@@ -13,15 +13,18 @@ use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 use std::fs; 
 use std::path::Path;
-use std::time::Duration; // 💡 Import ajouté pour le Watcher
+use std::time::Duration;
 use tauri::Emitter;
 
-// 💡 L'ASTUCE RUST : "as _" importe les méthodes du Trait en mode furtif, sans déclencher de Warning !
-use pqcrypto_traits::kem::{Ciphertext, SharedSecret}; // <-- Kyber nettoyé
-use pqcrypto_traits::sign::{SignedMessage, PublicKey as _}; // <-- Dilithium garde son astuce
+use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as _, SecretKey as _};
+use pqcrypto_traits::sign::{SignedMessage, PublicKey as _, SecretKey as _};
 
 const NODE_URL: &str = "http://80.78.26.243:8100";
 const VAULT_FILE: &str = ".wattcoin_vault";
+
+// 🧮 CONSTANTES MATHÉMATIQUES POST-QUANTIQUE (Famille Kyber/Dilithium)
+const LATTICE_Q: u32 = 8380417; 
+const LATTICE_DIM: usize = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct WalletKeys {
@@ -34,15 +37,24 @@ struct WalletKeys {
     dilithium_secret_hex: String,
 }
 
+// 💡 LA NOUVELLE STRUCTURE DE SIGNATURE LATTICE
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PQLatticeRingSignature {
+    pub key_image: String,
+    pub c0: String,
+    pub z_responses: Vec<Vec<u32>>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct TransactionPQ {
-    stealth_address: String,
-    kyber_capsule: String,
-    aes_vault: String,
-    lattice_commitment: LatticeCommitment, 
-    fee: u64,
-    pq_ring_inputs: Vec<String>,
-    dilithium_signature: String,
+    pub stealth_address: String,
+    pub kyber_capsule: String,
+    pub aes_vault: String,
+    pub lattice_commitment: LatticeCommitment, 
+    pub fee: u64,
+    pub pq_ring_inputs: Vec<String>,
+    pub pq_ring_signature: Option<PQLatticeRingSignature>, // 💡 LE GRAAL QUANTIQUE
+    pub dilithium_signature: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -54,7 +66,7 @@ struct SwapContract { pub buyer_btc_address: String, pub seller_watt_address: St
 #[derive(Serialize, Deserialize, Clone)]
 struct BatchResult { pub success: bool, pub message: String, pub clearing_price_sats: u64, pub total_volume_flames: u64, pub swaps: Vec<SwapContract> }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LatticeCommitment {
     pub c1: Vec<u64>,
     pub c2: u64,
@@ -78,7 +90,6 @@ impl LatticeCommitment {
 #[tauri::command]
 async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: String, watt_address: String) -> Result<(), String> {
     let mut rand_bytes = [0u8; 4]; rand::thread_rng().fill_bytes(&mut rand_bytes);
-    
     let amount_flames = (amount * 1_000_000_000.0) as u64; 
     let price_sats = (price * 100_000_000.0) as u64; 
 
@@ -141,7 +152,6 @@ async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys
     };
     let seed = mnemonic.to_seed("");
 
-    // 1. BITCOIN
     let secp = Secp256k1::new();
     let root = Xpriv::new_master(BtcNetwork::Testnet, &seed).unwrap();
     let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
@@ -151,14 +161,8 @@ async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys
     let compressed_pubkey = bitcoin::CompressedPublicKey::try_from(btc_pub).unwrap();
     let btc_address = BtcAddress::p2wpkh(&compressed_pubkey, BtcNetwork::Testnet).to_string();
 
-    // 2. WATTCOIN V2 : GÉNÉRATION DE L'IDENTITÉ POST-QUANTIQUE ABSOLUE
     let (kyber_pk, kyber_sk) = kyber768::keypair();
     let (dilithium_pk, dilithium_sk) = dilithium3::keypair();
-
-    use pqcrypto_traits::kem::PublicKey as KemPublicKey;
-    use pqcrypto_traits::sign::PublicKey as SignPublicKey;
-    use pqcrypto_traits::kem::SecretKey as KemSecretKey;
-    use pqcrypto_traits::sign::SecretKey as SignSecretKey;
 
     Ok(WalletKeys {
         mnemonic: mnemonic.to_string(),
@@ -325,8 +329,8 @@ async fn send_wattcoin(
 ) -> Result<String, String> {
     use pqcrypto_kyber::kyber768;
     use pqcrypto_dilithium::dilithium3;
-    use pqcrypto_traits::kem::PublicKey as KemPublicKey;
-    use pqcrypto_traits::sign::SecretKey as SignSecretKey;
+    use rand::Rng;
+    use rand::seq::SliceRandom;
 
     let recipient_bytes = hex::decode(&recipient_kyber_hex).map_err(|_| "Adresse invalide".to_string())?;
     let bob_pk = kyber768::PublicKey::from_bytes(&recipient_bytes).map_err(|_| "Clé Kyber corrompue".to_string())?;
@@ -352,7 +356,6 @@ async fn send_wattcoin(
     final_vault.extend_from_slice(&encrypted_data);
     let aes_vault = hex::encode(final_vault);
 
-    use rand::Rng;
     let blinding_factor = rand::thread_rng().gen_range(100..9999);
     let lattice_commitment = LatticeCommitment::commit(amount_in_flames, blinding_factor);
 
@@ -362,15 +365,123 @@ async fn send_wattcoin(
     let tx_data_to_sign = format!("{}{}{}{}{}", stealth_address, hex::encode(kyber_capsule.as_bytes()), aes_vault, lattice_commitment.c2, fee);
     let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
 
-    let mut pq_ring = Vec::new();
-    for _ in 0..10 {
+    let decoy_url = format!("{}/get_decoys/10", NODE_URL);
+    let mut pq_ring: Vec<String> = Vec::new();
+    let client = reqwest::Client::new(); 
+
+    if let Ok(res) = client.get(&decoy_url).send().await {
+        if let Ok(real_decoys) = res.json::<Vec<String>>().await {
+            pq_ring.extend(real_decoys);
+        }
+    }
+
+    while pq_ring.len() < 10 {
         let (fake_pk, _) = dilithium3::keypair();
         pq_ring.push(hex::encode(fake_pk.as_bytes()));
     }
-    pq_ring.push(sender_dilithium_public_hex);
-    
-    use rand::seq::SliceRandom;
+
+    pq_ring.push(sender_dilithium_public_hex.clone());
     pq_ring.shuffle(&mut rand::thread_rng());
+
+    // ==========================================================
+    // 🧠 LE MOTEUR DE GÉNÉRATION LATTICE (Post-Quantique)
+    // ==========================================================
+    let my_real_index = pq_ring.iter().position(|r| r == &sender_dilithium_public_hex).unwrap();
+
+    let n = pq_ring.len();
+    let mut z_responses = vec![vec![0u32; LATTICE_DIM]; n];
+    let mut challenges_c = vec![vec![0u8; 32]; n];
+    
+    // 1. Dérivation de notre clé secrète en un vecteur Lattice (S)
+    let mut s_vector = [0u32; LATTICE_DIM];
+    for j in 0..LATTICE_DIM {
+        let offset = j * 4;
+        s_vector[j] = u32::from_le_bytes(sk_bytes[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+    }
+
+    // 2. On génère une "Graine magique" aléatoire pour démarrer NOTRE maillon
+    let mut alpha = vec![0u32; LATTICE_DIM];
+    for j in 0..LATTICE_DIM {
+        alpha[j] = rand::thread_rng().gen_range(0..LATTICE_Q);
+    }
+
+    let mut current_index = my_real_index;
+    
+    // L'Oracle pour le tout premier Hachage (À partir de NOTRE clé)
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(tx_data_to_sign.as_bytes());
+    for j in 0..LATTICE_DIM {
+        let base_g = (j as u32 + 1) * 1337; 
+        let r_val = (alpha[j] as u64 * base_g as u64) % LATTICE_Q as u64;
+        hasher.update(&(r_val as u32).to_le_bytes());
+    }
+    
+    // Le challenge du maillon suivant est calculé
+    let mut next_c = hasher.finalize().as_bytes().to_vec();
+    challenges_c[(current_index + 1) % n] = next_c.clone();
+
+    // 3. Boucle sur les LEURRES (On simule des réponses aléatoires)
+    for _ in 1..n {
+        current_index = (current_index + 1) % n;
+        
+        let pk_hex = &pq_ring[current_index];
+        let mut hasher_pk = blake3::Hasher::new();
+        hasher_pk.update(pk_hex.as_bytes());
+        let pk_hash = hasher_pk.finalize();
+        
+        let mut p_vector = [0u32; LATTICE_DIM];
+        for j in 0..LATTICE_DIM {
+            let offset = j * 4;
+            p_vector[j] = u32::from_le_bytes(pk_hash.as_bytes()[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+        }
+
+        // Pour un leurre, Z est aléatoire
+        for j in 0..LATTICE_DIM {
+            z_responses[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
+        }
+
+        let c_i = u32::from_le_bytes(next_c[0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+
+        // Équation mathématique simulée
+        let mut r_i = vec![0u32; LATTICE_DIM];
+        for j in 0..LATTICE_DIM {
+            let base_g = (j as u32 + 1) * 1337;
+            let part1 = (z_responses[current_index][j] as u64 * base_g as u64) % LATTICE_Q as u64;
+            let part2 = (c_i as u64 * p_vector[j] as u64) % LATTICE_Q as u64;
+            r_i[j] = ((part1 + part2) % LATTICE_Q as u64) as u32;
+        }
+
+        let mut hasher_sim = blake3::Hasher::new();
+        hasher_sim.update(tx_data_to_sign.as_bytes());
+        for val in r_i {
+            hasher_sim.update(&val.to_le_bytes());
+        }
+        
+        next_c = hasher_sim.finalize().as_bytes().to_vec();
+        challenges_c[(current_index + 1) % n] = next_c.clone();
+    }
+
+    // 4. LA FERMETURE DU COLLIER (Avec notre clé secrète !)
+    let my_c = u32::from_le_bytes(challenges_c[my_real_index][0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+    
+    for j in 0..LATTICE_DIM {
+        let cs_product = (my_c as u64 * s_vector[j] as u64) % LATTICE_Q as u64;
+        if alpha[j] as u64 >= cs_product {
+            z_responses[my_real_index][j] = (alpha[j] as u64 - cs_product) as u32;
+        } else {
+            z_responses[my_real_index][j] = (LATTICE_Q as u64 + alpha[j] as u64 - cs_product) as u32;
+        }
+    }
+
+    let c0_final = hex::encode(&challenges_c[0]);
+    let key_image = hex::encode(blake3::hash(&sk_bytes).as_bytes());
+
+    let lattice_signature = PQLatticeRingSignature {
+        key_image,
+        c0: c0_final,
+        z_responses,
+    };
+    // ==========================================================
 
     let tx_pq = TransactionPQ {
         stealth_address,
@@ -379,10 +490,10 @@ async fn send_wattcoin(
         lattice_commitment, 
         fee,
         pq_ring_inputs: pq_ring,
+        pq_ring_signature: Some(lattice_signature),
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
 
-    let client = reqwest::Client::new();
     let url = format!("{}/send_tx", NODE_URL); 
     let res = client.post(&url) 
         .json(&tx_pq).send().await.map_err(|_| "Nœud injoignable !".to_string())?;
@@ -395,7 +506,7 @@ async fn send_wattcoin(
             writeln!(file, "{}", total_spend).unwrap();
         }
 
-        Ok(format!("☢️ TX POST-QUANTIQUE ENVOYÉE !\n\nPoids : {} octets\nSignature authentifiée par TA clé Dilithium.", serde_json::to_string(&tx_pq).unwrap().len()))
+        Ok(format!("☢️ TX POST-QUANTIQUE ENVOYÉE !\n\nPoids : {} octets\nFantômes impliqués : {}", serde_json::to_string(&tx_pq).unwrap().len(), tx_pq.pq_ring_inputs.len()))
     } else {
         Err("❌ Transaction rejetée.".to_string())
     }
@@ -525,6 +636,7 @@ async fn claim_wattcoin_swap(
         lattice_commitment,
         fee: 0,
         pq_ring_inputs: vec!["HTLC_CONTRACT".to_string()], 
+        pq_ring_signature: None, // 💡 HTLC n'utilise pas l'anneau Lattice
         dilithium_signature: secret, 
     };
 
@@ -557,11 +669,9 @@ fn destroy_vault() -> Result<String, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        // 💡 NOUVEAU : LE WATCHER EN TÂCHE DE FOND (Moteur Tauri)
         .setup(|app| {
             let app_handle = app.handle().clone();
             
-            // 💡 FIX : On utilise le runtime asynchrone intégré de Tauri !
             tauri::async_runtime::spawn(async move {
                 let client = reqwest::Client::new();
                 let mut last_blocks = 0;
@@ -573,7 +683,6 @@ fn main() {
                     if let Ok(res) = client.get(&url).send().await {
                         if let Ok(info) = res.json::<serde_json::Value>().await {
                             if let Some(blocks) = info["blocks"].as_u64() {
-                                // Si la chaîne a grandi, on alerte le frontend !
                                 if blocks > last_blocks {
                                     last_blocks = blocks;
                                     let _ = app_handle.emit("network-update", ());

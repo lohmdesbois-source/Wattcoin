@@ -17,28 +17,29 @@ pub struct BlockHeader {
 }
 
 impl Block {
-    // 🌍 LE VÉRITABLE GENESIS BLOCK D'OBSCURA
+    // 🌍 LE VÉRITABLE GENESIS BLOCK DE WATTCOIN
     pub fn genesis() -> Self {
         let header = BlockHeader {
             index: 0,
             timestamp: 1713000000, 
             previous_hash: String::from("0000000000000000000000000000000000000000000000000000000000000000"),
-            hash: String::from("GENESIS_HASH_OBSCURA_000000000000000000000000000000000000000000"), // Hash codé en dur
+            hash: String::from("GENESIS_HASH_WATTCOIN_000000000000000000000000000000000000000000"), // Hash codé en dur
             nonce: 0,
         };
 
-        // 🌍 LE VÉRITABLE GENESIS BLOCK QUANTIQUE D'OBSCURA
+        // 🌍 LE VÉRITABLE GENESIS BLOCK QUANTIQUE DE WATTCOIN
         let tx = Transaction {
             stealth_address: "GENESIS".to_string(),
-            kyber_capsule: "GENESIS".to_string(),
-            aes_vault: "GENESIS".to_string(),
+            kyber_capsule: "GENESIS_KEY".to_string(),
             
-            // 🧮 FIX : Engagement mathématique à 0 pour la Genèse
+            // 📜 LA DÉCLARATION D'INDÉPENDANCE DE WATTCOIN
+            aes_vault: "Wattcoin: L'énergie libre, anonyme et post-quantique. 03/Mai/2026 - Le monde change aujourd'hui.".to_string(),
+            
             lattice_commitment: crate::lattice::LatticeCommitment::commit(0, 0), 
-            
             fee: 0,
             pq_ring_inputs: vec!["GENESIS".to_string()], 
             dilithium_signature: "GENESIS".to_string(),
+            pq_ring_signature: None,
         };
 
         Block {

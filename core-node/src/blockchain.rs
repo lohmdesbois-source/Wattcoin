@@ -141,6 +141,7 @@ impl Blockchain {
             fee: 0,
             pq_ring_inputs: vec!["COINBASE_PUBKEY".to_string()],
             dilithium_signature: "COINBASE_SIG".to_string(),
+			pq_ring_signature: None,
         };
         valid_transactions.insert(0, coinbase_tx);
 

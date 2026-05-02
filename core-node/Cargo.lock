@@ -1978,12 +1978,11 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_core"
-version = "2.1.3"
+version = "2.1.4"
 dependencies = [
  "bip39",
  "blake3",
  "chrono",
- "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "num-bigint",
@@ -1995,7 +1994,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "warp",
 ]
