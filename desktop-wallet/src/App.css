@@ -1,0 +1,196 @@
+:root {
+  --bg-dark: #0f172a;
+  --bg-panel: #1e293b;
+  --primary: #10b981;
+  --primary-hover: #059669;
+  --btc-color: #f59e0b;
+  --xmr-color: #f26822;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --border: #334155;
+  --buy-color: #10b981;
+  --sell-color: #ef4444;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+}
+
+/* Layout */
+.dashboard-layout { display: flex; height: 100vh; }
+.sidebar { width: 250px; background-color: var(--bg-panel); border-right: 1px solid var(--border); padding: 2rem 1rem; }
+.logo { color: var(--primary); margin-bottom: 2rem; text-align: center; letter-spacing: 2px; }
+
+.nav-links { list-style: none; padding: 0; }
+.nav-links li { padding: 1rem; margin-bottom: 0.5rem; border-radius: 8px; cursor: pointer; color: var(--text-muted); transition: all 0.2s; }
+.nav-links li:hover, .nav-links li.active { background-color: rgba(16, 185, 129, 0.1); color: var(--primary); }
+
+.main-content { flex: 1; padding: 3rem; overflow-y: auto; max-width: 1200px; margin: 0 auto; width: 100%; }
+
+header h1 { margin-top: 0; }
+header p { color: var(--text-muted); margin-bottom: 2rem; }
+
+/* Onboarding & Cards */
+.onboarding-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 2rem; }
+.card { background-color: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 2.5rem; width: 100%; box-sizing: border-box; }
+
+input, textarea { width: 100%; box-sizing: border-box; padding: 1rem; background-color: var(--bg-dark); border: 1px solid var(--border); color: white; border-radius: 8px; font-size: 1rem; margin-bottom: 1rem; }
+input:focus, textarea:focus { outline: none; border-color: var(--primary); }
+
+button { padding: 1rem 2rem; background-color: var(--primary); color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 1rem; }
+button:hover { background-color: var(--primary-hover); }
+.btn-secondary { background-color: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+.btn-secondary:hover { background-color: var(--border); color: white; }
+
+.error-text { color: #ef4444; margin-top: 1rem; text-align: center; font-weight: bold; }
+
+/* 🚨 LA VUE BACKUP (24 MOTS) */
+.mnemonic-giant {
+  background-color: var(--bg-dark);
+  padding: 2rem;
+  border-radius: 12px;
+  border: 2px dashed #ef4444;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.5rem;
+  line-height: 2;
+  color: var(--text-main);
+  text-align: center;
+  margin: 2rem 0;
+  word-spacing: 15px;
+}
+
+/* 🧱 LES RÉSEAUX EMPILÉS */
+.networks-stack { display: flex; flex-direction: column; gap: 2rem; }
+.network-card { background-color: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+.network-card.btc { border-left: 6px solid var(--btc-color); }
+.network-card.xmr { border-left: 6px solid var(--xmr-color); }
+.network-card.watt { border-left: 6px solid var(--primary); }
+.network-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+.network-header h2 { margin: 0; font-size: 1.5rem; display: flex; align-items: center; gap: 10px; }
+.badge { background: var(--bg-dark); padding: 5px 12px; border-radius: 20px; font-size: 0.8rem; color: var(--text-muted); border: 1px solid var(--border); }
+.address-box { background: var(--bg-dark); padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 1.1rem; color: var(--text-muted); border: 1px solid var(--border); word-break: break-all; }
+
+/* ⚖️ TERMINAL DEX (NOUVEAU) */
+.dex-header { display: flex; justify-content: space-between; align-items: center; background: var(--bg-panel); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); margin-bottom: 1.5rem; }
+.trading-pair { font-size: 1.5rem; font-weight: bold; }
+.batch-timer { background: var(--bg-dark); padding: 10px 20px; border-radius: 8px; border: 1px solid var(--primary); color: var(--primary); font-family: monospace; font-size: 1.2rem; font-weight: bold; }
+
+.dex-grid { display: grid; grid-template-columns: 350px 1fr; gap: 1.5rem; align-items: start; }
+
+.order-form { background: var(--bg-panel); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); }
+.form-tabs { display: flex; gap: 10px; margin-bottom: 1.5rem; }
+.tab-btn { flex: 1; padding: 0.8rem; text-align: center; border-radius: 8px; cursor: pointer; font-weight: bold; border: 1px solid transparent; background: var(--bg-dark); color: var(--text-muted); }
+.tab-btn.buy.active { background: rgba(16, 185, 129, 0.1); color: var(--buy-color); border-color: var(--buy-color); }
+.tab-btn.sell.active { background: rgba(239, 68, 68, 0.1); color: var(--sell-color); border-color: var(--sell-color); }
+
+.input-label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 5px; }
+.submit-order-btn.buy { background: var(--buy-color); color: #000; }
+.submit-order-btn.sell { background: var(--sell-color); color: white; }
+
+.dark-pool { background: var(--bg-panel); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); height: 100%; }
+.pool-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+.pool-table th { text-align: left; padding: 10px; color: var(--text-muted); font-size: 0.9rem; border-bottom: 1px solid var(--border); }
+.pool-table td { padding: 12px 10px; font-family: monospace; font-size: 1rem; border-bottom: 1px solid rgba(51, 65, 85, 0.5); }
+.row-buy { color: var(--buy-color); }
+.row-sell { color: var(--sell-color); }
+
+/* Effet Pro sur les cartes */
+.interactive-card {
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.interactive-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+  border-color: rgba(255,255,255,0.2);
+}
+
+/* La Modale (Pop-up) */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.8); backdrop-filter: blur(5px);
+  display: flex; justify-content: center; align-items: center; z-index: 1000;
+}
+.modal-content {
+  background: var(--bg-card); border: 1px solid var(--border-color);
+  padding: 30px; border-radius: 12px; width: 400px; max-width: 90%;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.8);
+}
+.modal-header {
+  display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;
+}
+.close-btn {
+  background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.2rem;
+}
+.close-btn:hover { color: white; }
+.action-buttons {
+  display: flex; justify-content: space-between;
+}
+
+/* --------------------------------- */
+/* 🚀 STYLES ATOMIC SWAP (BEAUTY)   */
+/* --------------------------------- */
+
+.swap-stepper {
+  margin-top: 25px;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  text-align: left;
+}
+
+.step-item {
+  display: flex;
+  align-items: center;
+  margin-bottom: 15px;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  transition: all 0.3s ease;
+}
+
+.step-item.active {
+  color: var(--primary);
+  font-weight: bold;
+}
+
+.step-item.done {
+  color: #10b981; /* Vert succès */
+}
+
+.step-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid currentcolor;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-right: 15px;
+  font-size: 0.8rem;
+}
+
+/* Animation de pulsation pour l'étape en cours */
+.pulse-anim {
+  animation: pulse-border 1.5s infinite;
+}
+
+@keyframes pulse-border {
+  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+  70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+.success-banner {
+  background: rgba(16, 185, 129, 0.2);
+  border: 1px solid #10b981;
+  color: #10b981;
+  padding: 15px;
+  border-radius: 8px;
+  text-align: center;
+  font-weight: bold;
+  animation: fadeIn 0.5s ease-in-out;
+}
