@@ -1,0 +1,20 @@
+# Fichiers Rust / Cargo
+**/target/
+**/*.rs.bk
+
+# Fichiers Node / React (Tauri)
+**/node_modules/
+**/dist/
+**/build/
+
+# Bases de données locales & Coffres (Ne jamais uploader les clés !)
+**/*.json
+!package.json
+!package-lock.json
+!tauri.conf.json
+.wattcoin_vault
+.wattcoin_spends
+
+# Fichiers système
+.DS_Store
+Thumbs.db
