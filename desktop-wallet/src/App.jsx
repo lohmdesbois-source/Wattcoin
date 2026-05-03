@@ -189,7 +189,9 @@ function App() {
           recipientKyberHex: sendAddress, 
           amount: parseFloat(sendAmount),
           senderDilithiumSecretHex: walletData.dilithium_secret_hex, 
-          senderDilithiumPublicHex: walletData.dilithium_public_hex  
+          senderDilithiumPublicHex: walletData.dilithium_public_hex,
+          senderKyberSecretHex: walletData.kyber_secret_hex, // 💡 AJOUTÉ
+          senderKyberPublicHex: walletData.watt_address      // 💡 AJOUTÉ
         });
         alert(response);
         

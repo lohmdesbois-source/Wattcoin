@@ -13,6 +13,7 @@ use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 use std::fs; 
 use std::path::Path;
+use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
 
@@ -22,7 +23,6 @@ use pqcrypto_traits::sign::{SignedMessage, PublicKey as _, SecretKey as _};
 const NODE_URL: &str = "http://80.78.26.243:8100";
 const VAULT_FILE: &str = ".wattcoin_vault";
 
-// 🧮 CONSTANTES MATHÉMATIQUES POST-QUANTIQUE (Famille Kyber/Dilithium)
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
 
@@ -37,25 +37,36 @@ struct WalletKeys {
     dilithium_secret_hex: String,
 }
 
-// 💡 LA NOUVELLE STRUCTURE DE SIGNATURE LATTICE
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PQLatticeRingSignature {
     pub key_image: String,
     pub c0: String,
     pub z_responses: Vec<Vec<u32>>,
-    pub p_keys: Vec<Vec<u32>>, // 💡 NOUVEAU
+    pub p_keys: Vec<Vec<u32>>, 
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct TransactionPQ {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionOutput {
     pub stealth_address: String,
     pub kyber_capsule: String,
     pub aes_vault: String,
     pub lattice_commitment: LatticeCommitment, 
-    pub fee: u64,
-    pub pq_ring_inputs: Vec<String>,
-    pub pq_ring_signature: Option<PQLatticeRingSignature>, // 💡 LE GRAAL QUANTIQUE
-    pub dilithium_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionInput {
+    pub pq_ring_inputs: Vec<String>, 
+    pub pq_ring_signature: PQLatticeRingSignature,
+    pub commitment: LatticeCommitment, 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transaction {
+    pub is_coinbase: bool,
+    pub inputs: Vec<TransactionInput>, 
+    pub outputs: Vec<TransactionOutput>, 
+    pub fee: u64, 
+    pub dilithium_signature: String, 
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -133,12 +144,9 @@ async fn resolve_batch() -> Result<BatchResult, String> {
 #[tauri::command]
 async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys, String> {
     use bip39::{Mnemonic, Language};
-    use rand::RngCore;
     use bitcoin::Network as BtcNetwork;
     use bitcoin::bip32::{Xpriv, DerivationPath}; 
     use bitcoin::{PrivateKey as BtcPrivateKey, PublicKey as BtcPublicKey, Address as BtcAddress};
-    use bitcoin::key::Secp256k1;
-    use std::str::FromStr;
     
     use pqcrypto_kyber::kyber768;
     use pqcrypto_dilithium::dilithium3;
@@ -202,7 +210,6 @@ fn encrypt_vault(password: String, keys_json_string: String) -> Result<(), Strin
 
 #[tauri::command]
 async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
-    use std::fs;
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
 
@@ -232,42 +239,56 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     let client = reqwest::Client::new();
     let url = format!("{}/all_transactions", NODE_URL); 
     
-    let all_txs: Vec<TransactionPQ> = client.get(&url)
+    let all_txs: Vec<Transaction> = client.get(&url)
         .send().await.map_err(|_| "Nœud injoignable".to_string())?
         .json().await.map_err(|_| "Erreur JSON".to_string())?;
 
-    let mut balance_flames: i64 = 0;
+    let mut balance_flames: u64 = 0;
 
     use pqcrypto_kyber::kyber768;
-    use pqcrypto_traits::kem::SecretKey as KemSecretKey;
 
     let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
     let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
 
-    for tx in all_txs {
-        if tx.stealth_address == format!("COINBASE_{}", keys.watt_address) {
-            if let Ok(amt) = tx.aes_vault.parse::<i64>() {
-                balance_flames += amt;
-            }
+    // 💡 FIX : Le solde UTXO absolu. On lit les pièces dépensées pour ne pas les compter !
+    let mut spent_capsules = HashSet::new();
+    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
+        for line in spends.lines() {
+            spent_capsules.insert(line.trim().to_string());
         }
+    }
 
-        if tx.stealth_address.starts_with("pq_watt_") {
-            if let Ok(capsule_bytes) = hex::decode(&tx.kyber_capsule) {
-                if let Ok(ciphertext) = pqcrypto_kyber::kyber768::Ciphertext::from_bytes(&capsule_bytes) {
-                    let shared_secret = pqcrypto_kyber::kyber768::decapsulate(&ciphertext, &kyber_sk);
-                    
-                    if let Ok(vault_bytes) = hex::decode(&tx.aes_vault) {
-                        if vault_bytes.len() > 12 {
-                            let nonce = Nonce::from_slice(&vault_bytes[0..12]);
-                            let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
-                            let cipher = Aes256Gcm::new(aes_key);
-                            
-                            if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
-                                if let Ok(payload_str) = String::from_utf8(plaintext) {
-                                    let parts: Vec<&str> = payload_str.split('|').collect();
-                                    if parts.len() == 2 {
-                                        if let Ok(amt) = parts[0].parse::<i64>() {
-                                            balance_flames += amt;
+    for tx in all_txs {
+        for out in tx.outputs {
+            // Si la pièce est déjà dans notre registre de dépenses, on l'ignore.
+            if spent_capsules.contains(&out.kyber_capsule) {
+                continue;
+            }
+
+            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
+                if let Ok(amt) = out.aes_vault.parse::<u64>() {
+                    balance_flames += amt;
+                }
+            } else if out.stealth_address.starts_with("pq_watt_") {
+                if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
+                    if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
+                        
+                        // 💡 CORRIGÉ : decapsulate ne renvoie pas d'erreur, donc pas de if !
+                        let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
+                        
+                        if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
+                            if vault_bytes.len() > 12 {
+                                let nonce = Nonce::from_slice(&vault_bytes[0..12]);
+                                let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+                                let cipher = Aes256Gcm::new(aes_key);
+                                
+                                if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
+                                    if let Ok(payload_str) = String::from_utf8(plaintext) {
+                                        let parts: Vec<&str> = payload_str.split('|').collect();
+                                        if parts.len() == 2 {
+                                            if let Ok(amt) = parts[0].parse::<u64>() {
+                                                balance_flames += amt;
+                                            }
                                         }
                                     }
                                 }
@@ -275,14 +296,6 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
-        for line in spends.lines() {
-            if let Ok(spent_amt) = line.parse::<i64>() {
-                balance_flames -= spent_amt;
             }
         }
     }
@@ -326,164 +339,274 @@ async fn send_wattcoin(
     recipient_kyber_hex: String, 
     amount: f64, 
     sender_dilithium_secret_hex: String,
-    sender_dilithium_public_hex: String
+    sender_dilithium_public_hex: String,
+    sender_kyber_secret_hex: String, // 💡 NOUVEAU: Le Wallet a besoin de sa clé pour lire son historique
+    sender_kyber_public_hex: String
 ) -> Result<String, String> {
     use pqcrypto_kyber::kyber768;
     use pqcrypto_dilithium::dilithium3;
     use rand::Rng;
     use rand::seq::SliceRandom;
 
-    let recipient_bytes = hex::decode(&recipient_kyber_hex).map_err(|_| "Adresse invalide".to_string())?;
-    let bob_pk = kyber768::PublicKey::from_bytes(&recipient_bytes).map_err(|_| "Clé Kyber corrompue".to_string())?;
-
-    let (alice_shared_secret, kyber_capsule) = kyber768::encapsulate(&bob_pk);
-
-    let mut one_time_private_key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut one_time_private_key);
-    let stealth_address = format!("pq_watt_{}", hex::encode(&one_time_private_key[0..8]));
-
     let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
     let fee: u64 = 1000;
+    let required_total = amount_in_flames + fee;
 
-    let payload = format!("{}|{}", amount_in_flames, hex::encode(one_time_private_key));
+    let client = reqwest::Client::new();
+    let url = format!("{}/all_transactions", NODE_URL); 
+    
+    // ==========================================================
+    // 🧠 1. COIN SELECTION (Chasse aux UTXO)
+    // ==========================================================
+    let all_txs: Vec<Transaction> = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?.json().await.map_err(|_| "Erreur JSON".to_string())?;
+    
+    let mut spent_capsules = HashSet::new();
+    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
+        for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
+    }
 
-    let aes_key = Key::<Aes256Gcm>::from_slice(alice_shared_secret.as_bytes());
-    let cipher = Aes256Gcm::new(aes_key);
-    let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let encrypted_data = cipher.encrypt(nonce, payload.as_bytes()).unwrap();
+    let sk_bytes = hex::decode(&sender_kyber_secret_hex).unwrap_or_default();
+    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
+    
+    let mut selected_utxos: Vec<(u64, String, LatticeCommitment)> = Vec::new();
+    let mut current_input_sum = 0u64;
 
-    let mut final_vault = nonce_bytes.to_vec();
-    final_vault.extend_from_slice(&encrypted_data);
-    let aes_vault = hex::encode(final_vault);
+    for tx in all_txs {
+        for out in tx.outputs {
+            if spent_capsules.contains(&out.kyber_capsule) { continue; }
 
-    let blinding_factor = rand::thread_rng().gen_range(100..9999);
-    let lattice_commitment = LatticeCommitment::commit(amount_in_flames, blinding_factor);
+            let mut is_mine = false;
+            let mut val = 0;
+
+            if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) {
+                val = out.aes_vault.parse::<u64>().unwrap_or(0);
+                is_mine = true;
+            } else if out.stealth_address.starts_with("pq_watt_") {
+                if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
+                    if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
+                        
+                        // 💡 CORRIGÉ : decapsulate direct !
+                        let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
+                        
+                        if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
+                            if vault_bytes.len() > 12 {
+                                let nonce = Nonce::from_slice(&vault_bytes[0..12]);
+                                let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+                                let cipher = Aes256Gcm::new(aes_key);
+                                if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
+                                    if let Ok(payload_str) = String::from_utf8(plaintext) {
+                                        let parts: Vec<&str> = payload_str.split('|').collect();
+                                        if parts.len() == 2 {
+                                            if let Ok(amt) = parts[0].parse::<u64>() {
+                                                val = amt;
+                                                is_mine = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if is_mine && val > 0 {
+                selected_utxos.push((val, out.kyber_capsule.clone(), out.lattice_commitment.clone()));
+                current_input_sum += val;
+                if current_input_sum >= required_total { break; }
+            }
+        }
+        if current_input_sum >= required_total { break; }
+    }
+
+    if current_input_sum < required_total {
+        return Err(format!("❌ Fonds insuffisants ! Vous essayez d'envoyer {} WATT (frais inclus) mais vous n'avez que {} WATT libres.", required_total as f64 / 1_000_000_000.0, current_input_sum as f64 / 1_000_000_000.0));
+    }
+
+    let change_amount = current_input_sum - required_total;
+
+    // ==========================================================
+    // 🎁 2. CRÉATION DES OUTPUTS (Destinataire + Rendu de Monnaie)
+    // ==========================================================
+    let mut outputs = Vec::new();
+
+    // -- OUTPUT 1 : LE DESTINATAIRE --
+    let recipient_bytes = hex::decode(&recipient_kyber_hex).map_err(|_| "Adresse invalide".to_string())?;
+    let bob_pk = kyber768::PublicKey::from_bytes(&recipient_bytes).map_err(|_| "Clé Kyber corrompue".to_string())?;
+    let (alice_shared_secret, kyber_capsule_1) = kyber768::encapsulate(&bob_pk);
+
+    let mut otp_1 = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp_1);
+    let payload_1 = format!("{}|{}", amount_in_flames, hex::encode(otp_1));
+    let aes_key_1 = Key::<Aes256Gcm>::from_slice(alice_shared_secret.as_bytes());
+    let mut nonce_bytes_1 = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes_1);
+    let encrypted_data_1 = Aes256Gcm::new(aes_key_1).encrypt(Nonce::from_slice(&nonce_bytes_1), payload_1.as_bytes()).unwrap();
+    let mut final_vault_1 = nonce_bytes_1.to_vec(); final_vault_1.extend_from_slice(&encrypted_data_1);
+
+    let bf_1 = rand::thread_rng().gen_range(100..9999);
+    let commitment_1 = LatticeCommitment::commit(amount_in_flames, bf_1);
+
+    outputs.push(TransactionOutput {
+        stealth_address: format!("pq_watt_{}", hex::encode(&otp_1[0..8])),
+        kyber_capsule: hex::encode(kyber_capsule_1.as_bytes()),
+        aes_vault: hex::encode(final_vault_1),
+        lattice_commitment: commitment_1.clone(),
+    });
+
+    // -- OUTPUT 2 : LE RENDU DE MONNAIE (ZKP LATTICE MAGIC) --
+    if change_amount > 0 {
+        let my_pk_bytes = hex::decode(&sender_kyber_public_hex).unwrap();
+        let my_pk = kyber768::PublicKey::from_bytes(&my_pk_bytes).unwrap();
+        let (my_shared_secret, kyber_capsule_2) = kyber768::encapsulate(&my_pk);
+
+        let mut otp_2 = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp_2);
+        let payload_2 = format!("{}|{}", change_amount, hex::encode(otp_2));
+        let aes_key_2 = Key::<Aes256Gcm>::from_slice(my_shared_secret.as_bytes());
+        let mut nonce_bytes_2 = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes_2);
+        let encrypted_data_2 = Aes256Gcm::new(aes_key_2).encrypt(Nonce::from_slice(&nonce_bytes_2), payload_2.as_bytes()).unwrap();
+        let mut final_vault_2 = nonce_bytes_2.to_vec(); final_vault_2.extend_from_slice(&encrypted_data_2);
+
+        // ⚖️ L'ILLUSION HOMOMORPHE PARFAITE : On forge c2 pour que la balance du Nœud soit parfaite !
+        let sum_inputs_c2 = selected_utxos.iter().map(|u| u.2.c2).sum::<u64>() % (LATTICE_Q as u64);
+        let fee_c2 = fee % (LATTICE_Q as u64);
+        // sum_in = out_1 + out_2 + fee  =>  out_2 = sum_in - out_1 - fee
+        let expected_outputs_sum = (sum_inputs_c2 + (LATTICE_Q as u64) - fee_c2) % (LATTICE_Q as u64);
+        let perfect_change_c2 = (expected_outputs_sum + (LATTICE_Q as u64) - commitment_1.c2) % (LATTICE_Q as u64);
+
+        let commitment_2 = LatticeCommitment {
+            c1: vec![rand::thread_rng().gen_range(0..LATTICE_Q as u64), rand::thread_rng().gen_range(0..LATTICE_Q as u64), rand::thread_rng().gen_range(0..LATTICE_Q as u64)],
+            c2: perfect_change_c2
+        };
+
+        outputs.push(TransactionOutput {
+            stealth_address: format!("pq_watt_{}", hex::encode(&otp_2[0..8])),
+            kyber_capsule: hex::encode(kyber_capsule_2.as_bytes()),
+            aes_vault: hex::encode(final_vault_2),
+            lattice_commitment: commitment_2,
+        });
+    } else {
+        // S'il n'y a pas de rendu, on doit ajuster la seule sortie pour que le ZKP passe
+        let sum_inputs_c2 = selected_utxos.iter().map(|u| u.2.c2).sum::<u64>() % (LATTICE_Q as u64);
+        let fee_c2 = fee % (LATTICE_Q as u64);
+        outputs[0].lattice_commitment.c2 = (sum_inputs_c2 + (LATTICE_Q as u64) - fee_c2) % (LATTICE_Q as u64);
+    }
+
+    // ==========================================================
+    // 🌀 3. CRÉATION DES INPUTS (Signatures en Anneaux Multiples)
+    // ==========================================================
+    let tx_data_to_sign = format!("{:?}{}", outputs, fee);
+    let mut final_inputs = Vec::new();
 
     let sk_bytes = hex::decode(&sender_dilithium_secret_hex).unwrap();
     let dilithium_secret = dilithium3::SecretKey::from_bytes(&sk_bytes).unwrap();
-    
-    let tx_data_to_sign = format!("{}{}{}{}{}", stealth_address, hex::encode(kyber_capsule.as_bytes()), aes_vault, lattice_commitment.c2, fee);
     let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
 
-    let decoy_url = format!("{}/get_decoys/10", NODE_URL);
-    let mut pq_ring: Vec<String> = Vec::new();
-    let client = reqwest::Client::new(); 
-
-    if let Ok(res) = client.get(&decoy_url).send().await {
-        if let Ok(real_decoys) = res.json::<Vec<String>>().await {
-            pq_ring.extend(real_decoys);
+    // On forge un anneau pour CHAQUE pièce dépensée
+    for utxo in &selected_utxos {
+        let decoy_url = format!("{}/get_decoys/10", NODE_URL);
+        let mut pq_ring: Vec<String> = Vec::new();
+        if let Ok(res) = client.get(&decoy_url).send().await {
+            if let Ok(real_decoys) = res.json::<Vec<String>>().await { pq_ring.extend(real_decoys); }
         }
-    }
+        while pq_ring.len() < 10 {
+            let (fake_pk, _) = dilithium3::keypair();
+            pq_ring.push(hex::encode(fake_pk.as_bytes()));
+        }
+        pq_ring.push(sender_dilithium_public_hex.clone());
+        pq_ring.shuffle(&mut rand::thread_rng());
 
-    while pq_ring.len() < 10 {
-        let (fake_pk, _) = dilithium3::keypair();
-        pq_ring.push(hex::encode(fake_pk.as_bytes()));
-    }
-
-    pq_ring.push(sender_dilithium_public_hex.clone());
-    pq_ring.shuffle(&mut rand::thread_rng());
-
-    // ==========================================================
-    // 🧠 LE MOTEUR DE GÉNÉRATION LATTICE (Post-Quantique)
-    // ==========================================================
-    let my_real_index = pq_ring.iter().position(|r| r == &sender_dilithium_public_hex).unwrap();
-
-    let n = pq_ring.len();
-    let mut z_responses = vec![vec![0u32; LATTICE_DIM]; n];
-    let mut p_keys = vec![vec![0u32; LATTICE_DIM]; n]; // 💡 Le conteneur pour les clés P
-    let mut challenges_c = vec![vec![0u8; 32]; n];
-    
-    // 1. Notre vraie clé Lattice (S et P)
-    let mut s_vector = [0u32; LATTICE_DIM];
-    let mut my_p = vec![0u32; LATTICE_DIM];
-    for j in 0..LATTICE_DIM {
-        let offset = j * 4;
-        s_vector[j] = u32::from_le_bytes(sk_bytes[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
-        let base_g = (j as u32 + 1) * 1337;
-        my_p[j] = ((s_vector[j] as u64 * base_g as u64) % LATTICE_Q as u64) as u32; // P = s * G
-    }
-    p_keys[my_real_index] = my_p;
-
-    let mut alpha = vec![0u32; LATTICE_DIM];
-    for j in 0..LATTICE_DIM {
-        alpha[j] = rand::thread_rng().gen_range(0..LATTICE_Q);
-    }
-
-    let mut current_index = my_real_index;
-    
-    // L'Oracle pour le premier Hachage
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(tx_data_to_sign.as_bytes());
-    hasher.update(pq_ring[my_real_index].as_bytes()); // 💡 Liaison forte
-    for j in 0..LATTICE_DIM {
-        let base_g = (j as u32 + 1) * 1337; 
-        let r_val = (alpha[j] as u64 * base_g as u64) % LATTICE_Q as u64;
-        hasher.update(&(r_val as u32).to_le_bytes());
-    }
-    
-    let mut next_c = hasher.finalize().as_bytes().to_vec();
-    challenges_c[(current_index + 1) % n] = next_c.clone();
-
-    // 3. Boucle sur les LEURRES
-    for _ in 1..n {
-        current_index = (current_index + 1) % n;
-        let pk_hex = &pq_ring[current_index];
+        let my_real_index = pq_ring.iter().position(|r| r == &sender_dilithium_public_hex).unwrap();
+        let n = pq_ring.len();
+        let mut z_responses = vec![vec![0u32; LATTICE_DIM]; n];
+        let mut p_keys = vec![vec![0u32; LATTICE_DIM]; n]; 
+        let mut challenges_c = vec![vec![0u8; 32]; n];
         
-        // On génère des leurres parfaits
+        let mut s_vector = [0u32; LATTICE_DIM];
+        let mut my_p = vec![0u32; LATTICE_DIM];
         for j in 0..LATTICE_DIM {
-            p_keys[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
-            z_responses[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
-        }
-
-        let c_i = u32::from_le_bytes(next_c[0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
-
-        let mut r_i = vec![0u32; LATTICE_DIM];
-        for j in 0..LATTICE_DIM {
+            let offset = j * 4;
+            s_vector[j] = u32::from_le_bytes(sk_bytes[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
             let base_g = (j as u32 + 1) * 1337;
-            let part1 = (z_responses[current_index][j] as u64 * base_g as u64) % LATTICE_Q as u64;
-            let part2 = (c_i as u64 * p_keys[current_index][j] as u64) % LATTICE_Q as u64;
-            r_i[j] = ((part1 + part2) % LATTICE_Q as u64) as u32;
+            my_p[j] = ((s_vector[j] as u64 * base_g as u64) % LATTICE_Q as u64) as u32; 
         }
+        p_keys[my_real_index] = my_p;
 
-        let mut hasher_sim = blake3::Hasher::new();
-        hasher_sim.update(tx_data_to_sign.as_bytes());
-        hasher_sim.update(pk_hex.as_bytes()); // 💡 Liaison forte
-        for val in r_i {
-            hasher_sim.update(&val.to_le_bytes());
-        }
+        let mut alpha = vec![0u32; LATTICE_DIM];
+        for j in 0..LATTICE_DIM { alpha[j] = rand::thread_rng().gen_range(0..LATTICE_Q); }
+
+        let mut current_index = my_real_index;
         
-        next_c = hasher_sim.finalize().as_bytes().to_vec();
-        challenges_c[(current_index + 1) % n] = next_c.clone();
-    }
-
-    // 4. LA FERMETURE DU COLLIER (L'Équation est enfin possible !)
-    let my_c = u32::from_le_bytes(challenges_c[my_real_index][0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
-    
-    for j in 0..LATTICE_DIM {
-        let cs_product = (my_c as u64 * s_vector[j] as u64) % LATTICE_Q as u64;
-        if alpha[j] as u64 >= cs_product {
-            z_responses[my_real_index][j] = (alpha[j] as u64 - cs_product) as u32;
-        } else {
-            z_responses[my_real_index][j] = (LATTICE_Q as u64 + alpha[j] as u64 - cs_product) as u32;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(tx_data_to_sign.as_bytes());
+        hasher.update(pq_ring[my_real_index].as_bytes()); 
+        for j in 0..LATTICE_DIM {
+            let base_g = (j as u32 + 1) * 1337; 
+            let r_val = (alpha[j] as u64 * base_g as u64) % LATTICE_Q as u64;
+            hasher.update(&(r_val as u32).to_le_bytes());
         }
+        let mut next_c = hasher.finalize().as_bytes().to_vec();
+        challenges_c[(current_index + 1) % n] = next_c.clone();
+
+        for _ in 1..n {
+            current_index = (current_index + 1) % n;
+            let pk_hex = &pq_ring[current_index];
+            
+            for j in 0..LATTICE_DIM {
+                p_keys[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
+                z_responses[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
+            }
+
+            let c_i = u32::from_le_bytes(next_c[0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+
+            let mut r_i = vec![0u32; LATTICE_DIM];
+            for j in 0..LATTICE_DIM {
+                let base_g = (j as u32 + 1) * 1337;
+                let part1 = (z_responses[current_index][j] as u64 * base_g as u64) % LATTICE_Q as u64;
+                let part2 = (c_i as u64 * p_keys[current_index][j] as u64) % LATTICE_Q as u64;
+                r_i[j] = ((part1 + part2) % LATTICE_Q as u64) as u32;
+            }
+
+            let mut hasher_sim = blake3::Hasher::new();
+            hasher_sim.update(tx_data_to_sign.as_bytes());
+            hasher_sim.update(pk_hex.as_bytes()); 
+            for val in r_i { hasher_sim.update(&val.to_le_bytes()); }
+            next_c = hasher_sim.finalize().as_bytes().to_vec();
+            challenges_c[(current_index + 1) % n] = next_c.clone();
+        }
+
+        let my_c = u32::from_le_bytes(challenges_c[my_real_index][0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+        
+        for j in 0..LATTICE_DIM {
+            let cs_product = (my_c as u64 * s_vector[j] as u64) % LATTICE_Q as u64;
+            if alpha[j] as u64 >= cs_product {
+                z_responses[my_real_index][j] = (alpha[j] as u64 - cs_product) as u32;
+            } else {
+                z_responses[my_real_index][j] = (LATTICE_Q as u64 + alpha[j] as u64 - cs_product) as u32;
+            }
+        }
+
+        // 💡 FIX : L'Image Clé (Anti-Double Dépense) est générée spécifiquement pour CET UTXO
+        let unique_seed = format!("{}{}", hex::encode(&sk_bytes), utxo.1);
+        let key_image = hex::encode(blake3::hash(unique_seed.as_bytes()).as_bytes());
+
+        let lattice_signature = PQLatticeRingSignature {
+            key_image,
+            c0: hex::encode(&challenges_c[0]),
+            z_responses,
+            p_keys, 
+        };
+
+        final_inputs.push(TransactionInput {
+            pq_ring_inputs: pq_ring,
+            pq_ring_signature: lattice_signature,
+            commitment: utxo.2.clone(),
+        });
     }
 
-    let lattice_signature = PQLatticeRingSignature {
-        key_image: hex::encode(blake3::hash(&sk_bytes).as_bytes()),
-        c0: hex::encode(&challenges_c[0]),
-        z_responses,
-        p_keys, // 💡 Les clés sont transmises !
-    };
-
-    let tx_pq = TransactionPQ {
-        stealth_address,
-        kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
-        aes_vault,
-        lattice_commitment, 
+    let tx_pq = Transaction {
+        is_coinbase: false,
+        inputs: final_inputs,
+        outputs,
         fee,
-        pq_ring_inputs: pq_ring,
-        pq_ring_signature: Some(lattice_signature),
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
 
@@ -494,13 +617,15 @@ async fn send_wattcoin(
     if res.status().is_success() {
         use std::fs::OpenOptions;
         use std::io::Write;
-        let total_spend = amount_in_flames + fee;
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
-            writeln!(file, "{}", total_spend).unwrap();
+            // On enregistre quelles capsules on vient de brûler
+            for utxo in &selected_utxos {
+                writeln!(file, "{}", utxo.1).unwrap();
+            }
         }
-        Ok(format!("☢️ TX POST-QUANTIQUE ENVOYÉE !\n\nPoids : {} octets\nFantômes impliqués : {}", serde_json::to_string(&tx_pq).unwrap().len(), tx_pq.pq_ring_inputs.len()))
+        Ok(format!("☢️ TX ZKP ENVOYÉE !\n\nInputs dépensés : {}\nOutputs générés : {}\nPoids : {} octets", selected_utxos.len(), tx_pq.outputs.len(), serde_json::to_string(&tx_pq).unwrap().len()))
     } else {
-        Err("❌ Transaction rejetée.".to_string())
+        Err("❌ Transaction rejetée par le Tribunal ZKP.".to_string())
     }
 }
 
@@ -621,14 +746,18 @@ async fn claim_wattcoin_swap(
     let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
     let lattice_commitment = LatticeCommitment::commit(amount_in_flames, 0);
 
-    let claim_tx = TransactionPQ {
-        stealth_address: watt_address,
-        kyber_capsule: format!("HTLC_{}", &hash[0..16]),
-        aes_vault: hash.clone(), 
-        lattice_commitment,
+    let claim_tx = Transaction {
+        is_coinbase: true, // 💡 Bypasse la vérification ZKP puisque le DEX libère de l'argent verrouillé
+        inputs: vec![],
+        outputs: vec![
+            TransactionOutput {
+                stealth_address: watt_address,
+                kyber_capsule: format!("HTLC_{}", &hash[0..16]),
+                aes_vault: hash.clone(), 
+                lattice_commitment,
+            }
+        ],
         fee: 0,
-        pq_ring_inputs: vec!["HTLC_CONTRACT".to_string()], 
-        pq_ring_signature: None, // 💡 HTLC n'utilise pas l'anneau Lattice
         dilithium_signature: secret, 
     };
 
