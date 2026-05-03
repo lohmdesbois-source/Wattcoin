@@ -14,6 +14,9 @@
 !tauri.conf.json
 .wattcoin_vault
 .wattcoin_spends
+Github.txt
+SSH.txt
+Commandes.txt
 
 # Fichiers système
 .DS_Store

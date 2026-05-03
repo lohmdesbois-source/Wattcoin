@@ -43,6 +43,7 @@ pub struct PQLatticeRingSignature {
     pub key_image: String,
     pub c0: String,
     pub z_responses: Vec<Vec<u32>>,
+    pub p_keys: Vec<Vec<u32>>, // 💡 NOUVEAU
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -390,16 +391,20 @@ async fn send_wattcoin(
 
     let n = pq_ring.len();
     let mut z_responses = vec![vec![0u32; LATTICE_DIM]; n];
+    let mut p_keys = vec![vec![0u32; LATTICE_DIM]; n]; // 💡 Le conteneur pour les clés P
     let mut challenges_c = vec![vec![0u8; 32]; n];
     
-    // 1. Dérivation de notre clé secrète en un vecteur Lattice (S)
+    // 1. Notre vraie clé Lattice (S et P)
     let mut s_vector = [0u32; LATTICE_DIM];
+    let mut my_p = vec![0u32; LATTICE_DIM];
     for j in 0..LATTICE_DIM {
         let offset = j * 4;
         s_vector[j] = u32::from_le_bytes(sk_bytes[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+        let base_g = (j as u32 + 1) * 1337;
+        my_p[j] = ((s_vector[j] as u64 * base_g as u64) % LATTICE_Q as u64) as u32; // P = s * G
     }
+    p_keys[my_real_index] = my_p;
 
-    // 2. On génère une "Graine magique" aléatoire pour démarrer NOTRE maillon
     let mut alpha = vec![0u32; LATTICE_DIM];
     for j in 0..LATTICE_DIM {
         alpha[j] = rand::thread_rng().gen_range(0..LATTICE_Q);
@@ -407,52 +412,43 @@ async fn send_wattcoin(
 
     let mut current_index = my_real_index;
     
-    // L'Oracle pour le tout premier Hachage (À partir de NOTRE clé)
+    // L'Oracle pour le premier Hachage
     let mut hasher = blake3::Hasher::new();
     hasher.update(tx_data_to_sign.as_bytes());
+    hasher.update(pq_ring[my_real_index].as_bytes()); // 💡 Liaison forte
     for j in 0..LATTICE_DIM {
         let base_g = (j as u32 + 1) * 1337; 
         let r_val = (alpha[j] as u64 * base_g as u64) % LATTICE_Q as u64;
         hasher.update(&(r_val as u32).to_le_bytes());
     }
     
-    // Le challenge du maillon suivant est calculé
     let mut next_c = hasher.finalize().as_bytes().to_vec();
     challenges_c[(current_index + 1) % n] = next_c.clone();
 
-    // 3. Boucle sur les LEURRES (On simule des réponses aléatoires)
+    // 3. Boucle sur les LEURRES
     for _ in 1..n {
         current_index = (current_index + 1) % n;
-        
         let pk_hex = &pq_ring[current_index];
-        let mut hasher_pk = blake3::Hasher::new();
-        hasher_pk.update(pk_hex.as_bytes());
-        let pk_hash = hasher_pk.finalize();
         
-        let mut p_vector = [0u32; LATTICE_DIM];
+        // On génère des leurres parfaits
         for j in 0..LATTICE_DIM {
-            let offset = j * 4;
-            p_vector[j] = u32::from_le_bytes(pk_hash.as_bytes()[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
-        }
-
-        // Pour un leurre, Z est aléatoire
-        for j in 0..LATTICE_DIM {
+            p_keys[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
             z_responses[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q);
         }
 
         let c_i = u32::from_le_bytes(next_c[0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
 
-        // Équation mathématique simulée
         let mut r_i = vec![0u32; LATTICE_DIM];
         for j in 0..LATTICE_DIM {
             let base_g = (j as u32 + 1) * 1337;
             let part1 = (z_responses[current_index][j] as u64 * base_g as u64) % LATTICE_Q as u64;
-            let part2 = (c_i as u64 * p_vector[j] as u64) % LATTICE_Q as u64;
+            let part2 = (c_i as u64 * p_keys[current_index][j] as u64) % LATTICE_Q as u64;
             r_i[j] = ((part1 + part2) % LATTICE_Q as u64) as u32;
         }
 
         let mut hasher_sim = blake3::Hasher::new();
         hasher_sim.update(tx_data_to_sign.as_bytes());
+        hasher_sim.update(pk_hex.as_bytes()); // 💡 Liaison forte
         for val in r_i {
             hasher_sim.update(&val.to_le_bytes());
         }
@@ -461,7 +457,7 @@ async fn send_wattcoin(
         challenges_c[(current_index + 1) % n] = next_c.clone();
     }
 
-    // 4. LA FERMETURE DU COLLIER (Avec notre clé secrète !)
+    // 4. LA FERMETURE DU COLLIER (L'Équation est enfin possible !)
     let my_c = u32::from_le_bytes(challenges_c[my_real_index][0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
     
     for j in 0..LATTICE_DIM {
@@ -473,15 +469,12 @@ async fn send_wattcoin(
         }
     }
 
-    let c0_final = hex::encode(&challenges_c[0]);
-    let key_image = hex::encode(blake3::hash(&sk_bytes).as_bytes());
-
     let lattice_signature = PQLatticeRingSignature {
-        key_image,
-        c0: c0_final,
+        key_image: hex::encode(blake3::hash(&sk_bytes).as_bytes()),
+        c0: hex::encode(&challenges_c[0]),
         z_responses,
+        p_keys, // 💡 Les clés sont transmises !
     };
-    // ==========================================================
 
     let tx_pq = TransactionPQ {
         stealth_address,
@@ -505,7 +498,6 @@ async fn send_wattcoin(
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
             writeln!(file, "{}", total_spend).unwrap();
         }
-
         Ok(format!("☢️ TX POST-QUANTIQUE ENVOYÉE !\n\nPoids : {} octets\nFantômes impliqués : {}", serde_json::to_string(&tx_pq).unwrap().len(), tx_pq.pq_ring_inputs.len()))
     } else {
         Err("❌ Transaction rejetée.".to_string())
