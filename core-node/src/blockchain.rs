@@ -121,13 +121,14 @@ impl Blockchain {
         calculated_reward += total_fees; 
         println!("📉 Le mineur, avec le tips : {} Flames gagne en tout : {:.6} Watts", total_fees, (calculated_reward as f64) / (FLAME as f64));
 
+        // 🎁 La transaction de création de monnaie (Coinbase) PQ
         let coinbase_tx = Transaction {
             is_coinbase: true,
             inputs: vec![],
             outputs: vec![
                 crate::transaction::TransactionOutput {
                     stealth_address: format!("COINBASE_{}", miner_address), 
-                    kyber_capsule: "COINBASE_CAPSULE".to_string(),
+                    kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height), // 💡 IDENTIFIANT UNIQUE ICI
                     aes_vault: calculated_reward.to_string(), 
                     lattice_commitment: crate::lattice::LatticeCommitment::commit(calculated_reward, 0),
                 }
@@ -289,7 +290,8 @@ impl Blockchain {
 
             if tx.is_coinbase {
                 coinbase_count += 1;
-                if tx.outputs.is_empty() || tx.outputs[0].kyber_capsule != "COINBASE_CAPSULE" { 
+                // 💡 NOUVEAU COUPERET : On vérifie juste le préfixe
+                if tx.outputs.is_empty() || !tx.outputs[0].kyber_capsule.starts_with("COINBASE_CAPSULE") { 
                     return Err("Montant Coinbase illégal.".to_string());
                 }
             } else {
