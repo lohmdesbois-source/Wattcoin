@@ -10,7 +10,6 @@ use crate::blockchain::Blockchain;
 use crate::transaction::Transaction;
 use crate::api::{Order, SharedPool};
 
-// 💡 LE CŒUR DU NOUVEAU RÉSEAU : Le registre des tunnels ouverts
 pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -26,11 +25,10 @@ pub enum P2PMessage {
     MempoolSync { txs: Vec<Transaction> },
 }
 
-// 💡 Lecture en continu (NDJSON). On lit ligne par ligne jusqu'au \n.
 async fn read_p2p_message(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Option<P2PMessage> {
     let mut line = String::new();
     match reader.read_line(&mut line).await {
-        Ok(0) => None, // La connexion a été coupée
+        Ok(0) => None,
         Ok(_) => {
             serde_json::from_str::<P2PMessage>(&line.trim()).ok()
         }
@@ -38,10 +36,9 @@ async fn read_p2p_message(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>
     }
 }
 
-// 💡 Fonction utilitaire pour envoyer un message avec un \n final
 async fn send_message_to_channel(sender: &mpsc::Sender<String>, message: P2PMessage) {
     let mut json_str = serde_json::to_string(&message).unwrap();
-    json_str.push('\n'); // Crucial pour le BufReader !
+    json_str.push('\n'); 
     let _ = sender.send(json_str).await;
 }
 
@@ -64,7 +61,6 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
     }
 }
 
-// 🧠 LE GESTIONNAIRE DE TUNNEL
 fn start_peer_connection(
     socket: TcpStream, peer_ip: String, my_port: String,
     blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool,
@@ -77,14 +73,12 @@ fn start_peer_connection(
     let temp_peer_id = format!("{}:incoming", peer_ip);
     active_peers.lock().unwrap().insert(temp_peer_id.clone(), tx.clone());
 
-    // 📤 TÂCHE D'ÉCRITURE
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
         }
     });
 
-    // 📥 TÂCHE DE LECTURE
     tokio::spawn(async move {
         let mut actual_peer_id = temp_peer_id.clone();
 
@@ -94,13 +88,12 @@ fn start_peer_connection(
                     actual_peer_id = format!("{}:{}", peer_ip, sender_port);
                     known_peers.lock().unwrap().insert(actual_peer_id.clone());
                     
-                    // 💡 FIX : Le bloc {} garantit la mort du MutexGuard
                     {
                         let mut ap = active_peers.lock().unwrap();
                         if let Some(sender) = ap.remove(&temp_peer_id) {
                             ap.insert(actual_peer_id.clone(), sender);
                         }
-                    } // 🔓 Le cadenas est détruit à 100% ici
+                    } 
 
                     let (is_behind, i_am_ahead, my_height, my_hash, genesis_valid) = {
                         let chain = blockchain.lock().unwrap(); 
@@ -161,7 +154,8 @@ fn start_peer_connection(
                     if chain.resolve_partial_fork(blocks.clone()) { 
                         println!("✅ Synchronisation partielle réussie ! Nous sommes à jour.");
                         let mut mp = mempool.lock().unwrap();
-                        mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule)) });
+                        // 💡 FIX
+                        mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)) });
                     }
                 },
 
@@ -179,13 +173,13 @@ fn start_peer_connection(
                         send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
                     } else {
                         println!("\n====================================================================");
-						println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU ! (Source: {})", block.header.index, sender_port);
-						println!("🔗 Hash: {}", block.header.hash);
-						println!("====================================================================");
-						println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
-                        mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == t.kyber_capsule) });
+                        println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU ! (Source: {})", block.header.index, sender_port);
+                        println!("🔗 Hash: {}", block.header.hash);
+                        println!("====================================================================");
+                        println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
+                        // 💡 FIX
+                        mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) });
                         
-                        // 📢 On propage ce bloc à TOUS nos autres tunnels !
                         let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port.clone() };
                         let mut json_str = serde_json::to_string(&env).unwrap();
                         json_str.push('\n');
@@ -229,7 +223,17 @@ fn start_peer_connection(
                     let chain = blockchain.lock().unwrap(); 
                     let mut added = 0;
                     for t in txs {
-                        if !local_mp.iter().any(|x| x.kyber_capsule == t.kyber_capsule) && !chain.spent_key_images.contains(&t.kyber_capsule) {
+                        // 💡 FIX
+                        let mut spent = false;
+                        if !t.is_coinbase {
+                            for input in &t.inputs {
+                                if chain.spent_key_images.contains(&input.pq_ring_signature.key_image) {
+                                    spent = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !local_mp.iter().any(|x| x.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) && !spent {
                             local_mp.push(t);
                             added += 1;
                         }
@@ -252,9 +256,6 @@ fn start_peer_connection(
     });
 }
 
-// --- FONCTIONS RÉSEAU POUR LE MINEUR ---
-
-// Ouvre le tunnel au démarrage du mineur
 pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers) {
     let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
     
@@ -272,12 +273,10 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
             Arc::clone(&known_peers), Arc::clone(&active_peers)
         );
 
-        // 💡 FIX : On clone le sender dans un bloc isolé
         let ip_only = address.split(':').next().unwrap_or(&address).to_string();
-		let sender_opt = {
-			active_peers.lock().unwrap().get(&format!("{}:incoming", ip_only)).cloned()
-		};
-        // 🔓 Le Mutex est fermé. On peut utiliser le sender cloné en mode asynchrone !
+        let sender_opt = {
+            active_peers.lock().unwrap().get(&format!("{}:incoming", ip_only)).cloned()
+        };
         if let Some(sender) = sender_opt {
             send_message_to_channel(&sender, P2PMessage::Handshake { 
                 genesis_hash: my_genesis, 
@@ -290,7 +289,6 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
     }
 }
 
-// Diffuse le bloc dans TOUS les tunnels ouverts instantanément
 pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: ActivePeers) {
     let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
     let mut json_str = serde_json::to_string(&envelope).unwrap();
@@ -303,7 +301,6 @@ pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: Ac
     }
 }
 
-// 💡 NOUVEAU : On diffuse la TX instantanément dans les tunnels (Fini les nouvelles connexions !)
 pub async fn broadcast_transaction(tx: Transaction, active_peers: ActivePeers) {
     let envelope = P2PMessage::BroadcastTransaction { tx };
     let mut json_str = serde_json::to_string(&envelope).unwrap();
@@ -316,7 +313,6 @@ pub async fn broadcast_transaction(tx: Transaction, active_peers: ActivePeers) {
     }
 }
 
-// 💡 NOUVEAU : Pareil pour les ordres DEX, temps réel absolu !
 pub async fn broadcast_order(order: Order, active_peers: ActivePeers) {
     let envelope = P2PMessage::BroadcastOrder { order };
     let mut json_str = serde_json::to_string(&envelope).unwrap();

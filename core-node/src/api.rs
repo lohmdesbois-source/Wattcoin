@@ -43,14 +43,12 @@ pub async fn start_api_server(
     chain: Arc<Mutex<Blockchain>>, 
     known_peers: crate::SharedPeers, 
     dex_pool: SharedPool,
-	active_peers: crate::network::ActivePeers
+    active_peers: crate::network::ActivePeers
 ) {
     let mempool_filter = warp::any().map(move || Arc::clone(&mempool));
     let chain_filter = warp::any().map(move || Arc::clone(&chain));
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
     let peers_filter = warp::any().map(move || Arc::clone(&known_peers));
-
-    // 💡 Le filtre pour passer les tunnels à nos routes
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
 
     // 1. ROUTE : RECEVOIR UNE TRANSACTION WATTCOIN
@@ -58,15 +56,15 @@ pub async fn start_api_server(
         .and(warp::path("send_tx"))
         .and(warp::body::json())
         .and(mempool_filter.clone())
-        .and(active_peers_filter.clone()) // 💡 On utilise les tunnels
+        .and(active_peers_filter.clone()) 
         .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
             if tx.is_valid() {
                 let mut pool = mempool.lock().unwrap();
-                if !pool.iter().any(|t| t.kyber_capsule == tx.kyber_capsule) {
+                // 💡 FIX : On compare le 1er output
+                if !pool.iter().any(|t| t.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule) {
                     pool.push(tx.clone());
                     println!("📥 [API] Nouvelle TX ajoutée au Mempool !");
 
-                    // ⚡ PUSH INSTANTANÉ
                     let tx_clone = tx.clone();
                     tokio::spawn(async move {
                         crate::network::broadcast_transaction(tx_clone, active_peers).await;
@@ -95,8 +93,8 @@ pub async fn start_api_server(
             }
             warp::reply::json(&all_txs)
         });
-		
-	// 2.5 ROUTE : OBTENIR DES LEURRES POUR L'ANONYMAT (RING SIGNATURES)
+        
+    // 2.5 ROUTE : OBTENIR DES LEURRES POUR L'ANONYMAT (RING SIGNATURES)
     let get_decoys = warp::get()
         .and(warp::path!("get_decoys" / usize))
         .and(chain_filter.clone())
@@ -120,7 +118,7 @@ pub async fn start_api_server(
         .and(warp::path("order"))
         .and(warp::body::json())
         .and(dex_pool_filter.clone())
-        .and(active_peers_filter.clone()) // 💡 On utilise les tunnels
+        .and(active_peers_filter.clone()) 
         .map(|order: Order, pool: SharedPool, active_peers: crate::network::ActivePeers| {
             println!("📡 [API DEX] Ordre reçu du Wallet : {} {} WATT", order.order_type, order.amount_flames);
             
@@ -134,7 +132,6 @@ pub async fn start_api_server(
             }
 
             if is_new {
-                // ⚡ PUSH INSTANTANÉ
                 let order_clone = order.clone();
                 tokio::spawn(async move {
                     crate::network::broadcast_order(order_clone, active_peers).await;
@@ -153,11 +150,9 @@ pub async fn start_api_server(
                 return warp::reply::json(&BatchResult { success: false, message: "Piscine vide.".to_string(), clearing_price_sats: 0, total_volume_flames: 0, swaps: vec![] });
             }
 
-            // On sépare les acheteurs et les vendeurs
             let mut buys: Vec<Order> = orders.iter().filter(|o| o.order_type == "buy").cloned().collect();
             let mut sells: Vec<Order> = orders.iter().filter(|o| o.order_type == "sell").cloned().collect();
 
-            // On trie : Les acheteurs les plus offrants en premier, les vendeurs les moins chers en premier
             buys.sort_by(|a, b| b.price_sats.cmp(&a.price_sats));
             sells.sort_by(|a, b| a.price_sats.cmp(&b.price_sats));
 
@@ -166,16 +161,13 @@ pub async fn start_api_server(
             let mut generated_swaps = Vec::new();
             let mut i = 0; let mut j = 0;
 
-            // 💥 LE CROISEMENT DES ORDRES
             while i < buys.len() && j < sells.len() {
                 if buys[i].price_sats >= sells[j].price_sats {
                     
-                    // Le prix d'entente est la moyenne entre l'offre et la demande
                     clearing_price_sats = (buys[i].price_sats + sells[j].price_sats) / 2;
                     let trade_amount_flames = buys[i].amount_flames.min(sells[j].amount_flames);
                     total_volume_flames += trade_amount_flames;
 
-                    // 🔐 GÉNÉRATION DU SECRET HTLC POUR L'ATOMIC SWAP !
                     let mut secret_bytes = [0u8; 32];
                     rand::thread_rng().fill_bytes(&mut secret_bytes);
                     let htlc_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
@@ -192,17 +184,16 @@ pub async fn start_api_server(
                         htlc_hash,
                     });
 
-                    // On met à jour les quantités restantes
                     buys[i].amount_flames -= trade_amount_flames;
                     sells[j].amount_flames -= trade_amount_flames;
                     if buys[i].amount_flames == 0 { i += 1; }
                     if sells[j].amount_flames == 0 { j += 1; }
                 } else { 
-                    break; // Les prix ne se croisent plus, fin du batch
+                    break;
                 }
             }
 
-            orders.clear(); // On vide le pool après la résolution
+            orders.clear();
 
             if total_volume_flames > 0 {
                 println!("⚖️ [DEX] Ordres croisés ! Volume: {} Flames", total_volume_flames);
@@ -221,7 +212,7 @@ pub async fn start_api_server(
             warp::reply::json(&serde_json::json!({
                 "blocks": chain_lock.chain.len(), 
                 "connected_peers": peers.lock().unwrap().len(), 
-                "version": "Wattcoin V2.0.3 (Ano PQ DEX)"
+                "version": "Wattcoin V2.2.0 (ZKP LATTICE)"
             }))
         });
     

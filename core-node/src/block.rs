@@ -29,17 +29,18 @@ impl Block {
 
         // 🌍 LE VÉRITABLE GENESIS BLOCK QUANTIQUE DE WATTCOIN
         let tx = Transaction {
-            stealth_address: "GENESIS".to_string(),
-            kyber_capsule: "GENESIS_KEY".to_string(),
-            
-            // 📜 LA DÉCLARATION D'INDÉPENDANCE DE WATTCOIN
-            aes_vault: "Wattcoin: L'énergie libre, anonyme et post-quantique. 03/Mai/2026 - Le monde change aujourd'hui.".to_string(),
-            
-            lattice_commitment: crate::lattice::LatticeCommitment::commit(0, 0), 
+            is_coinbase: true,
+            inputs: vec![], // Aucun input, c'est la genèse !
+            outputs: vec![
+                crate::transaction::TransactionOutput {
+                    stealth_address: "GENESIS".to_string(),
+                    kyber_capsule: "GENESIS_KEY".to_string(),
+                    aes_vault: "Wattcoin: L'énergie libre, anonyme et post-quantique. 03/Mai/2026 - Le monde change aujourd'hui.".to_string(),
+                    lattice_commitment: crate::lattice::LatticeCommitment::commit(0, 0), 
+                }
+            ],
             fee: 0,
-            pq_ring_inputs: vec!["GENESIS".to_string()], 
             dilithium_signature: "GENESIS".to_string(),
-            pq_ring_signature: None,
         };
 
         Block {

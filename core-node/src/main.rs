@@ -61,10 +61,8 @@ async fn main() {
         known_peers.lock().unwrap().insert(target.clone()); 
     }
 
-    // 💡 LE REGISTRE DES TUNNELS P2P ACTIFS
     let active_peers: network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
 
-    // 🌐 1. DÉMARRAGE DU SERVEUR P2P
     let p2p_chain = Arc::clone(&shared_chain);
     let p2p_mempool = Arc::clone(&mempool);
     let p2p_dex_pool = Arc::clone(&dex_pool);
@@ -74,15 +72,13 @@ async fn main() {
     let bind_ip_p2p = p2p_bind_ip.to_string(); 
     tokio::spawn(async move { network::start_p2p_server(&bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active).await; });
     
-    // 🔌 2. DÉMARRAGE DE L'API REST
     let api_chain = Arc::clone(&shared_chain);
     let api_mempool = Arc::clone(&mempool);
     let api_peers = Arc::clone(&known_peers); 
-    let api_dex_pool = Arc::clone(&dex_pool); // 💡 FIX : On clone le pool DEX avant de l'envoyer dans le thread !
-	let api_active_peers = Arc::clone(&active_peers);
+    let api_dex_pool = Arc::clone(&dex_pool);
+    let api_active_peers = Arc::clone(&active_peers);
     tokio::spawn(async move { api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, api_dex_pool, api_active_peers).await; });
 
-    // 🤝 3. OUVERTURE DU TUNNEL VERS LE BOOTSTRAP
     if let Some(target) = &peer_target {
         println!("🤝 Ouverture du tunnel P2P vers {}...", target);
         let target_clone = target.clone();
@@ -120,7 +116,6 @@ async fn main() {
         println!("\n⛏️  Début de l'extraction pour l'adresse : {}...", miner_address);
         loop {
 
-            // --- ÉTAPE A : PRÉPARER LE BLOC ---
             let (mut candidate_block, target) = {
                 let mut chain = shared_chain.lock().unwrap();
                 let pending_txs = mempool.lock().unwrap().clone();
@@ -182,9 +177,12 @@ async fn main() {
                     println!("💰 Frais perçus  : {} Flames", total_fees);
                     println!("====================================================================\n");
                     
+                    // 💡 FIX : On utilise inputs
                     for tx in &candidate_block.transactions {
-                        if !tx.stealth_address.starts_with("COINBASE_") {
-                            chain.spent_key_images.insert(tx.kyber_capsule.clone());
+                        if !tx.is_coinbase {
+                            for input in &tx.inputs {
+                                chain.spent_key_images.insert(input.pq_ring_signature.key_image.clone());
+                            }
                         }
                     }
 
@@ -193,7 +191,6 @@ async fn main() {
                     chain.update_target(); 
                     chain.save_to_disk(&db_file);
 
-                    // 💡 NOUVEAU : On glisse le bloc dans nos tunnels P2P déjà ouverts !
                     let block_clone = candidate_block.clone();
                     let my_port_clone = port.clone(); 
                     let active_clone = Arc::clone(&active_peers);
@@ -204,8 +201,9 @@ async fn main() {
                 }
                 
                 let mut mp = mempool.lock().unwrap();
+                // 💡 FIX
                 mp.retain(|tx| {
-                    !candidate_block.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule)
+                    !candidate_block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)
                 });
             }
         }
