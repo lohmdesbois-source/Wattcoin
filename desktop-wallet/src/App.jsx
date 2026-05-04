@@ -33,6 +33,7 @@ function App() {
 
   const [manualSwapHash, setManualSwapHash] = useState(""); // 💡 NOUVEAU : Pour que Bob s'aligne
   const [manualSwapAmount, setManualSwapAmount] = useState("");
+  const [isProcessing, setIsProcessing] = useState(false);
 
   const handleCopy = (e, text, type) => {
     e.stopPropagation(); 
@@ -170,6 +171,11 @@ function App() {
       alert("Veuillez remplir l'adresse et le montant.");
       return;
     }
+    
+    // 💡 ANTI DOUBLE-CLIC : Si le wallet bosse déjà, on bloque !
+    if (isProcessing) return;
+    setIsProcessing(true);
+
     try {
       if (activeCoinModal === "WATT") {
         const response = await invoke("send_wattcoin", {
@@ -183,6 +189,7 @@ function App() {
           htlcTimeout: null  
         });
         alert(response);
+        
         setWattBalance(prev => prev - parseFloat(sendAmount));
         setActiveCoinModal(null); 
         setSendAddress(""); setSendAmount(""); 
@@ -191,6 +198,9 @@ function App() {
       }
     } catch (error) {
       alert(error);
+    } finally {
+      // 💡 ON LIBÈRE LE VERROU quoiqu'il arrive
+      setIsProcessing(false);
     }
   };
   
@@ -209,6 +219,8 @@ function App() {
 
   // 💡 Bob verrouille ses WATT en utilisant directement le contrat matché par le DEX
   const handleBobLockWatt = async (swap) => {
+    if (isProcessing) return; // Anti double-clic !
+    setIsProcessing(true);
     try {
       await invoke("send_wattcoin", {
         recipientKyberHex: walletData.watt_address, 
@@ -217,11 +229,15 @@ function App() {
         senderDilithiumPublicHex: walletData.dilithium_public_hex,
         senderKyberSecretHex: walletData.kyber_secret_hex,
         senderKyberPublicHex: walletData.watt_address,
-        htlcHashHex: swap.htlc_hash, // Pris directement dans les données !
+        htlcHashHex: swap.htlc_hash, 
         htlcTimeout: 144
       });
       alert("🔒 WATT verrouillés sur la blockchain WATT ! Alice peut maintenant réclamer.");
-    } catch (e) { alert("Erreur Lock WATT : " + e); }
+    } catch (e) { 
+      alert("Erreur Lock WATT : " + e); 
+    } finally {
+      setIsProcessing(false); // On libère le bouton
+    }
   };
 
   if (view === "loading") return <div className="onboarding-screen"><h1>Chargement...</h1></div>;
@@ -280,7 +296,7 @@ function App() {
             <div className="network-card watt interactive-card" onClick={() => setActiveCoinModal('WATT')}>
               <div className="network-header">
                 <h2><span style={{ color: "var(--primary)" }}>⚡</span> Wattcoin</h2>
-                <span className="badge">Réseau Furtif (L1)</span>
+                <span className="badge">Réseau Testnet Furtif (L1)</span>
               </div>
               <div className="address-box" style={{ fontSize: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(0,0,0,0.4)" }}>
                 <span style={{ fontFamily: "monospace", color: "#ccc" }}>
@@ -291,7 +307,7 @@ function App() {
                 </button>
               </div>
               <div style={{ marginTop: "20px", fontSize: "2.5rem", fontWeight: "bold", color: "var(--text-main)" }}>
-                {wattBalance.toFixed(4)} <span style={{ fontSize: "1.2rem", color: "var(--primary)" }}>WATT</span>
+                {wattBalance.toFixed(9)} <span style={{ fontSize: "1.2rem", color: "var(--primary)" }}>WATT</span>
               </div>
               <div style={{ fontSize: "1rem", color: "#888", marginTop: "5px" }}>
                 ≈ ${(wattBalance * wattUsdPrice).toFixed(2)} USD
@@ -313,7 +329,7 @@ function App() {
                 </button>
               </div>
               <div style={{ marginTop: "20px", fontSize: "2.5rem", fontWeight: "bold", color: "var(--text-main)" }}>
-                {btcBalance.toFixed(5)} <span style={{ fontSize: "1.2rem", color: "#F7931A" }}>BTC</span>
+                {btcBalance.toFixed(8)} <span style={{ fontSize: "1.2rem", color: "#F7931A" }}>BTC</span>
               </div>
               <div style={{ fontSize: "1rem", color: "#888", marginTop: "5px" }}>
                 ≈ ${(btcBalance * btcUsdPrice).toFixed(2)} USD
@@ -332,7 +348,7 @@ function App() {
                 <div className="send-form" style={{ marginTop: "10px" }}>
                   <div style={{ fontSize: "0.9rem", color: "var(--text-muted)", marginBottom: "15px", textAlign: "right" }}>
                     Solde : <span style={{ color: "var(--text-main)", fontWeight: "bold" }}>
-                      {activeCoinModal === 'WATT' ? wattBalance.toFixed(4) : btcBalance.toFixed(5)}
+                      {activeCoinModal === 'WATT' ? wattBalance.toFixed(9) : btcBalance.toFixed(8)}
                     </span> {activeCoinModal}
                   </div>
                   <input type="text" placeholder={`Adresse ${activeCoinModal} du destinataire`} value={sendAddress} onChange={(e) => setSendAddress(e.target.value)} style={{ width: "100%", marginBottom: "15px" }} />
@@ -443,9 +459,42 @@ function App() {
                             </button>
                           )}
                           {isBob && (
-                            <button className="btn-secondary" style={{ padding: "5px 15px", fontSize: "0.9rem" }} onClick={() => handleBobLockWatt(s)}>
-                              🔒 Verrouiller mes WATT
-                            </button>
+                            <div style={{ display: "flex", gap: "5px", flexDirection: "column" }}>
+                              <button 
+                                className="btn-secondary" 
+                                style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
+                                disabled={isProcessing}
+                                onClick={() => handleBobLockWatt(s)}
+                              >
+                                {isProcessing ? "⏳ Verrouillage..." : "🔒 1. Verrouiller mes WATT"}
+                              </button>
+
+                              {/* 💡 NOUVEAU BOUTON : Réclamation BTC pour Bob */}
+                              <button 
+                                className="btn-primary" 
+                                style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
+                                disabled={isProcessing}
+                                onClick={async () => {
+                                  try {
+                                    setIsProcessing(true);
+                                    const contractAddress = await invoke("create_btc_htlc", {
+                                      masterSeedHex: walletData.master_seed_hex,
+                                      hashHex: s.htlc_hash,
+                                      locktime: 144 
+                                    });
+                                    const res = await invoke("claim_btc_swap", {
+                                      masterSeedHex: walletData.master_seed_hex,
+                                      htlcAddress: contractAddress,
+                                      secretHex: s.htlc_secret // Dans la réalité L2, ce secret serait lu sur la blockchain
+                                    });
+                                    alert(res);
+                                  } catch (e) { alert("Erreur Claim BTC : " + e); }
+                                  finally { setIsProcessing(false); }
+                                }}
+                              >
+                                💰 2. Réclamer les BTC (Avec le Secret)
+                              </button>
+                            </div>
                           )}
                         </td>
                       </tr>
