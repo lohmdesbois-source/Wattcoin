@@ -7,7 +7,7 @@ use serde::{Serialize, Deserialize};
 use rand::Rng;
 use crate::block::Block;
 use crate::blockchain::Blockchain;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionType};
 use crate::api::{Order, SharedPool};
 
 pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
@@ -29,9 +29,7 @@ async fn read_p2p_message(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>
     let mut line = String::new();
     match reader.read_line(&mut line).await {
         Ok(0) => None,
-        Ok(_) => {
-            serde_json::from_str::<P2PMessage>(&line.trim()).ok()
-        }
+        Ok(_) => serde_json::from_str::<P2PMessage>(&line.trim()).ok(),
         Err(_) => None,
     }
 }
@@ -107,13 +105,9 @@ fn start_peer_connection(
                         )
                     }; 
 
-                    if !genesis_valid {
-                        println!("🚨 [P2P] INTRUSION REJETÉE.");
-                        break; 
-                    }
+                    if !genesis_valid { break; }
 
                     if is_behind {
-                        println!("🔄 [P2P] Je suis en retard. Demande du delta à {}...", sender_port);
                         send_message_to_channel(&tx, P2PMessage::SyncRequest { current_height: my_height, last_hash: my_hash, sender_port: my_port.clone() }).await;
                     } else if i_am_ahead {
                         send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash, current_height: my_height, sender_port: my_port.clone() }).await;
@@ -126,14 +120,12 @@ fn start_peer_connection(
                         let my_height = chain.chain.len() as u64;
 
                         if my_height > current_height {
-                            println!("📤 [P2P] Calcul du Delta pour {}...", sender_port);
                             let mut start_idx = current_height as usize;
                             let check_idx = start_idx.saturating_sub(1); 
 
                             if check_idx < chain.chain.len() && chain.chain[check_idx].header.hash == last_hash {
                                 Some(chain.chain[start_idx..].to_vec())
                             } else {
-                                println!("🔀 Fork détecté avec {} ! On recule pour la greffe.", sender_port);
                                 start_idx = start_idx.saturating_sub(10);
                                 if start_idx == 0 { start_idx = 1; } 
                                 Some(chain.chain[start_idx..].to_vec())
@@ -149,12 +141,9 @@ fn start_peer_connection(
                 P2PMessage::SyncResponse { blocks } => {
                     if blocks.is_empty() { continue; }
                     let mut chain = blockchain.lock().unwrap(); 
-                    println!("📦 [P2P] Réception d'un Delta ({} blocs) !", blocks.len());
                     
                     if chain.resolve_partial_fork(blocks.clone()) { 
-                        println!("✅ Synchronisation partielle réussie ! Nous sommes à jour.");
                         let mut mp = mempool.lock().unwrap();
-                        // 💡 FIX
                         mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)) });
                     }
                 },
@@ -162,14 +151,12 @@ fn start_peer_connection(
                 P2PMessage::NewBlock { block, sender_port } => {
                     let reject_info = {
                         let mut chain = blockchain.lock().unwrap();
-                        if let Err(e) = chain.validate_and_add_external_block(block.clone()) {
-                            println!("   🚨 BLOC REJETÉ : {}", e);
+                        if let Err(_) = chain.validate_and_add_external_block(block.clone()) {
                             Some((chain.chain[0].header.hash.clone(), chain.chain.len() as u64))
                         } else { None }
                     };
 
                     if let Some((my_genesis, my_height)) = reject_info {
-                        println!("🕰️ [P2P] Bloc obsolète. On réveille {} !", sender_port);
                         send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
                     } else {
                         println!("\n====================================================================");
@@ -177,7 +164,6 @@ fn start_peer_connection(
                         println!("🔗 Hash: {}", block.header.hash);
                         println!("====================================================================");
                         println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
-                        // 💡 FIX
                         mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) });
                         
                         let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port.clone() };
@@ -196,11 +182,8 @@ fn start_peer_connection(
                 P2PMessage::WhisperTransaction { tx: in_tx } => {
                     let mut rng = rand::thread_rng();
                     if rng.gen_range(1..=10) <= 2 {
-                        println!("🌼 [DANDELION] Explosion du pissenlit ! Diffusion publique.");
                         mempool.lock().unwrap().push(in_tx);
-                    } else {
-                        println!("🤫 [DANDELION] Relais furtif de la TX...");
-                    }
+                    } 
                 },
 
                 P2PMessage::BroadcastTransaction { tx: in_tx } => {
@@ -223,9 +206,8 @@ fn start_peer_connection(
                     let chain = blockchain.lock().unwrap(); 
                     let mut added = 0;
                     for t in txs {
-                        // 💡 FIX
                         let mut spent = false;
-                        if !t.is_coinbase {
+                        if t.tx_type != TransactionType::Coinbase {
                             for input in &t.inputs {
                                 if chain.spent_key_images.contains(&input.pq_ring_signature.key_image) {
                                     spent = true;
@@ -296,7 +278,6 @@ pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: Ac
 
     let peers = active_peers.lock().unwrap().clone();
     for (peer_id, sender) in peers.iter() {
-        println!("🚀 Envoi du bloc dans le tunnel vers {}...", peer_id);
         let _ = sender.try_send(json_str.clone());
     }
 }
@@ -308,7 +289,6 @@ pub async fn broadcast_transaction(tx: Transaction, active_peers: ActivePeers) {
 
     let peers = active_peers.lock().unwrap().clone();
     for (peer_id, sender) in peers.iter() {
-        println!("🚀 Envoi de la TX dans le tunnel vers {}...", peer_id);
         let _ = sender.try_send(json_str.clone());
     }
 }
@@ -320,7 +300,6 @@ pub async fn broadcast_order(order: Order, active_peers: ActivePeers) {
 
     let peers = active_peers.lock().unwrap().clone();
     for (peer_id, sender) in peers.iter() {
-        println!("🚀 Envoi de l'Ordre DEX dans le tunnel vers {}...", peer_id);
         let _ = sender.try_send(json_str.clone());
     }
 }

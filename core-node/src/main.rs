@@ -9,8 +9,8 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::collections::{HashSet, HashMap}; 
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXDataset, RandomXVM};
-use blockchain::Blockchain;
-use transaction::Transaction;
+use blockchain::{Blockchain, EPOCH_BLOCKS}; // 💡 On importe la constante
+use transaction::{Transaction, TransactionType};
 use api::SharedPool; 
 
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
@@ -54,13 +54,10 @@ async fn main() {
     let mempool: SharedMempool = Arc::new(Mutex::new(Vec::new()));
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
 
-    let genesis_hash = shared_chain.lock().unwrap().chain[0].header.hash.clone();
+    // 💡 L'initialisation se fera juste avant le minage
     
     let known_peers: SharedPeers = Arc::new(Mutex::new(HashSet::new()));
-    if let Some(target) = &peer_target {
-        known_peers.lock().unwrap().insert(target.clone()); 
-    }
-
+    if let Some(target) = &peer_target { known_peers.lock().unwrap().insert(target.clone()); }
     let active_peers: network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
 
     let p2p_chain = Arc::clone(&shared_chain);
@@ -105,12 +102,16 @@ async fn main() {
         println!("\n⚙️  Initialisation du moteur RandomX...");
         let start_rx = std::time::Instant::now(); 
         
+        // 💡 NOUVEAU : On gère l'époque dynamique !
         let flags = RandomXFlag::get_recommended_flags();
-        let cache = RandomXCache::new(flags, genesis_hash.as_bytes()).unwrap();
+        let mut current_epoch = 0;
+        let mut seed_hash = shared_chain.lock().unwrap().get_epoch_seed(1);
+        
+        let mut cache = RandomXCache::new(flags, seed_hash.as_bytes()).unwrap();
         
         println!("⏳ Allocation du Dataset de 2 Go en RAM (Veuillez patienter...)");
-        let dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
-        let vm = RandomXVM::new(flags, Some(cache), Some(dataset)).unwrap();
+        let mut dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
+        let mut vm = RandomXVM::new(flags, Some(cache.clone()), Some(dataset.clone())).unwrap();
         println!("✅ RandomX prêt en {:.2?} !", start_rx.elapsed());
 
         println!("\n⛏️  Début de l'extraction pour l'adresse : {}...", miner_address);
@@ -121,6 +122,23 @@ async fn main() {
                 let pending_txs = mempool.lock().unwrap().clone();
                 chain.prepare_block_template(pending_txs, &miner_address)
             };
+
+            // 💡 VÉRIFICATION DE L'ÉPOQUE : Si on franchit le cap, on détruit les ASICs !
+            let target_epoch = (candidate_block.header.index - 1) / EPOCH_BLOCKS;
+            if target_epoch > current_epoch {
+                println!("\n==========================================================");
+                println!("🔄 CHANGEMENT D'ÉPOQUE RANDOMX ! (Nouvelle Époque : {})", target_epoch);
+                println!("==========================================================");
+                current_epoch = target_epoch;
+                
+                seed_hash = shared_chain.lock().unwrap().get_epoch_seed(candidate_block.header.index);
+
+                println!("⏳ Recalcul du Dataset de 2 Go pour éjecter les ASICs... (Cela prendra ~30s)");
+                cache = RandomXCache::new(flags, seed_hash.as_bytes()).unwrap();
+                dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
+                vm = RandomXVM::new(flags, Some(cache.clone()), Some(dataset.clone())).unwrap();
+                println!("✅ Nouvelle Ère prête ! Le réseau est sécurisé.");
+            }
 
             let mut mined = false;
 
@@ -177,9 +195,8 @@ async fn main() {
                     println!("💰 Frais perçus  : {} Flames", total_fees);
                     println!("====================================================================\n");
                     
-                    // 💡 FIX : On utilise inputs
                     for tx in &candidate_block.transactions {
-                        if !tx.is_coinbase {
+                        if tx.tx_type != TransactionType::Coinbase {
                             for input in &tx.inputs {
                                 chain.spent_key_images.insert(input.pq_ring_signature.key_image.clone());
                             }
@@ -201,7 +218,6 @@ async fn main() {
                 }
                 
                 let mut mp = mempool.lock().unwrap();
-                // 💡 FIX
                 mp.retain(|tx| {
                     !candidate_block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)
                 });

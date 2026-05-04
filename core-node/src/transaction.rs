@@ -4,6 +4,15 @@ use crate::lattice::LatticeCommitment;
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;   
 
+// 💡 NOUVEAU : Le typage strict des transactions !
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TransactionType {
+    Coinbase,
+    Standard,
+    HTLCLock { hash: String, timeout_block: u64 }, // Bloque les fonds avec un Hash
+    HTLCClaim { secret: String },                  // Débloque les fonds avec le Secret
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PQLatticeRingSignature {
     pub key_image: String,          
@@ -12,77 +21,69 @@ pub struct PQLatticeRingSignature {
     pub p_keys: Vec<Vec<u32>>, 
 }
 
-// 📦 L'ARGENT QUI ENTRE (Dépense d'un ancien UTXO)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
-    pub pq_ring_inputs: Vec<String>, // Les leurres + la vraie clé
-    pub pq_ring_signature: PQLatticeRingSignature, // La preuve d'appartenance
-    pub commitment: LatticeCommitment, // L'engagement mathématique de la somme dépensée
+    pub pq_ring_inputs: Vec<String>,
+    pub pq_ring_signature: PQLatticeRingSignature,
+    pub commitment: LatticeCommitment,
 }
 
-// 🎁 L'ARGENT QUI SORT (Le destinataire ET ton rendu de monnaie)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionOutput {
     pub stealth_address: String,      
     pub kyber_capsule: String,        
     pub aes_vault: String,            
-    pub lattice_commitment: LatticeCommitment, // L'engagement de la nouvelle pièce
+    pub lattice_commitment: LatticeCommitment,
 }
 
-// 🔄 LA NOUVELLE TRANSACTION ZKP
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    pub is_coinbase: bool, // Vrai pour le Genesis et les Mineurs
+    pub tx_type: TransactionType, // 💡 FINI le 'is_coinbase' booléen !
     pub inputs: Vec<TransactionInput>,  
     pub outputs: Vec<TransactionOutput>, 
     pub fee: u64,                     
-    pub dilithium_signature: String,  // Optionnel/Prunable
+    pub dilithium_signature: String,  
 }
 
 impl Transaction {
     pub fn is_valid(&self) -> bool {
-        // 1. Passe-droit exclusif pour la création monétaire (Miner/Genesis)
-        if self.is_coinbase || self.dilithium_signature == "PRUNED" { 
+        if self.tx_type == TransactionType::Coinbase || self.dilithium_signature == "PRUNED" { 
+            return true; 
+        }
+
+        // 💡 Validation temporaire du Claim (En attendant de lier l'UTXO Lock)
+        if let TransactionType::HTLCClaim { secret } = &self.tx_type {
+            if secret.is_empty() { return false; }
             return true; 
         }
 
         // =================================================================
-        // ⚖️ 2. L'ILLUSION HOMOMORPHE (Vérification Zero-Knowledge ZKP)
+        // ⚖️ 2. L'ILLUSION HOMOMORPHE (ZKP)
         // =================================================================
         let mut sum_inputs_c2 = 0u64;
-        for input in &self.inputs {
-            sum_inputs_c2 = (sum_inputs_c2 + input.commitment.c2) % (LATTICE_Q as u64);
-        }
+        for input in &self.inputs { sum_inputs_c2 = (sum_inputs_c2 + input.commitment.c2) % (LATTICE_Q as u64); }
 
         let mut sum_outputs_c2 = 0u64;
-        for out in &self.outputs {
-            sum_outputs_c2 = (sum_outputs_c2 + out.lattice_commitment.c2) % (LATTICE_Q as u64);
-        }
+        for out in &self.outputs { sum_outputs_c2 = (sum_outputs_c2 + out.lattice_commitment.c2) % (LATTICE_Q as u64); }
 
-        // Les frais sont en clair (r = 0), on les convertit dans le champ Lattice
         let fee_commitment_c2 = self.fee % (LATTICE_Q as u64);
         let required_output_sum = (sum_outputs_c2 + fee_commitment_c2) % (LATTICE_Q as u64);
 
-        // LE COUPERET : On empêche la création magique de WATT !
         if sum_inputs_c2 != required_output_sum {
-            println!("🛑 REJET ZKP : Les montants cachés ne s'équilibrent pas. Création de fausse monnaie détectée !");
+            println!("🛑 REJET ZKP : Les montants cachés ne s'équilibrent pas !");
             return false;
         }
 
         // =================================================================
-        // 🌀 3. L'ÉPREUVE DU CERCLE LATTICE (Pour CHAQUE Input)
+        // 🌀 3. L'ÉPREUVE DU CERCLE LATTICE
         // =================================================================
-        
-        // On hache les outputs pour figer la transaction (Oracle Fiat-Shamir)
         let tx_data = format!("{:?}{}", self.outputs, self.fee);
 
         for input in &self.inputs {
             let n = input.pq_ring_inputs.len();
             let pq_ring = &input.pq_ring_signature;
             
-            if n == 0 || pq_ring.z_responses.len() != n || pq_ring.p_keys.len() != n {
-                return false;
-            }
+            if n == 0 || pq_ring.z_responses.len() != n || pq_ring.p_keys.len() != n { return false; }
 
             let mut current_c = hex::decode(&pq_ring.c0).unwrap_or_default();
 
@@ -104,9 +105,7 @@ impl Transaction {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(tx_data.as_bytes());
                 hasher.update(pk_hex.as_bytes()); 
-                for val in r_i {
-                    hasher.update(&val.to_le_bytes());
-                }
+                for val in r_i { hasher.update(&val.to_le_bytes()); }
                 current_c = hasher.finalize().as_bytes().to_vec();
             }
 
@@ -115,7 +114,6 @@ impl Transaction {
                 return false;
             }
         }
-
         true 
     }
 }

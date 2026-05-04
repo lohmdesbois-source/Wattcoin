@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionType, TransactionOutput};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -23,16 +23,16 @@ impl Block {
             index: 0,
             timestamp: 1713000000, 
             previous_hash: String::from("0000000000000000000000000000000000000000000000000000000000000000"),
-            hash: String::from("GENESIS_HASH_WATTCOIN_000000000000000000000000000000000000000000"), // Hash codé en dur
+            hash: String::from("GENESIS_HASH_WATTCOIN_000000000000000000000000000000000000000000"),
             nonce: 0,
         };
 
         // 🌍 LE VÉRITABLE GENESIS BLOCK QUANTIQUE DE WATTCOIN
         let tx = Transaction {
-            is_coinbase: true,
-            inputs: vec![], // Aucun input, c'est la genèse !
+            tx_type: TransactionType::Coinbase, // 💡 LE NOUVEAU MOTEUR
+            inputs: vec![],
             outputs: vec![
-                crate::transaction::TransactionOutput {
+                TransactionOutput {
                     stealth_address: "GENESIS".to_string(),
                     kyber_capsule: "GENESIS_KEY".to_string(),
                     aes_vault: "Wattcoin: L'énergie libre, anonyme et post-quantique. 03/Mai/2026 - Le monde change aujourd'hui.".to_string(),

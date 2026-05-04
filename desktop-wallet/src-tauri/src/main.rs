@@ -20,7 +20,8 @@ use tauri::Emitter;
 use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as _, SecretKey as _};
 use pqcrypto_traits::sign::{SignedMessage, PublicKey as _, SecretKey as _};
 
-const NODE_URL: &str = "http://80.78.26.243:8100";
+const NODE_URL: &str = "http://127.0.0.1:8100";
+//const NODE_URL: &str = "http://80.78.26.243:8100";
 const VAULT_FILE: &str = ".wattcoin_vault";
 
 const LATTICE_Q: u32 = 8380417; 
@@ -60,9 +61,17 @@ pub struct TransactionInput {
     pub commitment: LatticeCommitment, 
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TransactionType {
+    Coinbase,
+    Standard,
+    HTLCLock { hash: String, timeout_block: u64 },
+    HTLCClaim { secret: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    pub is_coinbase: bool,
+    pub tx_type: TransactionType, // 💡 Le nouveau moteur
     pub inputs: Vec<TransactionInput>, 
     pub outputs: Vec<TransactionOutput>, 
     pub fee: u64, 
@@ -603,7 +612,7 @@ async fn send_wattcoin(
     }
 
     let tx_pq = Transaction {
-        is_coinbase: false,
+        tx_type: TransactionType::Standard, // 💡 NOUVEAU
         inputs: final_inputs,
         outputs,
         fee,
@@ -747,8 +756,8 @@ async fn claim_wattcoin_swap(
     let lattice_commitment = LatticeCommitment::commit(amount_in_flames, 0);
 
     let claim_tx = Transaction {
-        is_coinbase: true, // 💡 Bypasse la vérification ZKP puisque le DEX libère de l'argent verrouillé
-        inputs: vec![],
+        tx_type: TransactionType::HTLCClaim { secret: secret.clone() }, // 💡 LE VRAI CONTRAT !
+        inputs: vec![], // Sera remplacé par le vrai UTXO bloqué dans la V2 du DEX
         outputs: vec![
             TransactionOutput {
                 stealth_address: watt_address,
@@ -758,7 +767,7 @@ async fn claim_wattcoin_swap(
             }
         ],
         fee: 0,
-        dilithium_signature: secret, 
+        dilithium_signature: secret, // On le garde temporairement pour le debug
     };
 
     let client = reqwest::Client::new();

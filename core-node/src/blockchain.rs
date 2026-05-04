@@ -1,5 +1,5 @@
 use crate::block::{Block, BlockHeader};
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionType};
 use std::fs;
 use num_bigint::BigUint;
 use std::collections::HashSet;
@@ -13,6 +13,9 @@ const INITIAL_REWARD: f64 = 50.0 * (FLAME as f64);
 const DECAY_FACTOR: f64 = 0.999999;  
 const TAIL_EMISSION: u64 = 1 * FLAME; 
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
+
+// 💡 NOUVEAU : Changement de Dataset tous les 20 blocs pour tuer les ASICs !
+pub const EPOCH_BLOCKS: u64 = 20; 
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
@@ -34,6 +37,19 @@ impl Blockchain {
         blockchain
     }
     
+    // 💡 NOUVEAU : Trouve la graine RandomX appropriée pour une hauteur de bloc donnée
+    pub fn get_epoch_seed(&self, height: u64) -> String {
+        if height <= EPOCH_BLOCKS {
+            return self.chain[0].header.hash.clone(); // Ère 0 : On utilise le Genesis
+        }
+        let target_block = ((height - 1) / EPOCH_BLOCKS) * EPOCH_BLOCKS;
+        if (target_block as usize) < self.chain.len() {
+            self.chain[target_block as usize].header.hash.clone()
+        } else {
+            self.chain[0].header.hash.clone() // Fallback sécurité
+        }
+    }
+
     pub fn load_from_disk(filename: &str) -> Self {
         if let Ok(data) = fs::read_to_string(filename) {
             if let Ok(chain) = serde_json::from_str::<Vec<Block>>(&data) {
@@ -43,7 +59,7 @@ impl Blockchain {
                 let mut spent_key_images = HashSet::new();
                 for block in &chain {
                     for tx in &block.transactions {
-                        if !tx.is_coinbase {
+                        if tx.tx_type != TransactionType::Coinbase {
                             for input in &tx.inputs {
                                 spent_key_images.insert(input.pq_ring_signature.key_image.clone());
                             }
@@ -81,7 +97,7 @@ impl Blockchain {
         for tx in transactions {
             if tx.is_valid() { 
                 let mut double_spend = false;
-                if !tx.is_coinbase {
+                if tx.tx_type != TransactionType::Coinbase {
                     for input in &tx.inputs {
                         if self.spent_key_images.contains(&input.pq_ring_signature.key_image) {
                             double_spend = true;
@@ -121,14 +137,13 @@ impl Blockchain {
         calculated_reward += total_fees; 
         println!("📉 Le mineur, avec le tips : {} Flames gagne en tout : {:.6} Watts", total_fees, (calculated_reward as f64) / (FLAME as f64));
 
-        // 🎁 La transaction de création de monnaie (Coinbase) PQ
         let coinbase_tx = Transaction {
-            is_coinbase: true,
+            tx_type: TransactionType::Coinbase,
             inputs: vec![],
             outputs: vec![
                 crate::transaction::TransactionOutput {
                     stealth_address: format!("COINBASE_{}", miner_address), 
-                    kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height), // 💡 IDENTIFIANT UNIQUE ICI
+                    kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
                     aes_vault: calculated_reward.to_string(), 
                     lattice_commitment: crate::lattice::LatticeCommitment::commit(calculated_reward, 0),
                 }
@@ -160,7 +175,7 @@ impl Blockchain {
         for block in &mut self.chain {
             if block.header.index < prune_target {
                 for tx in &mut block.transactions {
-                    if tx.dilithium_signature != "PRUNED" && !tx.is_coinbase {
+                    if tx.dilithium_signature != "PRUNED" && tx.tx_type != TransactionType::Coinbase {
                         tx.dilithium_signature.clear(); 
                         tx.dilithium_signature.push_str("PRUNED"); 
                         for input in &mut tx.inputs {
@@ -175,7 +190,7 @@ impl Blockchain {
         }
 
         if pruned_count > 0 {
-            println!("🪓 Pruning automatique (Profondeur {} blocs) : {} signatures quantiques purgées pour sauver l'espace !", MATURITY_BLOCKS, pruned_count);
+            println!("🪓 Pruning automatique : {} signatures quantiques purgées pour sauver l'espace !", pruned_count);
         }
     }
     
@@ -183,15 +198,25 @@ impl Blockchain {
         if new_chain.is_empty() || new_chain[0].header.hash != self.chain[0].header.hash { return false; }
 
         let flags = RandomXFlag::get_recommended_flags();
-        let genesis_hash = &new_chain[0].header.hash;
-        let cache = RandomXCache::new(flags, genesis_hash.as_bytes()).unwrap();
-        let vm = RandomXVM::new(flags, Some(cache), None).unwrap(); 
+        
+        // 💡 FIX : On utilise le bon Dataset !
+        let mut current_seed = self.get_epoch_seed(new_chain[1].header.index);
+        let mut cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
+        let mut vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap(); 
 
         for i in 1..new_chain.len() {
             let previous_block = &new_chain[i - 1];
             let current_block = &new_chain[i];
             if current_block.header.previous_hash != previous_block.header.hash { return false; }
             
+            // Si on change d'époque pendant le fork, on change la VM légère !
+            let needed_seed = self.get_epoch_seed(current_block.header.index);
+            if needed_seed != current_seed {
+                current_seed = needed_seed;
+                cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
+                vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
+            }
+
             let header_data = format!("{}{}{}{}", current_block.header.index, current_block.header.timestamp, current_block.header.previous_hash, current_block.header.nonce);
             let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
             let expected_hash = hex::encode(&hash_bytes);
@@ -205,7 +230,7 @@ impl Blockchain {
         let mut new_spent = HashSet::new();
         for block in &self.chain {
             for tx in &block.transactions {
-                if !tx.is_coinbase {
+                if tx.tx_type != TransactionType::Coinbase {
                     for input in &tx.inputs {
                         new_spent.insert(input.pq_ring_signature.key_image.clone());
                     }
@@ -228,11 +253,18 @@ impl Blockchain {
         if self.chain[ancestor_index].header.hash != new_blocks[0].header.previous_hash { return false; }
 
         let flags = RandomXFlag::get_recommended_flags();
-        let genesis_hash = &self.chain[0].header.hash;
-        let cache = RandomXCache::new(flags, genesis_hash.as_bytes()).unwrap();
-        let vm = RandomXVM::new(flags, Some(cache), None).unwrap(); 
+        let mut current_seed = self.get_epoch_seed(new_blocks[0].header.index);
+        let mut cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
+        let mut vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap(); 
 
         for block in &new_blocks {
+            let needed_seed = self.get_epoch_seed(block.header.index);
+            if needed_seed != current_seed {
+                current_seed = needed_seed;
+                cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
+                vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
+            }
+
             let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
             let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
             if hex::encode(&hash_bytes) != block.header.hash { return false; }
@@ -251,7 +283,7 @@ impl Blockchain {
             let mut new_spent = HashSet::new();
             for block in &self.chain {
                 for tx in &block.transactions {
-                    if !tx.is_coinbase {
+                    if tx.tx_type != TransactionType::Coinbase {
                         for input in &tx.inputs {
                             new_spent.insert(input.pq_ring_signature.key_image.clone());
                         }
@@ -270,8 +302,9 @@ impl Blockchain {
         if block.header.previous_hash != last_block.header.hash { return Err("Rupture de la chaîne.".to_string()); }
 
         let flags = RandomXFlag::get_recommended_flags();
-        let genesis_hash = &self.chain[0].header.hash;
-        let cache = RandomXCache::new(flags, genesis_hash.as_bytes()).map_err(|_| "Erreur Cache")?;
+        // 💡 FIX : Le Tribunal charge le Dataset de la bonne époque pour juger le bloc !
+        let seed = self.get_epoch_seed(block.header.index);
+        let cache = RandomXCache::new(flags, seed.as_bytes()).map_err(|_| "Erreur Cache")?;
         let vm = RandomXVM::new(flags, Some(cache), None).map_err(|_| "Erreur VM")?;
 
         let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
@@ -288,19 +321,17 @@ impl Blockchain {
         for tx in &block.transactions {
             if !tx.is_valid() { return Err("Signature invalide.".to_string()); }
 
-            if tx.is_coinbase {
+            if tx.tx_type == TransactionType::Coinbase {
                 coinbase_count += 1;
-                // 💡 NOUVEAU COUPERET : On vérifie juste le préfixe
                 if tx.outputs.is_empty() || !tx.outputs[0].kyber_capsule.starts_with("COINBASE_CAPSULE") { 
                     return Err("Montant Coinbase illégal.".to_string());
                 }
             } else {
                 for input in &tx.inputs {
-                    // Loi Cypherpunk: Vérification de la maturité (les fonds doivent reposer 3 blocs)
                     for input_ref in &input.pq_ring_inputs {
                         for (height, past_block) in self.chain.iter().enumerate() {
                             if let Some(source_tx) = past_block.transactions.iter().find(|t| t.outputs.iter().any(|o| &o.stealth_address == input_ref)) {
-                                if source_tx.is_coinbase {
+                                if source_tx.tx_type == TransactionType::Coinbase {
                                     let age = block.header.index - (height as u64);
                                     if age < MATURITY_BLOCKS {
                                         return Err(format!("Fonds immatures (Âge: {} blocs).", age));
@@ -394,7 +425,7 @@ impl Blockchain {
         let mut all_stealth = Vec::new();
         for block in &self.chain {
             for tx in &block.transactions {
-                if !tx.is_coinbase {
+                if tx.tx_type != TransactionType::Coinbase {
                     for out in &tx.outputs {
                         all_stealth.push(out.stealth_address.clone());
                     }
