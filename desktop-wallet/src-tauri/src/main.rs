@@ -20,8 +20,8 @@ use tauri::Emitter;
 use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as _, SecretKey as _};
 use pqcrypto_traits::sign::{SignedMessage, PublicKey as _, SecretKey as _};
 
-const NODE_URL: &str = "http://127.0.0.1:8100";
-//const NODE_URL: &str = "http://80.78.26.243:8100";
+//const NODE_URL: &str = "http://127.0.0.1:8100";
+const NODE_URL: &str = "http://80.78.26.243:8100";
 const VAULT_FILE: &str = ".wattcoin_vault";
 
 const LATTICE_Q: u32 = 8380417; 
