@@ -864,6 +864,26 @@ fn destroy_vault() -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<Vec<SwapContract>, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/swaps", NODE_URL);
+    let res = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?;
+    
+    if res.status().is_success() {
+        let all_swaps: Vec<SwapContract> = res.json().await.map_err(|_| "Erreur JSON".to_string())?;
+        
+        // 💡 Le Wallet filtre pour ne garder que les contrats qui l'intéressent !
+        let my_swaps: Vec<SwapContract> = all_swaps.into_iter()
+            .filter(|s| s.buyer_btc_address == btc_address || s.seller_watt_address == watt_address)
+            .collect();
+            
+        Ok(my_swaps)
+    } else {
+        Ok(vec![]) // Si la route n'existe pas encore (le serveur n'a pas redémarré), on renvoie un tableau vide
+    }
+}
+
 
 fn main() {
     tauri::Builder::default()
@@ -897,7 +917,7 @@ fn main() {
             generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
             submit_order, get_dark_pool, resolve_batch, get_watt_balance, get_btc_balance,
             send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, simulate_bot_lock,
-            destroy_vault
+            destroy_vault, get_active_swaps
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

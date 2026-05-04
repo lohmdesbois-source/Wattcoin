@@ -6,6 +6,8 @@ use serde::{Serialize, Deserialize};
 use rand::RngCore;
 
 pub type SharedPool = Arc<Mutex<Vec<Order>>>;
+// 💡 AJOUT : La mémoire partagée pour les contrats en cours
+pub type SharedSwaps = Arc<Mutex<Vec<SwapContract>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
@@ -17,7 +19,7 @@ pub struct Order {
     pub watt_address: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)] // 💡 N'oublie pas le 'Clone' ici
 pub struct SwapContract {
     pub buyer_btc_address: String,
     pub seller_watt_address: String,
@@ -50,6 +52,24 @@ pub async fn start_api_server(
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
     let peers_filter = warp::any().map(move || Arc::clone(&known_peers));
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
+
+    // 💡 AJOUT : Création de la mémoire des Swaps
+    let active_swaps: SharedSwaps = Arc::new(Mutex::new(Vec::new()));
+    
+    // On crée un clone de l'Arc pour la route resolve
+    let active_swaps_resolve = Arc::clone(&active_swaps);
+    let swaps_filter_for_resolve = warp::any().map(move || Arc::clone(&active_swaps_resolve));
+    
+    // On crée un AUTRE clone de l'Arc pour la route get
+    let active_swaps_get = Arc::clone(&active_swaps);
+    let swaps_filter_for_get = warp::any().map(move || Arc::clone(&active_swaps_get));
+
+    let get_swaps = warp::path("swaps")
+        .and(warp::get())
+        .and(swaps_filter_for_get)
+        .map(|swaps: SharedSwaps| {
+            warp::reply::json(&*swaps.lock().unwrap())
+        });
 
     // 1. ROUTE : RECEVOIR UNE TRANSACTION WATTCOIN
     let send_tx = warp::post()
@@ -140,11 +160,12 @@ pub async fn start_api_server(
             warp::reply::json(&"Ordre ajouté et propagé")
         });
 
-    // 5. 💥 ROUTE : LE MOTEUR DE MATCHING (LA MAGIE DU DEX)
+    // 5. 💥 ROUTE : LE MOTEUR DE MATCHING
     let resolve_batch = warp::post()
         .and(warp::path("resolve"))
         .and(dex_pool_filter.clone())
-        .map(|pool: SharedPool| { 
+        .and(swaps_filter_for_resolve) // 💡 AJOUT : On passe la mémoire des swaps à la route
+        .map(|pool: SharedPool, swaps_memory: SharedSwaps| { 
             let mut orders = pool.lock().unwrap();
             if orders.is_empty() {
                 return warp::reply::json(&BatchResult { success: false, message: "Piscine vide.".to_string(), clearing_price_sats: 0, total_volume_flames: 0, swaps: vec![] });
@@ -197,6 +218,10 @@ pub async fn start_api_server(
 
             if total_volume_flames > 0 {
                 println!("⚖️ [DEX] Ordres croisés ! Volume: {} Flames", total_volume_flames);
+                
+                // 💡 AJOUT : On sauvegarde les swaps générés dans la mémoire du Serveur !
+                swaps_memory.lock().unwrap().extend(generated_swaps.clone());
+                
                 warp::reply::json(&BatchResult { success: true, message: "Ordres croisés !".to_string(), clearing_price_sats, total_volume_flames, swaps: generated_swaps })
             } else {
                 warp::reply::json(&BatchResult { success: false, message: "Aucun croisement possible.".to_string(), clearing_price_sats: 0, total_volume_flames: 0, swaps: vec![] })
@@ -221,7 +246,8 @@ pub async fn start_api_server(
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST"]);
 
-    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(resolve_batch).or(info_route)
+    // 💡 AJOUT : On n'oublie pas d'ajouter get_swaps dans les routes finales
+    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(resolve_batch).or(info_route).or(get_swaps)
         .with(cors);
     
     warp::serve(routes).run((host_ip, port)).await;
