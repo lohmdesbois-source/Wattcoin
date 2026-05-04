@@ -12,7 +12,8 @@ function App() {
   
   const [wattBalance, setWattBalance] = useState(0.0);
   const [btcBalance, setBtcBalance] = useState(0.0);
-  const [btcUsdPrice, setBtcUsdPrice] = useState(0.0); // 💡 NOUVEAU : Prix USD
+  const [btcUsdPrice, setBtcUsdPrice] = useState(0.0); 
+  const [globalWattPriceSats, setGlobalWattPriceSats] = useState(0);
   
   const [activeCoinModal, setActiveCoinModal] = useState(null); 
   const [activeContractAddress, setActiveContractAddress] = useState(null);
@@ -58,7 +59,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (view !== "dex" && view !== "dashboard" && view !== "swaps") return; // 💡 NOUVEAU: On ajoute "swaps"
+    if (view !== "dex" && view !== "dashboard" && view !== "swaps") return;
 
     const updateData = async () => {
       if (!walletData) return;
@@ -79,7 +80,6 @@ function App() {
         } catch (e) { console.error(e); }
       }
 
-      // 💡 NOUVEAU : Auto-Check des Swaps en cours
       try {
         const swaps = await invoke("get_active_swaps", { 
           btcAddress: walletData.btc_address, 
@@ -89,16 +89,27 @@ function App() {
       } catch (e) { console.error("Erreur Swaps:", e); }
     };
 
-    updateData(); // Premier chargement
+    updateData();
 
     let unlisten;
     const setupListener = async () => {
       unlisten = await listen("network-update", () => {
-        console.log("🔄 Nouveau bloc miné sur le réseau ! Mise à jour des soldes...");
+        // 💡 FETCH DU PRIX GLOBAL LORS D'UN NOUVEAU BLOC
+        fetch("http://80.78.26.243:8100/info")
+          .then(res => res.json())
+          .then(data => {
+             if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats);
+          }).catch(()=>{});
+
         updateData();
       });
     };
     setupListener();
+
+    // 💡 FETCH DU PRIX INITIAL
+    fetch("http://80.78.26.243:8100/info").then(res => res.json()).then(data => {
+        if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats);
+    }).catch(()=>{});
 
     const timerDex = setInterval(async () => {
       if (view === "dex") {
@@ -108,6 +119,7 @@ function App() {
                if(result.success) {
                  setPendingSwaps(result.swaps);
                  alert(`⚖️ RÉSOLU ! Prix : ${(result.clearing_price_sats / 100000000).toFixed(8)} BTC`);
+                 setGlobalWattPriceSats(result.clearing_price_sats); // MAJ INSTANTANÉE
                }
             });
             return 120;
@@ -117,10 +129,7 @@ function App() {
       }
     }, 1000);
 
-    return () => {
-      clearInterval(timerDex);
-      if (unlisten) unlisten();
-    };
+    return () => { clearInterval(timerDex); if (unlisten) unlisten(); };
   }, [view, walletData]);
 
   const handleUnlock = async () => {
@@ -143,7 +152,9 @@ function App() {
     }
     await invoke("submit_order", {
       orderType: orderType, amount: parseFloat(orderAmount), price: parseFloat(orderPrice),
-      btcAddress: walletData.btc_address, wattAddress: walletData.watt_address
+      btcAddress: walletData.btc_address, 
+      btcPubkey: walletData.btc_pubkey_hex, // 💡 LA VRAIE CLÉ EST ENVOYÉE
+      wattAddress: walletData.watt_address
     });
     setOrderAmount(""); setOrderPrice("");
     try {
@@ -207,7 +218,8 @@ function App() {
   const handleFundSwap = async (swap) => {
     try {
       const contractAddress = await invoke("create_btc_htlc", {
-        masterSeedHex: walletData.master_seed_hex,
+        buyerPubkeyHex: swap.buyer_btc_pubkey,   // 💡 ALICE
+        sellerPubkeyHex: swap.seller_btc_pubkey, // 💡 BOB
         hashHex: swap.htlc_hash,
         locktime: 144 
       });
@@ -283,8 +295,9 @@ function App() {
   }
 
   if (view === "dashboard") {
-    // 💡 ESTIMATION DU PRIX WATT (Pour le visuel) - Basé sur un prix fictif ou le DEX
-    const wattUsdPrice = btcUsdPrice * 0.0001; 
+    // Si le prix est à zéro (début de chaîne), le WATT ne vaut rien en USD.
+    const wattBtcPrice = globalWattPriceSats / 100000000;
+    const wattUsdPrice = wattBtcPrice * btcUsdPrice;
 
     return (
       <div className="dashboard-layout"><Sidebar activeTab="dashboard" />
@@ -385,8 +398,23 @@ function App() {
                 <div className={`tab-btn buy ${orderType === "buy" ? "active" : ""}`} onClick={() => setOrderType("buy")}>Achat</div>
                 <div className={`tab-btn sell ${orderType === "sell" ? "active" : ""}`} onClick={() => setOrderType("sell")}>Vente</div>
               </div>
-              <input type="number" placeholder="Quantité WATT" value={orderAmount} onChange={(e) => setOrderAmount(e.target.value)} />
-              <input type="number" placeholder="Prix en BTC" value={orderPrice} onChange={(e) => setOrderPrice(e.target.value)} />
+              
+              <label style={{color: "#888", fontSize: "0.8rem", marginTop:"10px", display:"block"}}>Quantité (WATT)</label>
+              <input type="number" placeholder="Ex: 10" value={orderAmount} onChange={(e) => setOrderAmount(e.target.value)} />
+              
+              <label style={{color: "#888", fontSize: "0.8rem", marginTop:"10px", display:"block"}}>Prix Unitaire (BTC)</label>
+              <input type="number" placeholder="Ex: 0.00001" value={orderPrice} onChange={(e) => setOrderPrice(e.target.value)} />
+              
+              {/* 💡 SÉCURITÉ UX : Le Total */}
+              {orderAmount && orderPrice && (
+                <div style={{ background: "rgba(0,0,0,0.4)", padding: "10px", borderRadius: "5px", marginBottom: "15px", border: "1px solid #444", textAlign: "center" }}>
+                  <span style={{color: "#888", fontSize: "0.9rem"}}>Total estimé :</span><br/>
+                  <strong style={{color: orderType === "buy" ? "#ff4d4d" : "#00FF00", fontSize: "1.2rem"}}>
+                    {(parseFloat(orderAmount) * parseFloat(orderPrice)).toFixed(8)} BTC
+                  </strong>
+                </div>
+              )}
+
               <button className={`submit-order-btn ${orderType}`} style={{ width: "100%" }} onClick={handleSubmitOrder}>Envoyer au Dark Pool</button>
             </div>
             <div className="dark-pool">
@@ -436,22 +464,27 @@ function App() {
                   <thead><tr><th>Votre Rôle</th><th>Hash HTLC</th><th>WATT</th><th>BTC</th><th>Action Requise</th></tr></thead>
                   <tbody>
                     {pendingSwaps.map((s, i) => {
-                      // 💡 L'interface devine TOUTE SEULE qui est qui !
                       const isAlice = s.buyer_btc_address === walletData.btc_address;
                       const isBob = s.seller_watt_address === walletData.watt_address;
 
                       return (
                       <tr key={i}>
                         <td>
-                          {isAlice ? <span className="badge" style={{background: "#10b981"}}>Acheteur WATT (Alice)</span> : 
-                           isBob ? <span className="badge" style={{background: "#F7931A"}}>Vendeur WATT (Bob)</span> : 
+                          {isAlice ? <span className="badge" style={{background: "#10b981"}}>Acheteur WATT</span> : 
+                           isBob ? <span className="badge" style={{background: "#F7931A"}}>Vendeur WATT</span> : 
                            <span className="badge">Observateur</span>}
                         </td>
                         <td style={{ fontFamily: "monospace", fontSize: "0.8rem", color: "var(--primary)" }}>
                           {s.htlc_hash.substring(0, 16)}...
                         </td>
                         <td style={{ fontWeight: "bold" }}>{s.watt_amount_flames / 1000000000}</td>
-                        <td style={{ fontWeight: "bold" }}>{s.btc_amount_sats / 100000000}</td>
+                        <td style={{ fontWeight: "bold" }}>
+                          {s.btc_amount_sats / 100000000}
+                          {/* 💡 NOUVEAU : Affichage de l'estimation en USD */}
+                          <div style={{fontSize: "0.8rem", color: "#aaa", fontWeight: "normal"}}>
+                            ≈ ${((s.btc_amount_sats / 100000000) * btcUsdPrice).toFixed(2)}
+                          </div>
+                        </td>
                         <td>
                           {isAlice && (
                             <button className="btn-primary" style={{ padding: "5px 15px", fontSize: "0.9rem" }} onClick={() => handleFundSwap(s)}>
@@ -469,7 +502,7 @@ function App() {
                                 {isProcessing ? "⏳ Verrouillage..." : "🔒 1. Verrouiller mes WATT"}
                               </button>
 
-                              {/* 💡 NOUVEAU BOUTON : Réclamation BTC pour Bob */}
+                              {/* 💡 Bouton Réclamation BTC (Avec correction appel API) */}
                               <button 
                                 className="btn-primary" 
                                 style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
@@ -478,21 +511,20 @@ function App() {
                                   try {
                                     setIsProcessing(true);
                                     const contractAddress = await invoke("create_btc_htlc", {
-                                      masterSeedHex: walletData.master_seed_hex,
                                       hashHex: s.htlc_hash,
                                       locktime: 144 
                                     });
                                     const res = await invoke("claim_btc_swap", {
                                       masterSeedHex: walletData.master_seed_hex,
                                       htlcAddress: contractAddress,
-                                      secretHex: s.htlc_secret // Dans la réalité L2, ce secret serait lu sur la blockchain
+                                      secretHex: s.htlc_secret
                                     });
                                     alert(res);
                                   } catch (e) { alert("Erreur Claim BTC : " + e); }
                                   finally { setIsProcessing(false); }
                                 }}
                               >
-                                💰 2. Réclamer les BTC (Avec le Secret)
+                                💰 2. Réclamer les BTC (Secret)
                               </button>
                             </div>
                           )}

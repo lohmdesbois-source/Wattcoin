@@ -31,6 +31,7 @@ const LATTICE_DIM: usize = 4;
 struct WalletKeys {
     mnemonic: String,
     btc_address: String,
+    btc_pubkey_hex: String, // 💡 NOUVEAU
     watt_address: String, 
     master_seed_hex: String,
     kyber_secret_hex: String,
@@ -79,10 +80,10 @@ pub struct Transaction {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub watt_address: String }
+struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub btc_pubkey: String, pub watt_address: String }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct SwapContract { pub buyer_btc_address: String, pub seller_watt_address: String, pub watt_amount_flames: u64, pub btc_amount_sats: u64, pub htlc_secret: String, pub htlc_hash: String }
+struct SwapContract { pub buyer_btc_address: String, pub buyer_btc_pubkey: String, pub seller_watt_address: String, pub seller_btc_pubkey: String, pub watt_amount_flames: u64, pub btc_amount_sats: u64, pub htlc_secret: String, pub htlc_hash: String }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct BatchResult { pub success: bool, pub message: String, pub clearing_price_sats: u64, pub total_volume_flames: u64, pub swaps: Vec<SwapContract> }
@@ -109,7 +110,7 @@ impl LatticeCommitment {
 }
 
 #[tauri::command]
-async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: String, watt_address: String) -> Result<(), String> {
+async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: String, btc_pubkey: String, watt_address: String) -> Result<(), String> {
     let mut rand_bytes = [0u8; 4]; rand::thread_rng().fill_bytes(&mut rand_bytes);
     let amount_flames = (amount * 1_000_000_000.0) as u64; 
     let price_sats = (price * 100_000_000.0) as u64; 
@@ -118,8 +119,9 @@ async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: 
         "id": hex::encode(rand_bytes),
         "order_type": order_type,
         "amount_flames": amount_flames, 
-        "price_sats": price_sats,       
+        "price_sats": price_sats,        
         "btc_address": btc_address,
+        "btc_pubkey": btc_pubkey, // 💡 NOUVEAU
         "watt_address": watt_address
     });
 
@@ -185,6 +187,7 @@ async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys
     Ok(WalletKeys {
         mnemonic: mnemonic.to_string(),
         btc_address,
+        btc_pubkey_hex: btc_pub.to_string(), // 💡 NOUVEAU
         master_seed_hex: hex::encode(seed),
         watt_address: hex::encode(kyber_pk.as_bytes()),
         kyber_secret_hex: hex::encode(kyber_sk.as_bytes()),
@@ -658,21 +661,20 @@ async fn send_wattcoin(
 
 #[tauri::command]
 async fn create_btc_htlc(
-    master_seed_hex: String, 
+    buyer_pubkey_hex: String, 
+    seller_pubkey_hex: String, 
     hash_hex: String, 
     locktime: u32
 ) -> Result<String, String> {
-    
-    let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-    let root = Xpriv::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
-    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
-    let secp = Secp256k1::new();
-    let child = root.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
-    let priv_key = PrivateKey::new(child.private_key, Network::Testnet);
-    let buyer_pubkey = priv_key.public_key(&secp);
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::blockdata::script::Builder;
+    use bitcoin::opcodes::all::*;
+    use bitcoin::{Address, Network};
+    use std::str::FromStr;
 
-    let dummy_seller_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    let seller_pubkey = bitcoin::PublicKey::from_str(dummy_seller_hex).unwrap();
+    // 💡 Les vraies clés des participants !
+    let buyer_pubkey = bitcoin::PublicKey::from_str(&buyer_pubkey_hex).map_err(|_| "Clé Alice invalide".to_string())?;
+    let seller_pubkey = bitcoin::PublicKey::from_str(&seller_pubkey_hex).map_err(|_| "Clé Bob invalide".to_string())?;
 
     let htlc_hash = sha256::Hash::from_str(&hash_hex).map_err(|e| e.to_string())?;
 
@@ -681,18 +683,17 @@ async fn create_btc_htlc(
             .push_opcode(OP_SHA256)
             .push_slice(&htlc_hash.to_byte_array())
             .push_opcode(OP_EQUALVERIFY)
-            .push_key(&seller_pubkey) // 💡 BOB réclame avec le Secret
+            .push_key(&seller_pubkey) // Bob réclame
         .push_opcode(OP_ELSE)
             .push_int(locktime as i64)
             .push_opcode(OP_CSV)
             .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey) // 💡 ALICE récupère son argent si Bob ne fait rien (Timeout)
+            .push_key(&buyer_pubkey)  // Alice récupère
         .push_opcode(OP_ENDIF)
         .push_opcode(OP_CHECKSIG)
         .into_script();
 
     let address = Address::p2wsh(&htlc_script, Network::Testnet);
-    
     Ok(address.to_string())
 }
 

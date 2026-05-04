@@ -2,12 +2,15 @@ use warp::Filter;
 use crate::blockchain::Blockchain;
 use crate::transaction::Transaction;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering}; // 💡 NOUVEAU
 use serde::{Serialize, Deserialize};
 use rand::RngCore;
 
 pub type SharedPool = Arc<Mutex<Vec<Order>>>;
-// 💡 AJOUT : La mémoire partagée pour les contrats en cours
 pub type SharedSwaps = Arc<Mutex<Vec<SwapContract>>>;
+
+// 💡 NOUVEAU : Mémoire globale du prix du WATT
+static LAST_PRICE_SATS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
@@ -16,13 +19,16 @@ pub struct Order {
     pub amount_flames: u64,
     pub price_sats: u64,
     pub btc_address: String,
+    pub btc_pubkey: String, // 💡 Vraie Clé Publique Bitcoin
     pub watt_address: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)] // 💡 N'oublie pas le 'Clone' ici
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SwapContract {
     pub buyer_btc_address: String,
+    pub buyer_btc_pubkey: String,   // 💡 Clé d'Alice
     pub seller_watt_address: String,
+    pub seller_btc_pubkey: String,  // 💡 Clé de Bob
     pub watt_amount_flames: u64,
     pub btc_amount_sats: u64,
     pub htlc_secret: String,
@@ -196,9 +202,12 @@ pub async fn start_api_server(
                     let w_amt = trade_amount_flames as f64 / 1_000_000_000.0;
                     let btc_amount_sats = (w_amt * clearing_price_sats as f64) as u64;
 
+                    
                     generated_swaps.push(SwapContract {
                         buyer_btc_address: buys[i].btc_address.clone(),
+                        buyer_btc_pubkey: buys[i].btc_pubkey.clone(),    // 💡 AJOUT
                         seller_watt_address: sells[j].watt_address.clone(),
+                        seller_btc_pubkey: sells[j].btc_pubkey.clone(),  // 💡 AJOUT
                         watt_amount_flames: trade_amount_flames,
                         btc_amount_sats,
                         htlc_secret: hex::encode(secret_bytes),
@@ -218,9 +227,10 @@ pub async fn start_api_server(
 
             if total_volume_flames > 0 {
                 println!("⚖️ [DEX] Ordres croisés ! Volume: {} Flames", total_volume_flames);
-                
-                // 💡 AJOUT : On sauvegarde les swaps générés dans la mémoire du Serveur !
                 swaps_memory.lock().unwrap().extend(generated_swaps.clone());
+                
+                // 💡 MISE À JOUR DU COURS DU WATT !
+                LAST_PRICE_SATS.store(clearing_price_sats, Ordering::Relaxed);
                 
                 warp::reply::json(&BatchResult { success: true, message: "Ordres croisés !".to_string(), clearing_price_sats, total_volume_flames, swaps: generated_swaps })
             } else {
@@ -236,8 +246,9 @@ pub async fn start_api_server(
             let chain_lock = chain_arc.lock().unwrap();
             warp::reply::json(&serde_json::json!({
                 "blocks": chain_lock.chain.len(), 
-                "connected_peers": peers.lock().unwrap().len(), 
-                "version": "Wattcoin V2.2.0 (ZKP LATTICE)"
+                "connected_peers": peers.lock().unwrap().len(),
+                "last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed), // 💡 PRIX ENVOYÉ AU WALLET
+                "version": "Wattcoin V2.2.0"
             }))
         });
     
