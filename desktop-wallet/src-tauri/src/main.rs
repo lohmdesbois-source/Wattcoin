@@ -349,8 +349,11 @@ async fn send_wattcoin(
     amount: f64, 
     sender_dilithium_secret_hex: String,
     sender_dilithium_public_hex: String,
-    sender_kyber_secret_hex: String, // 💡 NOUVEAU: Le Wallet a besoin de sa clé pour lire son historique
-    sender_kyber_public_hex: String
+    sender_kyber_secret_hex: String,
+    sender_kyber_public_hex: String,
+    // 💡 NOUVEAU : Paramètres optionnels pour l'Atomic Swap
+    htlc_hash_hex: Option<String>, 
+    htlc_timeout: Option<u64>
 ) -> Result<String, String> {
     use pqcrypto_kyber::kyber768;
     use pqcrypto_dilithium::dilithium3;
@@ -611,10 +614,19 @@ async fn send_wattcoin(
         });
     }
 
+    // 💡 NOUVEAU : On détermine le type de transaction en fonction des paramètres reçus
+    let tx_type = match (htlc_hash_hex, htlc_timeout) {
+        (Some(hash), Some(timeout)) => {
+            println!("🔒 CRÉATION D'UN CONTRAT HTLC LOCK ! Hash: {}", hash);
+            TransactionType::HTLCLock { hash, timeout_block: timeout }
+        },
+        _ => TransactionType::Standard,
+    };
+
     let tx_pq = Transaction {
-        tx_type: TransactionType::Standard, // 💡 NOUVEAU
+        tx_type, // 💡 Le type est maintenant dynamique !
         inputs: final_inputs,
-        outputs,
+        outputs, // Si c'est un Lock, l'output 0 est le coffre bloqué.
         fee,
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
@@ -627,12 +639,18 @@ async fn send_wattcoin(
         use std::fs::OpenOptions;
         use std::io::Write;
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
-            // On enregistre quelles capsules on vient de brûler
             for utxo in &selected_utxos {
                 writeln!(file, "{}", utxo.1).unwrap();
             }
         }
-        Ok(format!("☢️ TX ZKP ENVOYÉE !\n\nInputs dépensés : {}\nOutputs générés : {}\nPoids : {} octets", selected_utxos.len(), tx_pq.outputs.len(), serde_json::to_string(&tx_pq).unwrap().len()))
+        
+        // 💡 Petit message de succès adapté
+        if tx_pq.tx_type == TransactionType::Standard {
+             Ok(format!("☢️ TX ZKP ENVOYÉE !\n\nInputs : {}\nOutputs : {}\nPoids : {} octets", selected_utxos.len(), tx_pq.outputs.len(), serde_json::to_string(&tx_pq).unwrap().len()))
+        } else {
+             Ok(format!("🔒 CONTRAT HTLC DÉPLOYÉ ! Les fonds sont verrouillés sur le réseau Wattcoin."))
+        }
+       
     } else {
         Err("❌ Transaction rejetée par le Tribunal ZKP.".to_string())
     }
@@ -752,34 +770,85 @@ async fn claim_wattcoin_swap(
         return Err("❌ Le secret révélé par le DEX est un faux !".to_string());
     }
 
-    let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
-    let lattice_commitment = LatticeCommitment::commit(amount_in_flames, 0);
+    // 🕵️ 1. SCAN DE LA BLOCKCHAIN POUR TROUVER LE COFFRE WATTCOIN
+    let client = reqwest::Client::new();
+    let url = format!("{}/all_transactions", NODE_URL);
+    let all_txs: Vec<Transaction> = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?.json().await.map_err(|_| "Erreur JSON".to_string())?;
 
+    let mut locked_utxo = None;
+    let mut locked_commitment = None;
+
+    for tx in all_txs {
+        if let TransactionType::HTLCLock { hash: lock_hash, .. } = &tx.tx_type {
+            if lock_hash == &hash && !tx.outputs.is_empty() {
+                locked_utxo = Some(tx.outputs[0].kyber_capsule.clone());
+                locked_commitment = Some(tx.outputs[0].lattice_commitment.clone());
+                break;
+            }
+        }
+    }
+
+    let (utxo_id, commitment) = match (locked_utxo, locked_commitment) {
+        (Some(u), Some(c)) => (u, c),
+        _ => return Err("⏳ Le vendeur n'a pas encore verrouillé ses WATT sur la blockchain ! Veuillez patienter.".to_string()),
+    };
+
+    // 🛡️ 2. PRÉPARATION DE L'INPUT (Avec Image Clé Unique)
+    let key_image = hex::encode(blake3::hash(format!("CLAIM_{}_{}", secret, utxo_id).as_bytes()).as_bytes());
+    let dummy_signature = PQLatticeRingSignature { key_image, c0: String::new(), z_responses: vec![], p_keys: vec![] };
+    let claim_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment };
+
+    // 🎁 3. PRÉPARATION DE L'OUTPUT (On s'envoie les fonds avec une vraie capsule Kyber)
+    use pqcrypto_kyber::kyber768;
+    use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+    use rand::RngCore;
+
+    let recipient_bytes = hex::decode(&watt_address).unwrap();
+    let pk = kyber768::PublicKey::from_bytes(&recipient_bytes).unwrap();
+    let (shared_secret, kyber_capsule) = kyber768::encapsulate(&pk);
+
+    let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
+    let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
+    let payload = format!("{}|{}", amount_in_flames, hex::encode(otp));
+    
+    let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+    let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).unwrap();
+    let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
+
+    let out_commitment = LatticeCommitment::commit(amount_in_flames, 0);
+
+    // 📝 4. ASSEMBLAGE DU CONTRAT FINAL
     let claim_tx = Transaction {
-        tx_type: TransactionType::HTLCClaim { secret: secret.clone() }, // 💡 LE VRAI CONTRAT !
-        inputs: vec![], // Sera remplacé par le vrai UTXO bloqué dans la V2 du DEX
+        tx_type: TransactionType::HTLCClaim { secret: secret.clone() },
+        inputs: vec![claim_input],
         outputs: vec![
             TransactionOutput {
-                stealth_address: watt_address,
-                kyber_capsule: format!("HTLC_{}", &hash[0..16]),
-                aes_vault: hash.clone(), 
-                lattice_commitment,
+                stealth_address: format!("pq_watt_{}", hex::encode(&otp[0..8])),
+                kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
+                aes_vault: hex::encode(final_vault),
+                lattice_commitment: out_commitment,
             }
         ],
         fee: 0,
-        dilithium_signature: secret, // On le garde temporairement pour le debug
+        dilithium_signature: hash.clone(), // 💡 IMPORTANT : Le Nœud va vérifier ça !
     };
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/send_tx", NODE_URL);
-    let res = client.post(&url) 
-        .json(&claim_tx).send().await.map_err(|_| "Nœud injoignable !".to_string())?;
+    let res = client.post(&format!("{}/send_tx", NODE_URL)).json(&claim_tx).send().await.map_err(|_| "Nœud injoignable !".to_string())?;
 
     if res.status().is_success() {
         Ok(format!("🎉 ATOMIC SWAP RÉUSSI ! Le réseau a validé votre Secret HTLC et débloqué {} WATT !", amount))
     } else {
-        Err("❌ Le Tribunal a rejeté votre Secret !".to_string())
+        Err("❌ Le Tribunal a rejeté votre transaction Claim !".to_string())
     }
+}
+
+#[tauri::command]
+async fn simulate_bot_lock(keys: WalletKeys, hash_hex: String, amount: f64) -> Result<String, String> {
+    send_wattcoin(
+        keys.watt_address.clone(), amount, keys.dilithium_secret_hex, keys.dilithium_public_hex,
+        keys.kyber_secret_hex, keys.watt_address, Some(hash_hex), Some(144) // 💡 L'ajout est ici !
+    ).await
 }
 
 #[tauri::command]
@@ -827,7 +896,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
             submit_order, get_dark_pool, resolve_batch, get_watt_balance, get_btc_balance,
-            send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap,
+            send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, simulate_bot_lock,
             destroy_vault
         ])
         .run(tauri::generate_context!())

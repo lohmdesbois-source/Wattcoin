@@ -51,10 +51,41 @@ impl Transaction {
             return true; 
         }
 
-        // 💡 Validation temporaire du Claim (En attendant de lier l'UTXO Lock)
+        // =================================================================
+        // 🔐 1. LE TRIBUNAL DES CONTRATS INTELLIGENTS (HTLC)
+        // =================================================================
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-            if secret.is_empty() { return false; }
-            return true; 
+            if secret.is_empty() { 
+                println!("🛑 REJET HTLC : Le secret est vide !");
+                return false; 
+            }
+            
+            // On vérifie que la transaction tente bien de dépenser un UTXO
+            if self.inputs.is_empty() {
+                println!("🛑 REJET HTLC : Aucune pièce bloquée n'est ciblée en Input.");
+                return false;
+            }
+
+            // On vérifie le contrat mathématique
+            let secret_bytes = hex::decode(secret).unwrap_or_default();
+            let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+
+            // Pour valider le contrat, le secret révélé DOIT correspondre au Vault (Hash) 
+            // stocké dans l'UTXO précédent (qu'on a récupéré lors de la création de la Tx).
+            // Le DEX inscrira le hash du lock ciblé dans 'dilithium_signature' pour le contrôle
+            if calculated_hash != self.dilithium_signature {
+                println!("🛑 REJET HTLC FATAL : Le secret révélé '{}' ne produit pas le Hash d'origine ! Le voleur est repoussé.", secret);
+                return false;
+            }
+            return true; // Le contrat est rempli ! Pas besoin du ZKP standard pour un Claim direct.
+        }
+
+        if let TransactionType::HTLCLock { hash, timeout_block: _ } = &self.tx_type {
+            if hash.len() != 64 { // Un hash Blake3 fait 64 caractères hexadécimaux
+                println!("🛑 REJET HTLC : Le Hash du contrat est invalide.");
+                return false;
+            }
+            // Le Lock suit ensuite les règles ZKP normales ci-dessous pour cacher le montant bloqué
         }
 
         // =================================================================

@@ -190,8 +190,10 @@ function App() {
           amount: parseFloat(sendAmount),
           senderDilithiumSecretHex: walletData.dilithium_secret_hex, 
           senderDilithiumPublicHex: walletData.dilithium_public_hex,
-          senderKyberSecretHex: walletData.kyber_secret_hex, // 💡 AJOUTÉ
-          senderKyberPublicHex: walletData.watt_address      // 💡 AJOUTÉ
+          senderKyberSecretHex: walletData.kyber_secret_hex,
+          senderKyberPublicHex: walletData.watt_address,
+          htlcHashHex: null, // 💡 AJOUTÉ
+          htlcTimeout: null  // 💡 AJOUTÉ
         });
         alert(response);
         
@@ -468,6 +470,21 @@ function App() {
 
                   {swapProgress === 0 && (
                     <div style={{ textAlign: "center", marginTop: "20px" }}>
+                      
+                      {/* 💡 NOUVEAU BOUTON : Simulation du Bot */}
+                      <button className="btn-secondary" style={{ marginRight: "10px" }} onClick={async () => {
+                        try {
+                          await invoke("simulate_bot_lock", {
+                            keys: walletData,
+                            hashHex: pendingSwaps[0].htlc_hash,
+                            amount: pendingSwaps[0].watt_amount_flames / 1000000000
+                          });
+                          alert("🤖 Le Bot a verrouillé ses WATT sur la blockchain !");
+                        } catch (e) { alert("Erreur Bot : " + e); }
+                      }}>
+                        🤖 1. Simuler Lock WATT (Bot)
+                      </button>
+
                       <button className="btn-primary" onClick={async () => {
                         try {
                           setSwapProgress(1);
