@@ -77,6 +77,7 @@ fn start_peer_connection(
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
+            let _ = write_half.flush().await; // 💡 LA SOLUTION : On force l'envoi immédiat !
         }
     });
 
@@ -278,9 +279,11 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                         let temp_peer_id = format!("{}:incoming_tor", address);
                         active_peers.lock().unwrap().insert(temp_peer_id.clone(), tx.clone());
 
+                        // --- TÂCHE D'ÉCRITURE TOR ---
                         tokio::spawn(async move {
                             while let Some(msg) = rx.recv().await {
                                 if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
+                                let _ = write_half.flush().await; // 💡 LA SOLUTION !
                             }
                         });
 
