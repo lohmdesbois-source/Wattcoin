@@ -438,8 +438,39 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                 }
             }
             
+            // 💡 NOUVEAU : LE MÉCANISME DE REPLI (FALLBACK) SI TOR EST BLOQUÉ
             if !connected {
-                println!("🛑 [ARTI-TOR] Échec définitif après {} tentatives. Le serveur distant est-il en ligne et accepte-t-il les connexions Tor ?", max_retries);
+                println!("🛑 [ARTI-TOR] Échec définitif après {} tentatives. L'hébergeur distant bloque probablement les nœuds de sortie Tor.", max_retries);
+                println!("⚠️ [REPLI] Activation du mode survie : Tentative de connexion en clair (TCP direct)...");
+                
+                if let Ok(socket) = TcpStream::connect(&address).await {
+                    println!("✅ [REPLI] Connecté au réseau en clair via {} ! L'IP n'est plus masquée.", address);
+                    
+                    let (my_genesis, my_height) = {
+                        let chain = blockchain.lock().unwrap();
+                        (chain.chain[0].header.hash.clone(), chain.chain.len() as u64)
+                    };
+
+                    start_peer_connection(
+                        socket, address.clone(), my_port.to_string(), 
+                        Arc::clone(&blockchain), Arc::clone(&mempool), Arc::clone(&dex_pool), 
+                        Arc::clone(&known_peers), Arc::clone(&active_peers)
+                    );
+
+                    let ip_only = address.split(':').next().unwrap_or(&address).to_string();
+                    let sender_opt = {
+                        active_peers.lock().unwrap().get(&format!("{}:incoming", ip_only)).cloned()
+                    };
+                    if let Some(sender) = sender_opt {
+                        send_message_to_channel(&sender, P2PMessage::Handshake { 
+                            genesis_hash: my_genesis, 
+                            current_height: my_height, 
+                            sender_port: my_port.to_string() 
+                        }).await;
+                    }
+                } else {
+                    println!("💀 [FATAL] Impossible de joindre le nœud {} ni via Tor, ni via TCP. Le serveur est hors ligne.", address);
+                }
             }
         }
         Err(e) => println!("🛑 [ARTI-TOR] Échec de l'initialisation du circuit Tor local : {}", e),
