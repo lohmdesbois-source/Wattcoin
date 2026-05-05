@@ -438,7 +438,7 @@ function App() {
                 <div className={`tab-btn sell ${orderType === "sell" ? "active" : ""}`} onClick={() => setOrderType("sell")}>Vente</div>
               </div>
               
-              {/* 💡 CHAMP QUANTITÉ AVEC USD ESTIMÉ */}
+              {/* 💡 CHAMP QUANTITÉ AVEC USD ESTIMÉ (basé sur le prix global actuel) */}
               <label style={{color: "#888", fontSize: "0.8rem", marginTop:"15px", display:"flex", justifyContent:"space-between"}}>
                 <span>Quantité (WATT)</span>
                 <span style={{color: "var(--primary)"}}>
@@ -456,13 +456,17 @@ function App() {
               </label>
               <input type="number" placeholder="Ex: 0.001" value={orderTotalBtc} onChange={(e) => setOrderTotalBtc(e.target.value)} />
               
-              {/* 💡 RÉTRO-AFFICHAGE DU PRIX UNITAIRE IMPLICITE */}
+              {/* 💡 RÉTRO-AFFICHAGE DU PRIX UNITAIRE IMPLICITE (BTC et USD) */}
               {orderAmount && orderTotalBtc && parseFloat(orderAmount) > 0 && (
                 <div style={{ background: "rgba(0,0,0,0.4)", padding: "10px", borderRadius: "5px", marginBottom: "15px", border: "1px solid #444", textAlign: "center" }}>
                   <span style={{color: "#888", fontSize: "0.85rem"}}>Prix unitaire implicite :</span><br/>
                   <strong style={{color: "#ccc", fontSize: "1.1rem"}}>
                     {(parseFloat(orderTotalBtc) / parseFloat(orderAmount)).toFixed(8)} BTC/WATT
                   </strong>
+                  <br/>
+                  <span style={{color: "#28a745", fontSize: "0.9rem"}}>
+                    ≈ ${((parseFloat(orderTotalBtc) / parseFloat(orderAmount)) * btcUsdPrice).toFixed(2)} USD/WATT
+                  </span>
                 </div>
               )}
 
