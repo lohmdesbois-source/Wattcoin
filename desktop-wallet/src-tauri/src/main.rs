@@ -667,7 +667,7 @@ async fn send_wattcoin(
 async fn create_btc_htlc(
     buyer_pubkey_hex: String, 
     seller_pubkey_hex: String, 
-    hash_hex: String, 
+    secret_hex: String, 
     locktime: u32
 ) -> Result<String, String> {
     use bitcoin::hashes::{sha256, Hash};
@@ -676,30 +676,32 @@ async fn create_btc_htlc(
     use bitcoin::{Address, Network};
     use std::str::FromStr;
 
-    // 💡 Les vraies clés des participants !
     let buyer_pubkey = bitcoin::PublicKey::from_str(&buyer_pubkey_hex).map_err(|_| "Clé Alice invalide".to_string())?;
     let seller_pubkey = bitcoin::PublicKey::from_str(&seller_pubkey_hex).map_err(|_| "Clé Bob invalide".to_string())?;
 
-    let htlc_hash = sha256::Hash::from_str(&hash_hex).map_err(|e| e.to_string())?;
+    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
+    let btc_hash = sha256::Hash::hash(&secret_bytes);
 
     let htlc_script = Builder::new()
         .push_opcode(OP_IF)
             .push_opcode(OP_SHA256)
-            .push_slice(&htlc_hash.to_byte_array())
+            .push_slice(&btc_hash.to_byte_array()) // 💡 CORRIGÉ : to_byte_array()
             .push_opcode(OP_EQUALVERIFY)
-            .push_key(&seller_pubkey) // Bob réclame
+            .push_key(&seller_pubkey) 
         .push_opcode(OP_ELSE)
             .push_int(locktime as i64)
             .push_opcode(OP_CSV)
             .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey)  // Alice récupère
+            .push_key(&buyer_pubkey)  
         .push_opcode(OP_ENDIF)
         .push_opcode(OP_CHECKSIG)
         .into_script();
 
+    // 💡 CORRIGÉ : Pas de .unwrap() ici !
     let address = Address::p2wsh(&htlc_script, Network::Testnet);
     Ok(address.to_string())
 }
+
 
 #[tauri::command]
 async fn send_btc_to_htlc(
@@ -886,7 +888,7 @@ async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<V
     } else {
         Ok(vec![])
     }
-} // <--- C'EST SOUVENT CETTE ACCOLADE QUI SAUTE !
+}
 
 // ========================================================================
 // 🏆 LE VRAI BOSS FINAL : LA RÉCLAMATION BITCOIN L1 PURE ET DURE !
@@ -896,64 +898,67 @@ async fn claim_btc_swap(
     master_seed_hex: String, 
     htlc_address: String, 
     secret_hex: String,
-    buyer_pubkey_hex: String
+    buyer_pubkey_hex: String,
+    seller_pubkey_hex: String 
 ) -> Result<String, String> {
-    // 💡 LA MAGIE EST ICI : On force l'utilisation exclusive du "Bitcoin" interne de BDK
-    // Cela isole cette fonction du reste de ton code en v0.32 et annule toutes les erreurs !
     use bdk::bitcoin::Network;
-    use bdk::bitcoin::bip32::{ExtendedPrivKey, DerivationPath};
-    use bdk::bitcoin::{Address, Amount, PrivateKey, PublicKey, OutPoint, Txid, Sequence, Transaction, TxIn, TxOut, Witness, ScriptBuf};
+    use bdk::bitcoin::bip32::{ExtendedPrivKey, DerivationPath}; // 💡 FIX: Plus de 'util::'
+    use bdk::bitcoin::{Address, PrivateKey, PublicKey, OutPoint, Txid, Sequence, Transaction, TxIn, TxOut, Witness, ScriptBuf};
     use bdk::bitcoin::blockdata::script::Builder;
     use bdk::bitcoin::opcodes::all::*;
     use bdk::bitcoin::hashes::{sha256, Hash};
     use bdk::bitcoin::secp256k1::{Secp256k1, Message};
-    use bdk::bitcoin::sighash::{SighashCache, EcdsaSighashType};
-    use bdk::bitcoin::absolute::LockTime;
+    use bdk::bitcoin::sighash::{SighashCache, EcdsaSighashType}; // 💡 FIX: Plus de 'util::'
+    use bdk::bitcoin::absolute::LockTime; // 💡 FIX: LockTime au lieu de PackedLockTime
     use std::str::FromStr;
 
     let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
     let xprv = ExtendedPrivKey::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
     let secp = Secp256k1::new();
     
-    // --- 1. GÉNÉRER LA CLÉ ET L'ADRESSE DE RÉCEPTION DE BOB ---
+    // --- 1. CLÉS ---
     let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
     let child = xprv.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
     let bob_priv_key = PrivateKey::new(child.private_key, Network::Testnet);
-    let bob_pub_key = PublicKey::from_private_key(&secp, &bob_priv_key);
-    // En v0.30 (BDK), la compression se force comme ça
-    let bob_pub_key_compressed = bdk::bitcoin::secp256k1::PublicKey::from_slice(&bob_pub_key.inner.serialize()).unwrap();
-    let bob_pub_key_final = PublicKey::new(bob_pub_key_compressed);
-    let bob_address = Address::p2wpkh(&bob_pub_key_final, Network::Testnet).unwrap();
-
-    // --- 2. RECONSTRUIRE LE SCRIPT HTLC EXACT ---
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
-    let calculated_hash = sha256::Hash::hash(&secret_bytes); 
     
     let buyer_pubkey = PublicKey::from_str(&buyer_pubkey_hex).unwrap();
+    let seller_pubkey = PublicKey::from_str(&seller_pubkey_hex).unwrap();
+    
+    // 💡 FIX: Ajout du .unwrap() car Address::p2wpkh renvoie un Result en v0.30
+    let bob_address = Address::p2wpkh(&seller_pubkey, Network::Testnet).unwrap();
+
+    // --- 2. RECONSTRUIRE LE SCRIPT HTLC EXACT (SHA256) ---
+    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
+    let btc_hash = sha256::Hash::hash(&secret_bytes); 
     
     let htlc_script = Builder::new()
         .push_opcode(OP_IF)
             .push_opcode(OP_SHA256)
-            .push_slice(calculated_hash.as_byte_array())
+            .push_slice(&btc_hash.to_byte_array()) 
             .push_opcode(OP_EQUALVERIFY)
-            .push_key(&bob_pub_key_final) // Branche de Bob
+            .push_key(&seller_pubkey) // 💡 FIX: On utilise seller_pubkey (Bob)
         .push_opcode(OP_ELSE)
             .push_int(144)
             .push_opcode(OP_CSV)
             .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey) // Branche d'Alice
+            .push_key(&buyer_pubkey) // Alice
         .push_opcode(OP_ENDIF)
         .push_opcode(OP_CHECKSIG)
         .into_script();
 
-    // --- 3. RÉCUPÉRER L'UTXO VIA MEMPOOL.SPACE (Version ASYNC pour éviter l'erreur blocking) ---
+    let p2wsh_address = Address::p2wsh(&htlc_script, Network::Testnet);
+    if p2wsh_address.to_string() != htlc_address {
+        return Err("Erreur critique: Le script reconstruit ne correspond pas à l'adresse HTLC !".to_string());
+    }
+
+    // --- 3. RÉCUPÉRER L'UTXO VIA MEMPOOL.SPACE ---
     let client = reqwest::Client::new();
     let url = format!("https://mempool.space/testnet/api/address/{}/utxo", htlc_address);
     let res = client.get(&url).send().await.map_err(|_| "Impossible de joindre le Testnet".to_string())?;
     
     let utxos: serde_json::Value = res.json().await.map_err(|_| "Erreur JSON".to_string())?;
     if utxos.as_array().unwrap_or(&vec![]).is_empty() {
-        return Err("❌ Aucun Bitcoin trouvé dans ce contrat ! Alice n'a pas encore envoyé les fonds.".to_string());
+        return Err("❌ Aucun Bitcoin trouvé ! La Tx d'Alice n'est pas encore confirmée par les mineurs Testnet.".to_string());
     }
     
     let txid_str = utxos[0]["txid"].as_str().unwrap();
@@ -962,15 +967,13 @@ async fn claim_btc_swap(
     let value_sats = utxos[0]["value"].as_u64().unwrap();
 
     let fee_sats = 600; 
-    if value_sats <= fee_sats {
-         return Err("Le montant verrouillé est trop faible pour payer les frais réseau !".to_string());
-    }
+    if value_sats <= fee_sats { return Err("Montant trop faible pour payer les frais !".to_string()); }
     let amount_to_receive = value_sats - fee_sats;
 
     // --- 4. CONSTRUIRE LA TRANSACTION BRUTE ---
     let txin = TxIn {
         previous_output: OutPoint { txid, vout },
-        script_sig: ScriptBuf::new(), 
+        script_sig: ScriptBuf::new(), // 💡 FIX: Utilisation de ScriptBuf::new()
         sequence: Sequence::MAX, 
         witness: Witness::new(), 
     };
@@ -982,51 +985,124 @@ async fn claim_btc_swap(
 
     let mut tx = Transaction {
         version: 2,
-        lock_time: LockTime::ZERO,
+        lock_time: LockTime::ZERO, // 💡 FIX: absolute::LockTime::ZERO
         input: vec![txin],
         output: vec![txout],
     };
 
-    // --- 5. SIGNER LA TRANSACTION (Le Witness P2WSH custom) ---
+    // --- 5. SIGNER LA TRANSACTION ---
     let mut sighash_cache = SighashCache::new(&mut tx);
-    
     let sighash = sighash_cache.segwit_signature_hash(
-        0,
-        &htlc_script,
-        value_sats,
-        EcdsaSighashType::All,
+        0, &htlc_script, value_sats, EcdsaSighashType::All,
     ).map_err(|e| e.to_string())?;
 
-    let message = Message::from_slice(sighash.as_byte_array()).unwrap();
+    let message = Message::from_slice(&sighash.to_byte_array()).unwrap();
     let signature = secp.sign_ecdsa(&message, &bob_priv_key.inner);
     
     let mut sig_with_hashtype = signature.serialize_der().to_vec();
     sig_with_hashtype.push(EcdsaSighashType::All as u8);
 
     let mut witness = Witness::new();
-    witness.push(sig_with_hashtype);  // 1. Signature de Bob
-    witness.push(secret_bytes);       // 2. Le Secret
-    witness.push(vec![1]);            // 3. OP_TRUE pour entrer dans la branche IF
-    witness.push(htlc_script.into_bytes()); // 4. Le Redeem Script complet
+    witness.push(sig_with_hashtype);  // 1. Signature
+    witness.push(secret_bytes);       // 2. Le Secret !
+    witness.push(vec![1]);            // 3. OP_TRUE (Branche IF)
+    witness.push(htlc_script.into_bytes()); // 4. Script
 
     tx.input[0].witness = witness;
 
-    // --- 6. SÉRIALISER ET DIFFUSER L1 ---
+    // --- 6. DIFFUSER LA TRANSACTION ---
     let raw_tx_bytes = bdk::bitcoin::consensus::encode::serialize(&tx);
     let raw_tx_hex = hex::encode(raw_tx_bytes);
-    println!("🚀 Diffusion de la Tx Raw L1 : {}", raw_tx_hex);
 
     let broadcast_res = client.post("https://mempool.space/testnet/api/tx")
         .body(raw_tx_hex)
-        .send().await.map_err(|_| "Erreur réseau lors de l'envoi à Mempool.space".to_string())?;
+        .send().await.map_err(|_| "Erreur réseau (Mempool)".to_string())?;
 
     if broadcast_res.status().is_success() {
-         Ok(format!("🎉 VRAI SWAP RÉUSSI ! Vous avez récupéré {} sats ! TXID : {}", amount_to_receive, tx.txid()))
+         Ok(format!("🎉 VRAI SWAP RÉUSSI ! Tx diffusée : {}\nVous avez reçu {} sats !", tx.txid(), amount_to_receive))
     } else {
          let err_text = broadcast_res.text().await.unwrap_or_default();
-         Err(format!("Le réseau Bitcoin a rejeté la transaction. Détails : {}", err_text))
+         Err(format!("Rejeté par Bitcoin : {}", err_text))
     }
 }
+
+// ========================================================================
+// 💸 FONCTION BONUS : ENVOI DIRECT DE BITCOIN L1 (P2WPKH -> P2WPKH)
+// ========================================================================
+#[tauri::command]
+async fn send_btc_direct(
+    master_seed_hex: String, 
+    recipient_address: String, 
+    amount_btc: f64
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        use bdk::bitcoin::Network as BdkNetwork;
+        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
+        use bdk::bitcoin::Address as BdkAddress;
+        use bdk::blockchain::{EsploraBlockchain, Blockchain};
+        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
+        use bdk::database::MemoryDatabase;
+        use std::str::FromStr;
+
+        // 1. DÉCHIFFRER LA SEED ET INITIALISER LE WALLET
+        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
+        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
+        
+        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
+        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
+
+        let wallet = Wallet::new(
+            &desc, 
+            Some(&change_desc), 
+            BdkNetwork::Testnet, 
+            MemoryDatabase::default()
+        ).map_err(|e| format!("Erreur Init Wallet: {}", e))?;
+
+        // 2. SYNCHRONISATION AVEC LA BLOCKCHAIN (Mempool.space)
+        println!("⏳ [BDK] Scan de la blockchain pour envoi direct...");
+        let blockchain = EsploraBlockchain::new("https://mempool.space/testnet/api", 20);
+        wallet.sync(&blockchain, SyncOptions::default()).map_err(|e| format!("Erreur Sync: {}", e))?;
+
+        // 3. PRÉPARATION DE LA CIBLE ET DU MONTANT
+        let target_address = BdkAddress::from_str(&recipient_address).map_err(|_| "Adresse BTC de destination invalide".to_string())?;
+        let amount_sats = (amount_btc * 100_000_000.0) as u64;
+
+        // Vérifier le solde avant de construire la Tx
+        let balance = wallet.get_balance().unwrap();
+        let total_available = balance.confirmed + balance.untrusted_pending + balance.trusted_pending;
+        
+        if total_available < amount_sats + 1000 { // + 1000 pour prévoir les frais
+             return Err(format!("Fonds insuffisants ! Vous avez {} sats mais essayez d'envoyer {} sats.", total_available, amount_sats));
+        }
+
+        // 4. CONSTRUCTION DE LA TRANSACTION
+        println!("🛠️ [BDK] Construction de la TX...");
+        let (mut psbt, _details) = {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
+            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
+            builder.finish().map_err(|e| format!("Erreur TX Builder: {}", e))?
+        };
+
+        // 5. SIGNATURE ET DIFFUSION
+        println!("✍️ [BDK] Signature...");
+        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
+        if !finalized {
+            return Err("❌ BDK n'a pas pu signer. Clés manquantes ?".to_string());
+        }
+
+        let raw_tx = psbt.extract_tx();
+        let txid = raw_tx.txid();
+        println!("🚀 [BDK] Diffusion de la TX L1...");
+        blockchain.broadcast(&raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
+
+        Ok(format!("✅ TX Bitcoin envoyée avec succès !\nTXID: {}", txid))
+    })
+    .await
+    .unwrap_or_else(|_| Err("Erreur critique du thread BDK".to_string()))
+}
+
+
 
 // ============== LA FONCTION MAIN ==================
 
@@ -1062,7 +1138,7 @@ fn main() {
             generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
             submit_order, get_dark_pool, resolve_batch, get_watt_balance, get_btc_balance,
             send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, simulate_bot_lock,
-            destroy_vault, get_active_swaps, claim_btc_swap
+            destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

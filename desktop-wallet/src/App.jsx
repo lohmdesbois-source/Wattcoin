@@ -183,7 +183,6 @@ function App() {
       return;
     }
     
-    // 💡 ANTI DOUBLE-CLIC : Si le wallet bosse déjà, on bloque !
     if (isProcessing) return;
     setIsProcessing(true);
 
@@ -204,13 +203,21 @@ function App() {
         setWattBalance(prev => prev - parseFloat(sendAmount));
         setActiveCoinModal(null); 
         setSendAddress(""); setSendAmount(""); 
-      } else {
-        alert("L'envoi de BTC direct depuis cette interface sera disponible bientôt !");
+      } else if (activeCoinModal === "BTC") {
+        // 💡 NOUVEAU : Envoi Direct de Bitcoin !
+        const response = await invoke("send_btc_direct", {
+          masterSeedHex: walletData.master_seed_hex,
+          recipientAddress: sendAddress,
+          amountBtc: parseFloat(sendAmount)
+        });
+        alert(response);
+        
+        setActiveCoinModal(null);
+        setSendAddress(""); setSendAmount("");
       }
     } catch (error) {
       alert(error);
     } finally {
-      // 💡 ON LIBÈRE LE VERROU quoiqu'il arrive
       setIsProcessing(false);
     }
   };
@@ -218,9 +225,9 @@ function App() {
   const handleFundSwap = async (swap) => {
     try {
       const contractAddress = await invoke("create_btc_htlc", {
-        buyerPubkeyHex: swap.buyer_btc_pubkey,   // 💡 ALICE
-        sellerPubkeyHex: swap.seller_btc_pubkey, // 💡 BOB
-        hashHex: swap.htlc_hash,
+        buyerPubkeyHex: swap.buyer_btc_pubkey,
+        sellerPubkeyHex: swap.seller_btc_pubkey,
+        secretHex: swap.htlc_secret, // 💡 CORRIGÉ : On passe le secret
         locktime: 144 
       });
       setActiveContractAddress(contractAddress);
@@ -366,9 +373,26 @@ function App() {
                   </div>
                   <input type="text" placeholder={`Adresse ${activeCoinModal} du destinataire`} value={sendAddress} onChange={(e) => setSendAddress(e.target.value)} style={{ width: "100%", marginBottom: "15px" }} />
                   <input type="number" placeholder={`Montant en ${activeCoinModal}`} value={sendAmount} onChange={(e) => setSendAmount(e.target.value)} style={{ width: "100%", marginBottom: "25px" }} />
-                  <button className="btn-primary" onClick={handleSendTransaction} style={{ width: "100%", padding: "12px", fontSize: "1.1rem" }}>
-                    Signer & Envoyer
+                  <button 
+                    className="btn-primary" 
+                    disabled={isProcessing} 
+                    onClick={handleSendTransaction} 
+                    style={{ width: "100%", padding: "12px", fontSize: "1.1rem", opacity: isProcessing ? 0.7 : 1, cursor: isProcessing ? "not-allowed" : "pointer" }}
+                  >
+                    {isProcessing ? "⏳ Transaction en cours..." : "Signer & Envoyer"}
                   </button>
+                  
+                  {/* 💡 NOUVEAU : Le message d'attente stylé */}
+                  {isProcessing && activeCoinModal === "BTC" && (
+                    <div style={{ marginTop: "15px", color: "#F7931A", textAlign: "center", fontSize: "0.9rem", fontWeight: "bold" }}>
+                      📡 BDK synchronise la blockchain Bitcoin...
+                    </div>
+                  )}
+                  {isProcessing && activeCoinModal === "WATT" && (
+                    <div style={{ marginTop: "15px", color: "var(--primary)", textAlign: "center", fontSize: "0.9rem", fontWeight: "bold" }}>
+                      ⚡ Création de la preuve ZKP en cours...
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -508,31 +532,32 @@ function App() {
                                 style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
                                 disabled={isProcessing}
                                 onClick={async () => {
-								  try {
-									setIsProcessing(true);
-									
-									// 1. On recrée l'adresse du contrat localement
-									const contractAddress = await invoke("create_btc_htlc", {
-									  buyerPubkeyHex: s.buyer_btc_pubkey,
-									  sellerPubkeyHex: s.seller_btc_pubkey,
-									  hashHex: s.htlc_hash,
-									  locktime: 144 
-									});
+                                  try {
+                                    setIsProcessing(true);
+                                    
+                                    // 1. On recrée l'adresse du contrat localement
+                                    const contractAddress = await invoke("create_btc_htlc", {
+                                      buyerPubkeyHex: s.buyer_btc_pubkey,
+                                      sellerPubkeyHex: s.seller_btc_pubkey,
+                                      secretHex: s.htlc_secret, // 💡 CORRIGÉ : On passe le secret
+                                      locktime: 144 
+                                    });
 
-									// 2. ON APPELLE LE CLAIM AVEC *TOUS* LES PARAMÈTRES !
-									const res = await invoke("claim_btc_swap", {
-									  masterSeedHex: walletData.master_seed_hex,
-									  htlcAddress: contractAddress,
-									  secretHex: s.htlc_secret,
-									  buyerPubkeyHex: s.buyer_btc_pubkey // 💡 LA PIÈCE MANQUANTE EST LÀ !
-									});
-									
-									alert(res);
-								  } catch (e) { alert("Erreur Claim BTC : " + e); }
-								  finally { setIsProcessing(false); }
-								}}
+                                    // 2. ON APPELLE LE CLAIM AVEC *TOUS* LES PARAMÈTRES !
+                                    const res = await invoke("claim_btc_swap", {
+                                      masterSeedHex: walletData.master_seed_hex,
+                                      htlcAddress: contractAddress,
+                                      secretHex: s.htlc_secret,
+                                      buyerPubkeyHex: s.buyer_btc_pubkey,
+                                      sellerPubkeyHex: s.seller_btc_pubkey // 💡 AJOUTÉ
+                                    });
+                                    
+                                    alert(res);
+                                  } catch (e) { alert("Erreur Claim BTC : " + e); }
+                                  finally { setIsProcessing(false); }
+                                }}
                               >
-                                💰 2. Réclamer les BTC (Secret)
+                                {isProcessing ? "⏳ Signature L1 en cours..." : "💰 2. Réclamer les BTC (Secret)"}
                               </button>
                             </div>
                           )}
@@ -552,8 +577,9 @@ function App() {
                   </div>
 
                   <div style={{ textAlign: "center", marginTop: "20px", display: "flex", gap: "10px", justifyContent: "center" }}>
-                    <button className="btn-primary" disabled={swapProgress > 0} onClick={async () => {
+					<button className="btn-primary" disabled={swapProgress > 0 || isProcessing} onClick={async () => {
                       try {
+                        setIsProcessing(true); // 💡 On verrouille
                         setSwapProgress(1);
                         await invoke("send_btc_to_htlc", {
                           masterSeedHex: walletData.master_seed_hex,
@@ -563,10 +589,10 @@ function App() {
                         setSwapProgress(2);
                         alert("✅ BTC envoyés sur le Testnet ! Attendez que le vendeur verrouille ses WATT.");
                       } catch (error) { alert("Erreur L1 : " + error); setSwapProgress(0); }
+                      finally { setIsProcessing(false); } // 💡 On libère
                     }}>
-                      2️⃣ Envoyer les BTC
+                      {isProcessing && swapProgress === 1 ? "⏳ Sync BDK en cours..." : "2️⃣ Envoyer les BTC"}
                     </button>
-
                     <button className="btn-secondary" disabled={swapProgress < 2 || swapProgress === 4} onClick={async () => {
                       try {
                         setSwapProgress(3);
