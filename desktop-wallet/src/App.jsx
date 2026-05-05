@@ -508,21 +508,29 @@ function App() {
                                 style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
                                 disabled={isProcessing}
                                 onClick={async () => {
-                                  try {
-                                    setIsProcessing(true);
-                                    const contractAddress = await invoke("create_btc_htlc", {
-                                      hashHex: s.htlc_hash,
-                                      locktime: 144 
-                                    });
-                                    const res = await invoke("claim_btc_swap", {
-                                      masterSeedHex: walletData.master_seed_hex,
-                                      htlcAddress: contractAddress,
-                                      secretHex: s.htlc_secret
-                                    });
-                                    alert(res);
-                                  } catch (e) { alert("Erreur Claim BTC : " + e); }
-                                  finally { setIsProcessing(false); }
-                                }}
+								  try {
+									setIsProcessing(true);
+									
+									// 1. On recrée l'adresse du contrat localement
+									const contractAddress = await invoke("create_btc_htlc", {
+									  buyerPubkeyHex: s.buyer_btc_pubkey,
+									  sellerPubkeyHex: s.seller_btc_pubkey,
+									  hashHex: s.htlc_hash,
+									  locktime: 144 
+									});
+
+									// 2. ON APPELLE LE CLAIM AVEC *TOUS* LES PARAMÈTRES !
+									const res = await invoke("claim_btc_swap", {
+									  masterSeedHex: walletData.master_seed_hex,
+									  htlcAddress: contractAddress,
+									  secretHex: s.htlc_secret,
+									  buyerPubkeyHex: s.buyer_btc_pubkey // 💡 LA PIÈCE MANQUANTE EST LÀ !
+									});
+									
+									alert(res);
+								  } catch (e) { alert("Erreur Claim BTC : " + e); }
+								  finally { setIsProcessing(false); }
+								}}
                               >
                                 💰 2. Réclamer les BTC (Secret)
                               </button>

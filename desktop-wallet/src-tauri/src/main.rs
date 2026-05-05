@@ -262,20 +262,25 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
     let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
 
-    // 💡 FIX : Le solde UTXO absolu. On lit les pièces dépensées pour ne pas les compter !
     let mut spent_capsules = HashSet::new();
     if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
-        for line in spends.lines() {
-            spent_capsules.insert(line.trim().to_string());
-        }
+        for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
 
     for tx in all_txs {
-        for out in tx.outputs {
-            // Si la pièce est déjà dans notre registre de dépenses, on l'ignore.
-            if spent_capsules.contains(&out.kyber_capsule) {
-                continue;
-            }
+        // 💡 NOUVEAU : On détecte si la transaction est un verrouillage HTLC
+        let is_lock_tx = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
+
+        // On itère avec l'index pour savoir quel Output on regarde
+        for (index, out) in tx.outputs.iter().enumerate() {
+            
+            if spent_capsules.contains(&out.kyber_capsule) { continue; }
+
+            // 💡 LE CORRECTIF EST LÀ : 
+            // Si c'est un contrat de Lock, le premier output (index 0 = l'argent verrouillé)
+            // n'est plus dans le solde libre de Bob ! Il appartient au contrat.
+            // Par contre, le rendu de monnaie (index 1) appartient toujours à Bob.
+            if is_lock_tx && index == 0 { continue; }
 
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
@@ -285,7 +290,6 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
                         
-                        // 💡 CORRIGÉ : decapsulate ne renvoie pas d'erreur, donc pas de if !
                         let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
                         
                         if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
@@ -885,38 +889,143 @@ async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<V
 } // <--- C'EST SOUVENT CETTE ACCOLADE QUI SAUTE !
 
 // ========================================================================
-// 🏆 LE BOSS FINAL : LA RÉCLAMATION BITCOIN L1 PAR BOB !
+// 🏆 LE VRAI BOSS FINAL : LA RÉCLAMATION BITCOIN L1 PURE ET DURE !
 // ========================================================================
 #[tauri::command]
 async fn claim_btc_swap(
     master_seed_hex: String, 
     htlc_address: String, 
-    secret_hex: String
+    secret_hex: String,
+    buyer_pubkey_hex: String
 ) -> Result<String, String> {
-    // 💡 Ici, on s'interface avec le réseau Bitcoin pour de vrai.
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Erreur Secret".to_string())?;
+    // 💡 LA MAGIE EST ICI : On force l'utilisation exclusive du "Bitcoin" interne de BDK
+    // Cela isole cette fonction du reste de ton code en v0.32 et annule toutes les erreurs !
+    use bdk::bitcoin::Network;
+    use bdk::bitcoin::bip32::{ExtendedPrivKey, DerivationPath};
+    use bdk::bitcoin::{Address, Amount, PrivateKey, PublicKey, OutPoint, Txid, Sequence, Transaction, TxIn, TxOut, Witness, ScriptBuf};
+    use bdk::bitcoin::blockdata::script::Builder;
+    use bdk::bitcoin::opcodes::all::*;
+    use bdk::bitcoin::hashes::{sha256, Hash};
+    use bdk::bitcoin::secp256k1::{Secp256k1, Message};
+    use bdk::bitcoin::sighash::{SighashCache, EcdsaSighashType};
+    use bdk::bitcoin::absolute::LockTime;
+    use std::str::FromStr;
 
-    // 1. OBTENIR LE UTXO VIA ESPLORA
+    let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
+    let xprv = ExtendedPrivKey::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
+    let secp = Secp256k1::new();
+    
+    // --- 1. GÉNÉRER LA CLÉ ET L'ADRESSE DE RÉCEPTION DE BOB ---
+    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
+    let child = xprv.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
+    let bob_priv_key = PrivateKey::new(child.private_key, Network::Testnet);
+    let bob_pub_key = PublicKey::from_private_key(&secp, &bob_priv_key);
+    // En v0.30 (BDK), la compression se force comme ça
+    let bob_pub_key_compressed = bdk::bitcoin::secp256k1::PublicKey::from_slice(&bob_pub_key.inner.serialize()).unwrap();
+    let bob_pub_key_final = PublicKey::new(bob_pub_key_compressed);
+    let bob_address = Address::p2wpkh(&bob_pub_key_final, Network::Testnet).unwrap();
+
+    // --- 2. RECONSTRUIRE LE SCRIPT HTLC EXACT ---
+    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
+    let calculated_hash = sha256::Hash::hash(&secret_bytes); 
+    
+    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey_hex).unwrap();
+    
+    let htlc_script = Builder::new()
+        .push_opcode(OP_IF)
+            .push_opcode(OP_SHA256)
+            .push_slice(calculated_hash.as_byte_array())
+            .push_opcode(OP_EQUALVERIFY)
+            .push_key(&bob_pub_key_final) // Branche de Bob
+        .push_opcode(OP_ELSE)
+            .push_int(144)
+            .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP)
+            .push_key(&buyer_pubkey) // Branche d'Alice
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+
+    // --- 3. RÉCUPÉRER L'UTXO VIA MEMPOOL.SPACE (Version ASYNC pour éviter l'erreur blocking) ---
     let client = reqwest::Client::new();
     let url = format!("https://mempool.space/testnet/api/address/{}/utxo", htlc_address);
     let res = client.get(&url).send().await.map_err(|_| "Impossible de joindre le Testnet".to_string())?;
     
     let utxos: serde_json::Value = res.json().await.map_err(|_| "Erreur JSON".to_string())?;
     if utxos.as_array().unwrap_or(&vec![]).is_empty() {
-        return Err("❌ Aucun Bitcoin trouvé dans ce contrat HTLC ! Alice ne les a pas encore envoyés.".to_string());
+        return Err("❌ Aucun Bitcoin trouvé dans ce contrat ! Alice n'a pas encore envoyé les fonds.".to_string());
     }
     
-    let txid = utxos[0]["txid"].as_str().unwrap().to_string();
+    let txid_str = utxos[0]["txid"].as_str().unwrap();
+    let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
+    let vout = utxos[0]["vout"].as_u64().unwrap() as u32;
     let value_sats = utxos[0]["value"].as_u64().unwrap();
 
-    let fee_sats = 500;
-    let amount_to_receive = value_sats.saturating_sub(fee_sats);
+    let fee_sats = 600; 
+    if value_sats <= fee_sats {
+         return Err("Le montant verrouillé est trop faible pour payer les frais réseau !".to_string());
+    }
+    let amount_to_receive = value_sats - fee_sats;
 
-    println!("🔓 [HTLC L1] Récupération de {} sats depuis l'UTXO {}...", amount_to_receive, txid);
-    println!("🔑 [HTLC L1] Utilisation du Secret : {}", secret_hex);
+    // --- 4. CONSTRUIRE LA TRANSACTION BRUTE ---
+    let txin = TxIn {
+        previous_output: OutPoint { txid, vout },
+        script_sig: ScriptBuf::new(), 
+        sequence: Sequence::MAX, 
+        witness: Witness::new(), 
+    };
+
+    let txout = TxOut {
+        value: amount_to_receive,
+        script_pubkey: bob_address.script_pubkey(),
+    };
+
+    let mut tx = Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: vec![txin],
+        output: vec![txout],
+    };
+
+    // --- 5. SIGNER LA TRANSACTION (Le Witness P2WSH custom) ---
+    let mut sighash_cache = SighashCache::new(&mut tx);
     
-    // Simulation de la validation du Script Witness pour le testnet (La librairie BDK nécessite une config lourde pour les scripts customs)
-    Ok(format!("🎉 SWAP TOTALEMENT RÉUSSI ! Le réseau a validé votre Secret et débloqué {} sats sur votre portefeuille Bitcoin Testnet !", amount_to_receive))
+    let sighash = sighash_cache.segwit_signature_hash(
+        0,
+        &htlc_script,
+        value_sats,
+        EcdsaSighashType::All,
+    ).map_err(|e| e.to_string())?;
+
+    let message = Message::from_slice(sighash.as_byte_array()).unwrap();
+    let signature = secp.sign_ecdsa(&message, &bob_priv_key.inner);
+    
+    let mut sig_with_hashtype = signature.serialize_der().to_vec();
+    sig_with_hashtype.push(EcdsaSighashType::All as u8);
+
+    let mut witness = Witness::new();
+    witness.push(sig_with_hashtype);  // 1. Signature de Bob
+    witness.push(secret_bytes);       // 2. Le Secret
+    witness.push(vec![1]);            // 3. OP_TRUE pour entrer dans la branche IF
+    witness.push(htlc_script.into_bytes()); // 4. Le Redeem Script complet
+
+    tx.input[0].witness = witness;
+
+    // --- 6. SÉRIALISER ET DIFFUSER L1 ---
+    let raw_tx_bytes = bdk::bitcoin::consensus::encode::serialize(&tx);
+    let raw_tx_hex = hex::encode(raw_tx_bytes);
+    println!("🚀 Diffusion de la Tx Raw L1 : {}", raw_tx_hex);
+
+    let broadcast_res = client.post("https://mempool.space/testnet/api/tx")
+        .body(raw_tx_hex)
+        .send().await.map_err(|_| "Erreur réseau lors de l'envoi à Mempool.space".to_string())?;
+
+    if broadcast_res.status().is_success() {
+         Ok(format!("🎉 VRAI SWAP RÉUSSI ! Vous avez récupéré {} sats ! TXID : {}", amount_to_receive, tx.txid()))
+    } else {
+         let err_text = broadcast_res.text().await.unwrap_or_default();
+         Err(format!("Le réseau Bitcoin a rejeté la transaction. Détails : {}", err_text))
+    }
 }
 
 // ============== LA FONCTION MAIN ==================
