@@ -53,6 +53,14 @@ pub async fn start_api_server(
     dex_pool: SharedPool,
     active_peers: crate::network::ActivePeers
 ) {
+    // 💡 NOUVEAU : On recharge le dernier prix connu depuis le disque dur !
+    if let Ok(price_str) = std::fs::read_to_string(".watt_market_price") {
+        if let Ok(saved_price) = price_str.trim().parse::<u64>() {
+            LAST_PRICE_SATS.store(saved_price, Ordering::Relaxed);
+            println!("📈 [MARCHÉ] Dernier prix du WATT rechargé : {} Sats", saved_price);
+        }
+    }
+
     let mempool_filter = warp::any().map(move || Arc::clone(&mempool));
     let chain_filter = warp::any().map(move || Arc::clone(&chain));
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
@@ -167,74 +175,93 @@ pub async fn start_api_server(
         });
 
     // 5. 💥 ROUTE : LE MOTEUR DE MATCHING
-    let resolve_batch = warp::post()
-        .and(warp::path("resolve"))
-        .and(dex_pool_filter.clone())
-        .and(swaps_filter_for_resolve) // 💡 AJOUT : On passe la mémoire des swaps à la route
-        .map(|pool: SharedPool, swaps_memory: SharedSwaps| { 
-            let mut orders = pool.lock().unwrap();
-            if orders.is_empty() {
-                return warp::reply::json(&BatchResult { success: false, message: "Piscine vide.".to_string(), clearing_price_sats: 0, total_volume_flames: 0, swaps: vec![] });
-            }
-
-            let mut buys: Vec<Order> = orders.iter().filter(|o| o.order_type == "buy").cloned().collect();
-            let mut sells: Vec<Order> = orders.iter().filter(|o| o.order_type == "sell").cloned().collect();
+    let resolve_route = warp::path("resolve")
+        .and(warp::post())
+        .and(dex_pool_filter.clone())            // 💡 FIX (nom de variable)
+        .and(swaps_filter_for_resolve.clone())   // 💡 FIX (nom de variable)
+        .map(|pool: SharedPool, swaps_memory: SharedSwaps| {
+            let mut p = pool.lock().unwrap();
+            
+            // 💡 FIX : "p" est déjà la liste, on utilise p.iter() (plus de p.orders)
+            let mut buys: Vec<_> = p.iter().filter(|o| o.order_type == "buy").cloned().collect();
+            let mut sells: Vec<_> = p.iter().filter(|o| o.order_type == "sell").cloned().collect();
 
             buys.sort_by(|a, b| b.price_sats.cmp(&a.price_sats));
             sells.sort_by(|a, b| a.price_sats.cmp(&b.price_sats));
 
+            let mut generated_swaps = Vec::new();
             let mut clearing_price_sats = 0;
             let mut total_volume_flames = 0;
-            let mut generated_swaps = Vec::new();
-            let mut i = 0; let mut j = 0;
 
-            while i < buys.len() && j < sells.len() {
-                if buys[i].price_sats >= sells[j].price_sats {
-                    
-                    clearing_price_sats = (buys[i].price_sats + sells[j].price_sats) / 2;
-                    let trade_amount_flames = buys[i].amount_flames.min(sells[j].amount_flames);
-                    total_volume_flames += trade_amount_flames;
+            let mut buy_idx = 0;
+            let mut sell_idx = 0;
+
+            while buy_idx < buys.len() && sell_idx < sells.len() {
+                let buy = &mut buys[buy_idx];
+                let sell = &mut sells[sell_idx];
+
+                if buy.price_sats >= sell.price_sats {
+                    clearing_price_sats = (buy.price_sats + sell.price_sats) / 2; 
+
+                    let matched_volume = std::cmp::min(buy.amount_flames, sell.amount_flames);
+                    total_volume_flames += matched_volume;
 
                     let mut secret_bytes = [0u8; 32];
                     rand::thread_rng().fill_bytes(&mut secret_bytes);
+                    let htlc_secret = hex::encode(secret_bytes);
                     let htlc_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
 
-                    let w_amt = trade_amount_flames as f64 / 1_000_000_000.0;
-                    let btc_amount_sats = (w_amt * clearing_price_sats as f64) as u64;
+                    let btc_amount = (matched_volume as f64 / 1_000_000_000.0 * clearing_price_sats as f64) as u64;
 
-                    
                     generated_swaps.push(SwapContract {
-                        buyer_btc_address: buys[i].btc_address.clone(),
-                        buyer_btc_pubkey: buys[i].btc_pubkey.clone(),    // 💡 AJOUT
-                        seller_watt_address: sells[j].watt_address.clone(),
-                        seller_btc_pubkey: sells[j].btc_pubkey.clone(),  // 💡 AJOUT
-                        watt_amount_flames: trade_amount_flames,
-                        btc_amount_sats,
-                        htlc_secret: hex::encode(secret_bytes),
+                        buyer_btc_address: buy.btc_address.clone(),
+                        buyer_btc_pubkey: buy.btc_pubkey.clone(),
+                        seller_watt_address: sell.watt_address.clone(),
+                        seller_btc_pubkey: sell.btc_pubkey.clone(),
+                        watt_amount_flames: matched_volume,
+                        btc_amount_sats: btc_amount,
+                        htlc_secret,
                         htlc_hash,
                     });
 
-                    buys[i].amount_flames -= trade_amount_flames;
-                    sells[j].amount_flames -= trade_amount_flames;
-                    if buys[i].amount_flames == 0 { i += 1; }
-                    if sells[j].amount_flames == 0 { j += 1; }
-                } else { 
-                    break;
+                    buy.amount_flames -= matched_volume;
+                    sell.amount_flames -= matched_volume;
+
+                    if buy.amount_flames == 0 { buy_idx += 1; }
+                    if sell.amount_flames == 0 { sell_idx += 1; }
+                } else {
+                    break; 
                 }
             }
 
-            orders.clear();
+            // 💡 FIX : On utilise p.clear() au lieu de p.orders.clear()
+            p.clear();
 
             if total_volume_flames > 0 {
-                println!("⚖️ [DEX] Ordres croisés ! Volume: {} Flames", total_volume_flames);
+                println!("⚖️ [DEX] Ordres croisés ! Volume: {} Flames, Prix unitaire: {} Sats", total_volume_flames, clearing_price_sats);
                 swaps_memory.lock().unwrap().extend(generated_swaps.clone());
                 
-                // 💡 MISE À JOUR DU COURS DU WATT !
-                LAST_PRICE_SATS.store(clearing_price_sats, Ordering::Relaxed);
+                // 💡 FIX : On utilise LAST_PRICE_SATS directement
+                LAST_PRICE_SATS.store(clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
                 
-                warp::reply::json(&BatchResult { success: true, message: "Ordres croisés !".to_string(), clearing_price_sats, total_volume_flames, swaps: generated_swaps })
+                let _ = std::fs::write(".watt_market_price", clearing_price_sats.to_string());
+                
+                // 💡 FIX : On utilise BatchResult directement
+                warp::reply::json(&BatchResult { 
+                    success: true, 
+                    message: "Ordres croisés !".to_string(), 
+                    clearing_price_sats, 
+                    total_volume_flames, 
+                    swaps: generated_swaps 
+                })
             } else {
-                warp::reply::json(&BatchResult { success: false, message: "Aucun croisement possible.".to_string(), clearing_price_sats: 0, total_volume_flames: 0, swaps: vec![] })
+                warp::reply::json(&BatchResult { 
+                    success: false, 
+                    message: "Pas de croisement possible".to_string(), 
+                    clearing_price_sats: 0, 
+                    total_volume_flames: 0, 
+                    swaps: vec![] 
+                })
             }
         });
     
@@ -257,8 +284,8 @@ pub async fn start_api_server(
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST"]);
 
-    // 💡 AJOUT : On n'oublie pas d'ajouter get_swaps dans les routes finales
-    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(resolve_batch).or(info_route).or(get_swaps)
+    // 💡 FIX : On utilise resolve_route au lieu de resolve_batch
+    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(resolve_route).or(info_route).or(get_swaps)
         .with(cors);
     
     warp::serve(routes).run((host_ip, port)).await;

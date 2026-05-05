@@ -24,7 +24,7 @@ function App() {
   
   const [orderType, setOrderType] = useState("buy");
   const [orderAmount, setOrderAmount] = useState("");
-  const [orderPrice, setOrderPrice] = useState("");
+  const [orderTotalBtc, setOrderTotalBtc] = useState("");
   const [countdown, setCountdown] = useState(120); 
   const [darkPool, setDarkPool] = useState([]);
   const [pendingSwaps, setPendingSwaps] = useState([]);
@@ -118,8 +118,8 @@ function App() {
             invoke("resolve_batch").then(result => {
                if(result.success) {
                  setPendingSwaps(result.swaps);
-                 alert(`⚖️ RÉSOLU ! Prix : ${(result.clearing_price_sats / 100000000).toFixed(8)} BTC`);
-                 setGlobalWattPriceSats(result.clearing_price_sats); // MAJ INSTANTANÉE
+                 // 💡 L'alerte agaçante a été supprimée ici !
+                 setGlobalWattPriceSats(result.clearing_price_sats); // MAJ INSTANTANÉE DU PRIX
                }
             });
             return 120;
@@ -144,19 +144,34 @@ function App() {
   };
 
   const handleSubmitOrder = async () => {
-    if (!orderAmount || !orderPrice) return;
-    const totalBtcCost = parseFloat(orderAmount) * parseFloat(orderPrice);
-    if (orderType === "buy" && totalBtcCost > btcBalance) {
-      alert(`❌ Fonds insuffisants ! Il vous faut ${totalBtcCost.toFixed(8)} BTC, mais vous n'avez que ${btcBalance.toFixed(8)} BTC.`);
+    if (!orderAmount || !orderTotalBtc) return;
+    
+    const amountWATT = parseFloat(orderAmount);
+    const totalBTC = parseFloat(orderTotalBtc);
+
+    if (amountWATT <= 0 || totalBTC <= 0) {
+      alert("Les montants doivent être supérieurs à zéro.");
       return;
     }
+
+    if (orderType === "buy" && totalBTC > btcBalance) {
+      alert(`❌ Fonds insuffisants ! Il vous faut ${totalBTC.toFixed(8)} BTC, mais vous n'avez que ${btcBalance.toFixed(8)} BTC.`);
+      return;
+    }
+    
+    // 💡 Le backend Rust attend le prix UNITAIRE en BTC. On le calcule ici en silence !
+    const unitPriceBtc = totalBTC / amountWATT;
+
     await invoke("submit_order", {
-      orderType: orderType, amount: parseFloat(orderAmount), price: parseFloat(orderPrice),
+      orderType: orderType, 
+      amount: amountWATT, 
+      price: unitPriceBtc, // Envoi du prix unitaire calculé
       btcAddress: walletData.btc_address, 
-      btcPubkey: walletData.btc_pubkey_hex, // 💡 LA VRAIE CLÉ EST ENVOYÉE
+      btcPubkey: walletData.btc_pubkey_hex, 
       wattAddress: walletData.watt_address
     });
-    setOrderAmount(""); setOrderPrice("");
+    
+    setOrderAmount(""); setOrderTotalBtc("");
     try {
       const pool = await invoke("get_dark_pool");
       setDarkPool(pool);
@@ -423,23 +438,37 @@ function App() {
                 <div className={`tab-btn sell ${orderType === "sell" ? "active" : ""}`} onClick={() => setOrderType("sell")}>Vente</div>
               </div>
               
-              <label style={{color: "#888", fontSize: "0.8rem", marginTop:"10px", display:"block"}}>Quantité (WATT)</label>
+              {/* 💡 CHAMP QUANTITÉ AVEC USD ESTIMÉ */}
+              <label style={{color: "#888", fontSize: "0.8rem", marginTop:"15px", display:"flex", justifyContent:"space-between"}}>
+                <span>Quantité (WATT)</span>
+                <span style={{color: "var(--primary)"}}>
+                  ≈ ${orderAmount ? (parseFloat(orderAmount) * (globalWattPriceSats / 100000000) * btcUsdPrice).toFixed(2) : "0.00"}
+                </span>
+              </label>
               <input type="number" placeholder="Ex: 10" value={orderAmount} onChange={(e) => setOrderAmount(e.target.value)} />
               
-              <label style={{color: "#888", fontSize: "0.8rem", marginTop:"10px", display:"block"}}>Prix Unitaire (BTC)</label>
-              <input type="number" placeholder="Ex: 0.00001" value={orderPrice} onChange={(e) => setOrderPrice(e.target.value)} />
+              {/* 💡 CHAMP TOTAL BTC AVEC USD ESTIMÉ */}
+              <label style={{color: "#888", fontSize: "0.8rem", marginTop:"10px", display:"flex", justifyContent:"space-between"}}>
+                <span>Total à {orderType === "buy" ? "payer" : "recevoir"} (BTC)</span>
+                <span style={{color: "#F7931A"}}>
+                  ≈ ${orderTotalBtc ? (parseFloat(orderTotalBtc) * btcUsdPrice).toFixed(2) : "0.00"}
+                </span>
+              </label>
+              <input type="number" placeholder="Ex: 0.001" value={orderTotalBtc} onChange={(e) => setOrderTotalBtc(e.target.value)} />
               
-              {/* 💡 SÉCURITÉ UX : Le Total */}
-              {orderAmount && orderPrice && (
+              {/* 💡 RÉTRO-AFFICHAGE DU PRIX UNITAIRE IMPLICITE */}
+              {orderAmount && orderTotalBtc && parseFloat(orderAmount) > 0 && (
                 <div style={{ background: "rgba(0,0,0,0.4)", padding: "10px", borderRadius: "5px", marginBottom: "15px", border: "1px solid #444", textAlign: "center" }}>
-                  <span style={{color: "#888", fontSize: "0.9rem"}}>Total estimé :</span><br/>
-                  <strong style={{color: orderType === "buy" ? "#ff4d4d" : "#00FF00", fontSize: "1.2rem"}}>
-                    {(parseFloat(orderAmount) * parseFloat(orderPrice)).toFixed(8)} BTC
+                  <span style={{color: "#888", fontSize: "0.85rem"}}>Prix unitaire implicite :</span><br/>
+                  <strong style={{color: "#ccc", fontSize: "1.1rem"}}>
+                    {(parseFloat(orderTotalBtc) / parseFloat(orderAmount)).toFixed(8)} BTC/WATT
                   </strong>
                 </div>
               )}
 
-              <button className={`submit-order-btn ${orderType}`} style={{ width: "100%" }} onClick={handleSubmitOrder}>Envoyer au Dark Pool</button>
+              <button className={`submit-order-btn ${orderType}`} style={{ width: "100%", marginTop: "10px" }} onClick={handleSubmitOrder}>
+                Envoyer au Dark Pool
+              </button>
             </div>
             <div className="dark-pool">
               <h3>🌊 Piscine d'ordres</h3>
