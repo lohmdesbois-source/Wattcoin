@@ -70,6 +70,16 @@ pub enum TransactionType {
     HTLCClaim { secret: String },
 }
 
+#[derive(Serialize)]
+pub struct HistoryItem {
+    pub id: String,
+    pub tx_type: String,
+    pub amount: f64,
+    pub coin: String,
+    pub date: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     pub tx_type: TransactionType, // 💡 Le nouveau moteur
@@ -317,6 +327,89 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     }
 
     Ok(balance_flames as f64 / 1_000_000_000.0)
+}
+
+#[tauri::command]
+async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/all_transactions", NODE_URL); 
+    
+    let all_txs: Vec<Transaction> = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?.json().await.map_err(|_| "Erreur JSON".to_string())?;
+
+    let mut history = Vec::new();
+    use pqcrypto_kyber::kyber768;
+    use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead}};
+
+    let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
+    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
+
+    // On charge la liste des pièces que l'on a déjà dépensées
+    let mut spent_capsules = std::collections::HashSet::new();
+    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
+        for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
+    }
+
+    for (i, tx) in all_txs.iter().enumerate() {
+        let is_lock = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
+
+        for (out_idx, out) in tx.outputs.iter().enumerate() {
+            if is_lock && out_idx == 0 { continue; } // On ignore les contrats bloqués
+
+            let is_spent = spent_capsules.contains(&out.kyber_capsule);
+            let status_text = if is_spent { "Dépensé" } else { "Disponible" };
+
+            // 1. Détection des récompenses de Minage (Coinbase)
+            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
+                if let Ok(amt) = out.aes_vault.parse::<u64>() {
+                    history.push(HistoryItem {
+                        id: format!("Bloc N°{}", i ), 
+                        tx_type: "receive".to_string(),
+                        amount: amt as f64 / 1_000_000_000.0,
+                        coin: "WATT".to_string(),
+                        date: "Récemment".to_string(),
+                        status: format!("Minage ({})", status_text),
+                    });
+                }
+            } 
+            // 2. Détection des Transferts et Swaps (Déchiffrement Kyber)
+            else if out.stealth_address.starts_with("pq_watt_") {
+                if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
+                    if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
+                        let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
+                        if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
+                            if vault_bytes.len() > 12 {
+                                let nonce = Nonce::from_slice(&vault_bytes[0..12]);
+                                let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+                                let cipher = Aes256Gcm::new(aes_key);
+                                
+                                if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
+                                    if let Ok(payload_str) = String::from_utf8(plaintext) {
+                                        let parts: Vec<&str> = payload_str.split('|').collect();
+                                        if parts.len() == 2 {
+                                            if let Ok(amt) = parts[0].parse::<u64>() {
+                                                history.push(HistoryItem {
+                                                    id: format!("{}...", &out.kyber_capsule[0..12]),
+                                                    tx_type: "receive".to_string(),
+                                                    amount: amt as f64 / 1_000_000_000.0,
+                                                    coin: "WATT".to_string(),
+                                                    date: "Récemment".to_string(),
+                                                    status: format!("Transfert ({})", status_text),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // On inverse pour afficher les transactions les plus récentes en haut
+    history.reverse();
+    Ok(history)
 }
 
 #[tauri::command]
@@ -1102,6 +1195,61 @@ async fn send_btc_direct(
     .unwrap_or_else(|_| Err("Erreur critique du thread BDK".to_string()))
 }
 
+#[tauri::command]
+fn save_miner_script(os: String, address: String) -> Result<String, String> {
+    // 1. Trouver le dossier principal de l'utilisateur
+    let home = if cfg!(windows) {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
+    } else {
+        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+    };
+
+    let base_dir = std::path::PathBuf::from(&home);
+    
+    // 2. Chasse au trésor : Trouver le bon dossier (Anglais ou Français)
+    let mut target_dir = base_dir.join("Downloads");
+    if !target_dir.exists() {
+        target_dir = base_dir.join("Téléchargements");
+    }
+    if !target_dir.exists() {
+        target_dir = base_dir.join("Desktop");
+    }
+    if !target_dir.exists() {
+        target_dir = base_dir.join("Bureau");
+    }
+    if !target_dir.exists() {
+        target_dir = base_dir; // Fallback : on met à la racine (/home/lucien/)
+    }
+
+    // 3. Nommer le fichier
+    let filename = if os == "linux" { "start_miner.sh" } else { "start_miner.bat" };
+    let file_path = target_dir.join(filename);
+
+    let short_addr = if address.len() > 15 { &address[0..15] } else { &address };
+
+    // 4. Contenu du script
+    let content = if os == "linux" {
+        format!("#!/bin/bash\n\n# Lancement du Nœud Wattcoin avec Minage\n# Le port local est défini sur 8001 pour éviter les conflits.\necho \"🔥 Démarrage du Nœud Cypherpunk pour {}...\"\n./wattcoin_core 8001 {} 80.78.26.243:8000 --live\n", short_addr, address)
+    } else {
+        format!("@echo off\n:: Lancement du Nœud Wattcoin avec Minage\n:: Le port local est defini sur 8001 pour eviter les conflits.\necho 🔥 Demarrage du Noeud Cypherpunk pour {}...\nwattcoin_core.exe 8001 {} 80.78.26.243:8000 --live\npause\n", short_addr, address)
+    };
+
+    // 5. Écrire le fichier
+    std::fs::write(&file_path, content).map_err(|e| format!("Erreur d'écriture : {}", e))?;
+
+    // 6. Rendre le script exécutable sous Linux
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(mut perms) = std::fs::metadata(&file_path).map(|m| m.permissions()) {
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&file_path, perms);
+        }
+    }
+
+    Ok(format!("Script généré avec succès dans :\n{}", file_path.display()))
+}
+
 
 
 // ============== LA FONCTION MAIN ==================
@@ -1138,7 +1286,7 @@ fn main() {
             generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
             submit_order, get_dark_pool, resolve_batch, get_watt_balance, get_btc_balance,
             send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, simulate_bot_lock,
-            destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct
+            destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, save_miner_script
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

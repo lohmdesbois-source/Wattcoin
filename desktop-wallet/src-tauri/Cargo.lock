@@ -5816,7 +5816,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin-wallet"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "aes-gcm",
  "bdk",

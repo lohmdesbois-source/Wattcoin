@@ -35,6 +35,7 @@ function App() {
   const [manualSwapHash, setManualSwapHash] = useState(""); // 💡 NOUVEAU : Pour que Bob s'aligne
   const [manualSwapAmount, setManualSwapAmount] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [txHistory, setTxHistory] = useState([]);
 
   const handleCopy = (e, text, type) => {
     e.stopPropagation(); 
@@ -67,6 +68,11 @@ function App() {
         const balWATT = await invoke("get_watt_balance", { keys: walletData });
         setWattBalance(balWATT);
       } catch (e) { console.error(e); }
+	  
+	  try {
+        const hist = await invoke("get_history", { keys: walletData });
+        setTxHistory(hist);
+      } catch (e) { console.error("Erreur historique:", e); }
       
       try {
         const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex });
@@ -667,30 +673,37 @@ function App() {
         <main className="main-content">
           <header>
             <h1>Historique des Transactions</h1>
-            <p style={{ color: "var(--text-muted)" }}>Vos derniers mouvements sur les réseaux</p>
+            <p style={{ color: "var(--text-muted)" }}>Scanner cryptographique activé. Seuls vos fonds déchiffrés apparaissent ici.</p>
           </header>
 
           <div className="glass-panel" style={{ padding: "30px", maxWidth: "800px" }}>
             <div style={{ marginTop: "10px" }}>
-              {[
-                { id: "tx_9a8b...", type: "receive", amount: 15.0, coin: "WATT", date: "24 Avr 2026", status: "Confirmé" },
-                { id: "tx_3f2c...", type: "send", amount: 0.05, coin: "BTC", date: "22 Avr 2026", status: "Confirmé" }
-              ].map((tx, idx) => (
-                <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "#111", padding: "15px", borderRadius: "8px", marginBottom: "10px", borderLeft: tx.type === 'receive' ? "4px solid #00FF00" : "4px solid #FF3333" }}>
-                  <div>
-                    <div style={{ color: "#FFF", fontWeight: "bold", fontSize: "1.1rem" }}>
-                      {tx.type === 'receive' ? '⬇️ Reçu' : '⬆️ Envoyé'}
-                    </div>
-                    <div style={{ color: "#888", fontSize: "0.9rem" }}>{tx.date} • {tx.id}</div>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ color: tx.type === 'receive' ? "#00FF00" : "#FF3333", fontWeight: "bold", fontSize: "1.2rem" }}>
-                      {tx.type === 'receive' ? '+' : '-'}{tx.amount} {tx.coin}
-                    </div>
-                    <div style={{ color: "#888", fontSize: "0.8rem" }}>{tx.status}</div>
-                  </div>
+              
+              {txHistory.length === 0 ? (
+                <div style={{ textAlign: "center", color: "#888", padding: "40px 0" }}>
+                  Aucune transaction détectée sur la blockchain.
                 </div>
-              ))}
+              ) : (
+                txHistory.map((tx, idx) => (
+                  <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "#111", padding: "15px", borderRadius: "8px", marginBottom: "10px", borderLeft: "4px solid #00FF00" }}>
+                    <div>
+                      <div style={{ color: "#FFF", fontWeight: "bold", fontSize: "1.1rem" }}>
+                        ⬇️ Reçu
+                      </div>
+                      <div style={{ color: "#888", fontSize: "0.9rem" }}>{tx.date} • {tx.id}</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ color: "#00FF00", fontWeight: "bold", fontSize: "1.2rem" }}>
+                        +{tx.amount.toFixed(4)} {tx.coin}
+                      </div>
+                      <div style={{ color: tx.status.includes("Dépensé") ? "#FF3333" : "#888", fontSize: "0.8rem", fontWeight: "bold" }}>
+                        {tx.status}
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+
             </div>
           </div>
         </main>
@@ -699,6 +712,18 @@ function App() {
   }
 
   if (view === "settings") {
+    
+    // 💡 NOUVEAU : Appel du backend Rust pour créer le fichier
+    const handleDownloadMinerScript = async (os) => {
+      try {
+        const address = walletData.watt_address;
+        const message = await invoke("save_miner_script", { os: os, address: address });
+        alert("✅ " + message);
+      } catch (error) {
+        alert("❌ Erreur : " + error);
+      }
+    };
+
     return (
       <div className="dashboard-layout">
         <Sidebar activeTab="settings" />
@@ -722,6 +747,29 @@ function App() {
                   <button className="btn-secondary" onClick={() => setShowSeed(true)}>Afficher la Phrase Secrète</button>
                 </div>
               )}
+            </div>
+
+            {/* 💡 NOUVEAU : SECTION SCRIPTS DE MINAGE */}
+            <div className="security-section" style={{ marginTop: "40px" }}>
+              <h3 style={{ color: "#10b981" }}>⛏️ Scripts de Minage</h3>
+              <p style={{ color: "#AAA" }}>Téléchargez un script pré-configuré avec votre adresse de réception (3000 caractères) pour lancer votre propre nœud de minage sans faire d'erreur.</p>
+              
+              <div style={{ display: "flex", gap: "15px", marginTop: "15px" }}>
+                <button 
+                  className="btn-secondary" 
+                  style={{ flex: 1, padding: "12px", border: "1px solid #10b981", color: "#10b981", background: "rgba(16, 185, 129, 0.1)" }}
+                  onClick={() => handleDownloadMinerScript("linux")}
+                >
+                  🐧 Générer start_miner.sh (Linux/Mac)
+                </button>
+                <button 
+                  className="btn-secondary" 
+                  style={{ flex: 1, padding: "12px", border: "1px solid #3b82f6", color: "#3b82f6", background: "rgba(59, 130, 246, 0.1)" }}
+                  onClick={() => handleDownloadMinerScript("windows")}
+                >
+                  🪟 Générer start_miner.bat (Windows)
+                </button>
+              </div>
             </div>
 
             <div className="security-section" style={{ marginTop: "50px", borderTop: "1px solid #444", paddingTop: "30px" }}>
