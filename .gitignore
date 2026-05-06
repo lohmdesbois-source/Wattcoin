@@ -21,3 +21,13 @@ Commandes.txt
 # Fichiers système
 .DS_Store
 Thumbs.db
+
+# ==========================================
+# RELEASES & BINAIRES (Ne jamais uploader !)
+# ==========================================
+**/*.tar.gz
+**/*.zip
+**/*.deb
+**/*.exe
+**/*.AppImage
+**/Wattcoin-Node-*/
