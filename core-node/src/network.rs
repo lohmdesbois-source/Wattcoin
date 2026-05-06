@@ -27,7 +27,6 @@ pub enum P2PMessage {
     MempoolSync { txs: Vec<Transaction> },
 }
 
-// 💡 CORRECTION : La fonction accepte désormais TOUS les types de flux (TCP pur ET Tor)
 async fn read_p2p_message<R: AsyncBufReadExt + std::marker::Unpin>(reader: &mut R) -> Option<P2PMessage> {
     let mut line = String::new();
     match reader.read_line(&mut line).await {
@@ -54,6 +53,10 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
         let (socket, peer_addr) = listener.accept().await.unwrap();
         let peer_ip = peer_addr.ip().to_string();
         
+        // 💡 NOUVEAU : Log du serrage de main pour le Relais
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        println!("🤝 [{}] Nouvelle connexion P2P entrante depuis {} !", now, peer_ip);
+        
         start_peer_connection(
             socket, peer_ip, my_port.clone(), 
             Arc::clone(&blockchain), Arc::clone(&mempool), Arc::clone(&dex_pool), 
@@ -77,7 +80,7 @@ fn start_peer_connection(
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
-            let _ = write_half.flush().await; // 💡 LA SOLUTION : On force l'envoi immédiat !
+            let _ = write_half.flush().await;
         }
     });
 
@@ -118,7 +121,6 @@ fn start_peer_connection(
                     }
                 },
 
-                // 💡 FIX: on ignore sender_port avec un "_" pour ne plus avoir de warning
                 P2PMessage::SyncRequest { current_height, last_hash, sender_port: _ } => {
                     let blocks_to_send = {
                         let chain = blockchain.lock().unwrap(); 
@@ -164,11 +166,19 @@ fn start_peer_connection(
                     if let Some((my_genesis, my_height)) = reject_info {
                         send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
                     } else {
+                        // 💡 NOUVEAU : Log enrichi pour le serveur TCP
+                        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                        let tx_count = block.transactions.len();
+                        let tx_detail = if tx_count == 1 { "1 Coinbase".to_string() } else { format!("1 Coinbase + {} Publique/Swap", tx_count - 1) };
+
                         println!("\n====================================================================");
-                        println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU ! (Source: {})", block.header.index, sender_port);
-                        println!("🔗 Hash: {}", block.header.hash);
+                        println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU VIA P2P ! (Source: {})", block.header.index, sender_port);
+                        println!("🕒 Reçu le : {}", now);
+                        println!("🔗 Hash    : {}", block.header.hash);
+                        println!("📝 Contenu : {} transactions incluses ({})", tx_count, tx_detail);
                         println!("====================================================================");
                         println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
+                        
                         mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) });
                         
                         let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port.clone() };
@@ -243,7 +253,6 @@ fn start_peer_connection(
     });
 }
 
-// 💡 NOUVEAU : Le tunnel sortant natif embarqué (AVEC PATIENCE ET CORRECTION RUST !)
 pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers) {
     let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
     
@@ -279,11 +288,10 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                         let temp_peer_id = format!("{}:incoming_tor", address);
                         active_peers.lock().unwrap().insert(temp_peer_id.clone(), tx.clone());
 
-                        // --- TÂCHE D'ÉCRITURE TOR ---
                         tokio::spawn(async move {
                             while let Some(msg) = rx.recv().await {
                                 if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
-                                let _ = write_half.flush().await; // 💡 LA SOLUTION !
+                                let _ = write_half.flush().await; 
                             }
                         });
 
@@ -295,7 +303,6 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                         let my_port_clone = my_port.to_string();
                         let temp_peer_id_for_task = temp_peer_id.clone();
                         
-                        // 💡 FIX RUST : On clone l'adresse spécifiquement pour que le thread puisse l'absorber sans tuer la boucle
                         let address_for_task = address.clone();
 
                         tokio::spawn(async move {
@@ -304,12 +311,12 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                             while let Some(message) = read_p2p_message(&mut reader).await {
                                 match message {
                                     P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
-                                        actual_peer_id = format!("{}:{}", address_for_task, sender_port); // On utilise le clone !
+                                        actual_peer_id = format!("{}:{}", address_for_task, sender_port); 
                                         kp_clone.lock().unwrap().insert(actual_peer_id.clone());
                                         
                                         {
                                             let mut ap = ap_clone.lock().unwrap();
-                                            let old_id = format!("{}:incoming_tor", address_for_task); // On utilise le clone !
+                                            let old_id = format!("{}:incoming_tor", address_for_task); 
                                             if let Some(sender) = ap.remove(&old_id) {
                                                 ap.insert(actual_peer_id.clone(), sender);
                                             }
@@ -363,13 +370,22 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                                                 Some((chain.chain[0].header.hash.clone(), chain.chain.len() as u64))
                                             } else { None }
                                         };
+                                        
                                         if let Some((my_genesis, my_height)) = reject_info {
                                             send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() }).await;
                                         } else {
+                                            // 💡 NOUVEAU : Log enrichi pour le mineur sous Tor
+                                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                            let tx_count = block.transactions.len();
+                                            let tx_detail = if tx_count == 1 { "1 Coinbase".to_string() } else { format!("1 Coinbase + {} Publique/Swap", tx_count - 1) };
+
                                             println!("\n====================================================================");
                                             println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU VIA TOR ! (Source: {})", block.header.index, sender_port);
-                                            println!("🔗 Hash: {}", block.header.hash);
+                                            println!("🕒 Reçu le : {}", now);
+                                            println!("🔗 Hash    : {}", block.header.hash);
+                                            println!("📝 Contenu : {} transactions incluses ({})", tx_count, tx_detail);
                                             println!("====================================================================");
+                                            
                                             mp_clone.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) });
                                             
                                             let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port_clone.clone() };
@@ -441,7 +457,7 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                 }
             }
             
-            // 💡 NOUVEAU : LE MÉCANISME DE REPLI (FALLBACK) SI TOR EST BLOQUÉ
+            // 💡 REPLI TCP (FALLBACK)
             if !connected {
                 println!("🛑 [ARTI-TOR] Échec définitif après {} tentatives. L'hébergeur distant bloque probablement les nœuds de sortie Tor.", max_retries);
                 println!("⚠️ [REPLI] Activation du mode survie : Tentative de connexion en clair (TCP direct)...");
@@ -479,7 +495,6 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
         Err(e) => println!("🛑 [ARTI-TOR] Échec de l'initialisation du circuit Tor local : {}", e),
     }
 }
-
 
 pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: ActivePeers) {
     let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
