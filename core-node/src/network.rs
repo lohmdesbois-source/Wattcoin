@@ -141,17 +141,22 @@ fn start_peer_connection(
                     }; 
 
                     if let Some(blocks) = blocks_to_send {
+                        println!("📤 [SYNC] Le nœud distant est en retard. Envoi de {} blocs manquants...", blocks.len());
                         send_message_to_channel(&tx, P2PMessage::SyncResponse { blocks }).await;
                     }
                 },
                 
                 P2PMessage::SyncResponse { blocks } => {
                     if blocks.is_empty() { continue; }
+                    println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {}). Tentative de fusion...", blocks.len(), blocks.first().unwrap().header.index, blocks.last().unwrap().header.index);
                     let mut chain = blockchain.lock().unwrap(); 
                     
                     if chain.resolve_partial_fork(blocks.clone()) { 
+                        println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
                         let mut mp = mempool.lock().unwrap();
                         mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)) });
+                    } else {
+                        println!("❌ [SYNC] Échec de la fusion ! La fonction 'resolve_partial_fork' a refusé d'intégrer les blocs.");
                     }
                 },
 
@@ -351,15 +356,20 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                                             } else { None }
                                         }; 
                                         if let Some(blocks) = blocks_to_send {
+                                            println!("📤 [SYNC TOR] Envoi de {} blocs manquants...", blocks.len());
                                             send_message_to_channel(&tx, P2PMessage::SyncResponse { blocks }).await;
                                         }
                                     },
                                     P2PMessage::SyncResponse { blocks } => {
                                         if !blocks.is_empty() {
+                                            println!("📥 [SYNC TOR] Lot de {} blocs reçu ! Tentative de fusion...", blocks.len());
                                             let mut chain = bc_clone.lock().unwrap(); 
                                             if chain.resolve_partial_fork(blocks.clone()) { 
+                                                println!("✅ [SYNC TOR] Rattrapage réussi !");
                                                 let mut mp = mp_clone.lock().unwrap();
                                                 mp.retain(|t| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule)) });
+                                            } else {
+                                                println!("❌ [SYNC TOR] Échec de la fusion !");
                                             }
                                         }
                                     },

@@ -99,8 +99,16 @@ async fn main() {
             chain.save_to_disk(&db_file_relay);
         }
     } else {
+        // 💡 LA CORRECTION EST ICI : On force le mineur à attendre la synchro initiale !
+        if peer_target.is_some() {
+            println!("⏳ [SYNCHRONISATION] Pause de 15 secondes...");
+            println!("⏳ Laissons le temps au tunnel Tor de s'établir et de télécharger l'historique du Relais.");
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            println!("✅ [SYNCHRONISATION] Phase d'écoute terminée. Allumage des moteurs !");
+        }
+
         println!("\n⚙️  Initialisation du moteur RandomX...");
-        let start_rx = std::time::Instant::now(); 
+        let start_rx = std::time::Instant::now();
         
         // 💡 NOUVEAU : On gère l'époque dynamique !
         let flags = RandomXFlag::get_recommended_flags();

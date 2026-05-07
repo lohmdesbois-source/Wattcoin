@@ -31,3 +31,6 @@ Thumbs.db
 **/*.exe
 **/*.AppImage
 **/Wattcoin-Node-*/
+
+# Dossier de distribution (temporaire)
+/dist/
