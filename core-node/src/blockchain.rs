@@ -246,16 +246,13 @@ impl Blockchain {
         if new_blocks.is_empty() { return false; }
 
         let start_index = new_blocks[0].header.index as usize;
-        
-        // Si on nous envoie toute la chaîne, on passe par la résolution complète
         if start_index == 0 { return self.resolve_fork(new_blocks); }
         if start_index > self.chain.len() { return false; }
 
-        // 💡 CORRECTION : Recherche de l'ancêtre commun (Tolérance aux désynchronisations)
+        // 1. Recherche de l'ancêtre commun
         let mut ancestor_index = start_index.saturating_sub(1);
         let mut found_ancestor = false;
 
-        // On recule jusqu'à trouver un bloc où nos deux historiques correspondent
         while ancestor_index > 0 {
             if self.chain[ancestor_index].header.hash == new_blocks[0].header.previous_hash {
                 found_ancestor = true;
@@ -264,21 +261,37 @@ impl Blockchain {
             ancestor_index -= 1;
         }
 
-        // Si vraiment aucun ancêtre commun n'est trouvé (à part le Genesis), on rejette.
-        // Il faudrait faire une synchronisation complète.
         if !found_ancestor && self.chain[0].header.hash != new_blocks[0].header.previous_hash {
-            println!("❌ [FORK] Impossible de trouver un ancêtre commun !");
+            println!("❌ [FORK] Impossible de trouver un ancêtre commun avec ce lot. Le nœud a besoin d'un historique plus ancien !");
             return false;
         }
 
+        // 💡 LA MAGIE EST ICI : On fusionne virtuellement la chaîne AVANT de valider !
+        // Cela permet au validateur d'utiliser les bons blocs pour les changements d'Époque.
+        let mut theoretical_chain = self.chain[0..=ancestor_index].to_vec();
+        theoretical_chain.extend(new_blocks.clone());
+
+        // Petite fonction interne pour lire la graine sur la chaîne théorique
+        let get_theoretical_seed = |height: u64, t_chain: &[Block]| -> String {
+            if height <= EPOCH_BLOCKS {
+                return t_chain[0].header.hash.clone();
+            }
+            let target_block = ((height - 1) / EPOCH_BLOCKS) * EPOCH_BLOCKS;
+            if (target_block as usize) < t_chain.len() {
+                t_chain[target_block as usize].header.hash.clone()
+            } else {
+                t_chain[0].header.hash.clone()
+            }
+        };
+
+        // 2. Le Tribunal RandomX
         let flags = RandomXFlag::get_recommended_flags();
-        let mut current_seed = self.get_epoch_seed(new_blocks[0].header.index);
+        let mut current_seed = get_theoretical_seed(new_blocks[0].header.index, &theoretical_chain);
         let mut cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
         let mut vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap(); 
 
-        // Validation mathématique (RandomX) de la nouvelle branche
         for block in &new_blocks {
-            let needed_seed = self.get_epoch_seed(block.header.index);
+            let needed_seed = get_theoretical_seed(block.header.index, &theoretical_chain);
             if needed_seed != current_seed {
                 current_seed = needed_seed;
                 cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
@@ -287,20 +300,17 @@ impl Blockchain {
 
             let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
             let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
+            
             if hex::encode(&hash_bytes) != block.header.hash { 
                 println!("❌ [FORK] La nouvelle branche contient un bloc frauduleux (Index {})", block.header.index);
                 return false; 
             }
         }
 
-        // Construction théorique de la nouvelle chaîne
-        let mut theoretical_chain = self.chain[0..=ancestor_index].to_vec();
-        theoretical_chain.extend(new_blocks.clone());
-
+        // 3. Pesée des deux chaînes (Preuve de travail)
         let my_work = Blockchain::calculate_total_work(&self.chain);
         let new_work = Blockchain::calculate_total_work(&theoretical_chain);
 
-        // Si la nouvelle chaîne est plus "lourde", on l'adopte !
         if new_work > my_work || (new_work == my_work && new_blocks.last().unwrap().header.timestamp < self.chain.last().unwrap().header.timestamp) {
             println!("✅ [FORK] Nouvelle chaîne adoptée ! On recule de {} blocs et on en applique {}.", 
                      self.chain.len() - ancestor_index - 1, new_blocks.len());
@@ -308,7 +318,7 @@ impl Blockchain {
             self.chain = theoretical_chain;
             self.recalculate_target_from_scratch(); 
 
-            // Mise à jour des clés dépensées
+            // Remise à zéro des clés dépensées
             let mut new_spent = HashSet::new();
             for block in &self.chain {
                 for tx in &block.transactions {
