@@ -273,7 +273,10 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
             loop {
                 println!("⏳ Tentative de création du circuit Onion vers {}...", address);
                 
-                match tor_client.connect(address.clone()).await {
+                let mut prefs = arti_client::StreamPrefs::new();
+				prefs.connect_to_onions(arti_client::config::BoolOrAuto::Explicit(true));
+
+				match tor_client.connect_with_prefs(address.clone(), &prefs).await {
                     Ok(tor_stream) => {
                         println!("🛡️ [ARTI-TOR] Tunnel fantôme établi ! L'IP du mineur est désormais intraçable.");
                         
