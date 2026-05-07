@@ -274,7 +274,7 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                 println!("⏳ Tentative de création du circuit Onion vers {}...", address);
                 
                 let mut prefs = arti_client::StreamPrefs::new();
-				prefs.connect_to_onions(arti_client::config::BoolOrAuto::Explicit(true));
+				prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
 
 				match tor_client.connect_with_prefs(address.clone(), &prefs).await {
                     Ok(tor_stream) => {
