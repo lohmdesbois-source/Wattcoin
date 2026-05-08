@@ -32,10 +32,11 @@ function App() {
   const [sendAddress, setSendAddress] = useState("");
   const [sendAmount, setSendAmount] = useState("");
 
-  const [manualSwapHash, setManualSwapHash] = useState(""); // 💡 NOUVEAU : Pour que Bob s'aligne
-  const [manualSwapAmount, setManualSwapAmount] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [txHistory, setTxHistory] = useState([]);
+  
+  // 💡 NOUVEAU : Message dynamique pour l'écran de chargement
+  const [syncMessage, setSyncMessage] = useState("Établissement du tunnel Tor...");
 
   const handleCopy = (e, text, type) => {
     e.stopPropagation(); 
@@ -44,6 +45,7 @@ function App() {
     setTimeout(() => setCopied(""), 2000);
   };
 
+  // 1. Initialisation de base
   useEffect(() => {
     async function checkVault() {
       const exists = await invoke("vault_exists");
@@ -51,71 +53,78 @@ function App() {
     }
     checkVault();
 
-    // 💡 NOUVEAU : Récupération du prix du Bitcoin en USD (CoinGecko API Libre)
-    fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+    // 💡 Nouveau fournisseur de prix (Binance) : beaucoup plus robuste
+    fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
       .then(res => res.json())
       .then(data => {
-        if(data && data.bitcoin) setBtcUsdPrice(data.bitcoin.usd);
+        if(data && data.price) setBtcUsdPrice(parseFloat(data.price));
       }).catch(err => console.warn("Erreur Prix USD:", err));
   }, []);
 
+  // 💡 2. LA NOUVELLE LOGIQUE DE SYNCHRONISATION (Écran d'attente)
   useEffect(() => {
-    if (view !== "dex" && view !== "dashboard" && view !== "swaps") return;
+    if (view === "syncing" && walletData) {
+      const performInitialSync = async () => {
+        try {
+          setSyncMessage("Connexion au réseau furtif en cours...");
+          const info = await invoke("get_network_info");
+          if(info.last_price_sats) setGlobalWattPriceSats(info.last_price_sats);
+
+          setSyncMessage("Déchiffrement de la blockchain...");
+          const balWATT = await invoke("get_watt_balance", { keys: walletData });
+          setWattBalance(balWATT);
+
+          const hist = await invoke("get_history", { keys: walletData });
+          setTxHistory(hist);
+
+          // 💡 BOOM ! On ouvre le coffre immédiatement !
+          setView("dashboard");
+
+          // 💡 ET SEULEMENT APRÈS, on lance la tâche lourde BTC en arrière-plan
+          invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex })
+            .then(balBTC => setBtcBalance(balBTC))
+            .catch(btcError => console.warn("Erreur BTC en arrière-plan :", btcError));
+
+        } catch (e) {
+          console.error("Erreur de sync initiale:", e);
+          setSyncMessage("⚠️ Tor est très lent ou le Nœud est hors ligne. Nouvelle tentative...");
+          setTimeout(performInitialSync, 5000);
+        }
+      };
+      performInitialSync();
+    }
+  }, [view, walletData]);
+
+  // 3. Mises à jour en arrière-plan (quand le dashboard est déjà ouvert)
+  useEffect(() => {
+    if (view !== "dex" && view !== "dashboard" && view !== "swaps" && view !== "history") return;
 
     const updateData = async () => {
       if (!walletData) return;
-      try {
-        const balWATT = await invoke("get_watt_balance", { keys: walletData });
-        setWattBalance(balWATT);
-      } catch (e) { console.error(e); }
-	  
-	  try {
-        const hist = await invoke("get_history", { keys: walletData });
-        setTxHistory(hist);
-      } catch (e) { console.error("Erreur historique:", e); }
-      
-      try {
-        const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex });
-        setBtcBalance(balBTC);
-      } catch (e) { console.error(e); }
+      try { const balWATT = await invoke("get_watt_balance", { keys: walletData }); setWattBalance(balWATT); } catch (e) {}
+      try { const hist = await invoke("get_history", { keys: walletData }); setTxHistory(hist); } catch (e) {}
+      try { const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex }); setBtcBalance(balBTC); } catch (e) {}
       
       if (view === "dex") {
-        try {
-          const pool = await invoke("get_dark_pool");
-          setDarkPool(pool);
-        } catch (e) { console.error(e); }
+        try { const pool = await invoke("get_dark_pool"); setDarkPool(pool); } catch (e) {}
       }
 
       try {
-        const swaps = await invoke("get_active_swaps", { 
-          btcAddress: walletData.btc_address, 
-          wattAddress: walletData.watt_address 
-        });
+        const swaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
         setPendingSwaps(swaps);
-      } catch (e) { console.error("Erreur Swaps:", e); }
+      } catch (e) {}
     };
-
-    updateData();
 
     let unlisten;
     const setupListener = async () => {
       unlisten = await listen("network-update", () => {
-        // 💡 FETCH DU PRIX GLOBAL LORS D'UN NOUVEAU BLOC
-        fetch("http://80.78.26.243:8100/info")
-          .then(res => res.json())
-          .then(data => {
-             if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats);
-          }).catch(()=>{});
-
+        invoke("get_network_info")
+            .then(data => { if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats); })
+            .catch(()=>{});
         updateData();
       });
     };
     setupListener();
-
-    // 💡 FETCH DU PRIX INITIAL
-    fetch("http://80.78.26.243:8100/info").then(res => res.json()).then(data => {
-        if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats);
-    }).catch(()=>{});
 
     const timerDex = setInterval(async () => {
       if (view === "dex") {
@@ -124,10 +133,9 @@ function App() {
             invoke("resolve_batch").then(result => {
                if(result.success) {
                  setPendingSwaps(result.swaps);
-                 // 💡 L'alerte agaçante a été supprimée ici !
-                 setGlobalWattPriceSats(result.clearing_price_sats); // MAJ INSTANTANÉE DU PRIX
+                 setGlobalWattPriceSats(result.clearing_price_sats);
                }
-            });
+            }).catch(e => console.error("Erreur Resolve:", e));
             return 120;
           }
           return prev - 1;
@@ -143,46 +151,121 @@ function App() {
     try {
       const res = await invoke("unlock_vault", { password: password });
       setWalletData(res);
-      setView("dashboard"); 
+      setView("syncing"); // 💡 ON VA SUR L'ÉCRAN D'ATTENTE !
     } catch (e) { 
       setError(e); 
     }
   };
 
+  const handleCreateWallet = async () => {
+    try {
+      const res = await invoke("generate_pro_wallet", { phraseOption: restorePhrase ? restorePhrase : null });
+      await invoke("encrypt_vault", { password: password, keysJsonString: JSON.stringify(res) });
+      setWalletData(res);
+      setView("syncing"); // 💡 ON VA SUR L'ÉCRAN D'ATTENTE !
+    } catch (e) {
+      alert("Erreur de création : " + e);
+    }
+  }; 
+
   const handleSubmitOrder = async () => {
     if (!orderAmount || !orderTotalBtc) return;
-    
     const amountWATT = parseFloat(orderAmount);
     const totalBTC = parseFloat(orderTotalBtc);
 
-    if (amountWATT <= 0 || totalBTC <= 0) {
-      alert("Les montants doivent être supérieurs à zéro.");
-      return;
-    }
-
-    if (orderType === "buy" && totalBTC > btcBalance) {
-      alert(`❌ Fonds insuffisants ! Il vous faut ${totalBTC.toFixed(8)} BTC, mais vous n'avez que ${btcBalance.toFixed(8)} BTC.`);
-      return;
-    }
+    if (amountWATT <= 0 || totalBTC <= 0) { alert("Les montants doivent être supérieurs à zéro."); return; }
+    if (orderType === "buy" && totalBTC > btcBalance) { alert(`❌ Fonds insuffisants !`); return; }
     
-    // 💡 Le backend Rust attend le prix UNITAIRE en BTC. On le calcule ici en silence !
     const unitPriceBtc = totalBTC / amountWATT;
 
-    await invoke("submit_order", {
-      orderType: orderType, 
-      amount: amountWATT, 
-      price: unitPriceBtc, // Envoi du prix unitaire calculé
-      btcAddress: walletData.btc_address, 
-      btcPubkey: walletData.btc_pubkey_hex, 
-      wattAddress: walletData.watt_address
-    });
-    
-    setOrderAmount(""); setOrderTotalBtc("");
     try {
+      await invoke("submit_order", {
+        orderType: orderType, amount: amountWATT, price: unitPriceBtc, 
+        btcAddress: walletData.btc_address, btcPubkey: walletData.btc_pubkey_hex, wattAddress: walletData.watt_address
+      });
+      setOrderAmount(""); setOrderTotalBtc("");
       const pool = await invoke("get_dark_pool");
       setDarkPool(pool);
-    } catch (e) { console.error(e); }
+    } catch (e) { alert(e); }
   };
+
+  const handleSendTransaction = async () => {
+    if (!sendAddress || !sendAmount) return;
+    if (isProcessing) return;
+    setIsProcessing(true);
+
+    try {
+      if (activeCoinModal === "WATT") {
+        const response = await invoke("send_wattcoin", {
+          recipientKyberHex: sendAddress, amount: parseFloat(sendAmount),
+          senderDilithiumSecretHex: walletData.dilithium_secret_hex, senderDilithiumPublicHex: walletData.dilithium_public_hex,
+          senderKyberSecretHex: walletData.kyber_secret_hex, senderKyberPublicHex: walletData.watt_address,
+          htlcHashHex: null, htlcTimeout: null  
+        });
+        alert(response);
+        setWattBalance(prev => prev - parseFloat(sendAmount));
+        setActiveCoinModal(null); setSendAddress(""); setSendAmount(""); 
+      } else if (activeCoinModal === "BTC") {
+        const response = await invoke("send_btc_direct", {
+          masterSeedHex: walletData.master_seed_hex, recipientAddress: sendAddress, amountBtc: parseFloat(sendAmount)
+        });
+        alert(response);
+        setActiveCoinModal(null); setSendAddress(""); setSendAmount("");
+      }
+    } catch (error) { alert(error); } finally { setIsProcessing(false); }
+  };
+  
+  // HTLC
+  const handleFundSwap = async (swap) => {
+    try {
+      // On demande au backend Rust de calculer l'adresse du contrat Bitcoin (P2WSH)
+      const address = await invoke("create_btc_htlc", {
+        buyerPubkeyHex: swap.buyer_btc_pubkey,
+        sellerPubkeyHex: swap.seller_btc_pubkey,
+        secretHex: swap.htlc_secret,
+        locktime: 144
+      });
+      
+      // On affiche l'encart orange pour envoyer les BTC
+      setActiveContractAddress(address);
+    } catch (error) {
+      alert("Erreur lors de la création du contrat BTC : " + error);
+    }
+  };
+  
+  // HTLC WATT
+  const handleBobLockWatt = async (swap) => {
+    if (isProcessing) return;
+    setIsProcessing(true);
+
+    try {
+      // Bob appelle la fonction d'envoi classique, MAIS en remplissant 
+      // les champs HTLC (Hash et Timeout). Le backend Rust va automatiquement
+      // comprendre qu'il s'agit d'une transaction de type HTLCLock.
+      const response = await invoke("send_wattcoin", {
+        recipientKyberHex: swap.seller_watt_address, // Placeholder cryptographique
+        amount: swap.watt_amount_flames / 1000000000,
+        senderDilithiumSecretHex: walletData.dilithium_secret_hex,
+        senderDilithiumPublicHex: walletData.dilithium_public_hex,
+        senderKyberSecretHex: walletData.kyber_secret_hex,
+        senderKyberPublicHex: walletData.watt_address,
+        htlcHashHex: swap.htlc_hash,     // 💡 Le Cadenas Magique !
+        htlcTimeout: 144                 // 💡 Expiration dans 144 blocs
+      });
+      
+      alert(response); // Affichera "🔒 CONTRAT HTLC DÉPLOYÉ !"
+      setWattBalance(prev => prev - (swap.watt_amount_flames / 1000000000));
+      
+    } catch (error) {
+      alert("❌ Erreur lors du verrouillage des WATT : " + error);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+  
+  
+
+  // ================= UI COMPONENTS =================
 
   const Sidebar = ({ activeTab }) => (
     <nav className="sidebar">
@@ -197,103 +280,32 @@ function App() {
       </ul>
     </nav>
   );
-  
-  const handleSendTransaction = async () => {
-    if (!sendAddress || !sendAmount) {
-      alert("Veuillez remplir l'adresse et le montant.");
-      return;
-    }
-    
-    if (isProcessing) return;
-    setIsProcessing(true);
 
-    try {
-      if (activeCoinModal === "WATT") {
-        const response = await invoke("send_wattcoin", {
-          recipientKyberHex: sendAddress, 
-          amount: parseFloat(sendAmount),
-          senderDilithiumSecretHex: walletData.dilithium_secret_hex, 
-          senderDilithiumPublicHex: walletData.dilithium_public_hex,
-          senderKyberSecretHex: walletData.kyber_secret_hex,
-          senderKyberPublicHex: walletData.watt_address,
-          htlcHashHex: null, 
-          htlcTimeout: null  
-        });
-        alert(response);
-        
-        setWattBalance(prev => prev - parseFloat(sendAmount));
-        setActiveCoinModal(null); 
-        setSendAddress(""); setSendAmount(""); 
-      } else if (activeCoinModal === "BTC") {
-        // 💡 NOUVEAU : Envoi Direct de Bitcoin !
-        const response = await invoke("send_btc_direct", {
-          masterSeedHex: walletData.master_seed_hex,
-          recipientAddress: sendAddress,
-          amountBtc: parseFloat(sendAmount)
-        });
-        alert(response);
-        
-        setActiveCoinModal(null);
-        setSendAddress(""); setSendAmount("");
-      }
-    } catch (error) {
-      alert(error);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-  
-  const handleFundSwap = async (swap) => {
-    try {
-      const contractAddress = await invoke("create_btc_htlc", {
-        buyerPubkeyHex: swap.buyer_btc_pubkey,
-        sellerPubkeyHex: swap.seller_btc_pubkey,
-        secretHex: swap.htlc_secret, // 💡 CORRIGÉ : On passe le secret
-        locktime: 144 
-      });
-      setActiveContractAddress(contractAddress);
-    } catch (error) {
-      alert("Erreur lors de la création du contrat : " + error);
-    }
-  };
-
-  // 💡 Bob verrouille ses WATT en utilisant directement le contrat matché par le DEX
-  const handleBobLockWatt = async (swap) => {
-    if (isProcessing) return; // Anti double-clic !
-    setIsProcessing(true);
-    try {
-      await invoke("send_wattcoin", {
-        recipientKyberHex: walletData.watt_address, 
-        amount: swap.watt_amount_flames / 1000000000,
-        senderDilithiumSecretHex: walletData.dilithium_secret_hex,
-        senderDilithiumPublicHex: walletData.dilithium_public_hex,
-        senderKyberSecretHex: walletData.kyber_secret_hex,
-        senderKyberPublicHex: walletData.watt_address,
-        htlcHashHex: swap.htlc_hash, 
-        htlcTimeout: 144
-      });
-      alert("🔒 WATT verrouillés sur la blockchain WATT ! Alice peut maintenant réclamer.");
-    } catch (e) { 
-      alert("Erreur Lock WATT : " + e); 
-    } finally {
-      setIsProcessing(false); // On libère le bouton
-    }
-  };
+  // ================= VIEWS =================
 
   if (view === "loading") return <div className="onboarding-screen"><h1>Chargement...</h1></div>;
 
-  if (view === "onboarding") { /* ... Reste identique ... */
-    const handleCreateWallet = async () => {
-      try {
-        const res = await invoke("generate_pro_wallet", { phraseOption: restorePhrase ? restorePhrase : null });
-        await invoke("encrypt_vault", { password: password, keysJsonString: JSON.stringify(res) });
-        setWalletData(res);
-        setView("dashboard"); 
-      } catch (e) {
-        alert("Erreur de création : " + e);
-      }
-    }; 
-      
+  // 💡 L'ÉCRAN DE SYNCHRONISATION EST ICI !
+  if (view === "syncing") {
+    return (
+      <div className="onboarding-screen">
+        <div className="card" style={{ maxWidth: "500px", margin: "0 auto", textAlign: "center" }}>
+          <h2 style={{ color: "var(--primary)", marginBottom: "15px" }}>🧅 Initialisation...</h2>
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: "20px" }}>
+            {/* Petit loader CSS fait maison avec une div animée */}
+            <div style={{ width: "40px", height: "40px", border: "4px solid rgba(16, 185, 129, 0.2)", borderTop: "4px solid var(--primary)", borderRadius: "50%", animation: "spin 1s linear infinite" }}></div>
+            <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
+          </div>
+          <p style={{ color: "var(--text-main)", fontWeight: "bold" }}>{syncMessage}</p>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: "10px" }}>
+            Le Wallet télécharge vos informations à travers le réseau Tor pour garantir votre anonymat absolu. Veuillez patienter.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (view === "onboarding") { 
     return (
       <div className="onboarding-screen">
         <h1 className="logo">WATTCOIN</h1>
@@ -323,7 +335,6 @@ function App() {
   }
 
   if (view === "dashboard") {
-    // Si le prix est à zéro (début de chaîne), le WATT ne vaut rien en USD.
     const wattBtcPrice = globalWattPriceSats / 100000000;
     const wattUsdPrice = wattBtcPrice * btcUsdPrice;
 
@@ -333,7 +344,6 @@ function App() {
           <header><h1>Votre Trésorerie</h1></header>
           <div className="networks-stack">
             
-            {/* CARTE WATTCOIN */}
             <div className="network-card watt interactive-card" onClick={() => setActiveCoinModal('WATT')}>
               <div className="network-header">
                 <h2><span style={{ color: "var(--primary)" }}>⚡</span> Wattcoin</h2>
@@ -355,7 +365,6 @@ function App() {
               </div>
             </div>
 
-            {/* CARTE BITCOIN */}
             <div className="network-card btc interactive-card" onClick={() => setActiveCoinModal('BTC')}>
               <div className="network-header">
                 <h2><span style={{ color: "#F7931A" }}>₿</span> Bitcoin</h2>
@@ -403,7 +412,6 @@ function App() {
                     {isProcessing ? "⏳ Transaction en cours..." : "Signer & Envoyer"}
                   </button>
                   
-                  {/* 💡 NOUVEAU : Le message d'attente stylé */}
                   {isProcessing && activeCoinModal === "BTC" && (
                     <div style={{ marginTop: "15px", color: "#F7931A", textAlign: "center", fontSize: "0.9rem", fontWeight: "bold" }}>
                       📡 BDK synchronise la blockchain Bitcoin...
@@ -444,7 +452,6 @@ function App() {
                 <div className={`tab-btn sell ${orderType === "sell" ? "active" : ""}`} onClick={() => setOrderType("sell")}>Vente</div>
               </div>
               
-              {/* 💡 CHAMP QUANTITÉ AVEC USD ESTIMÉ (basé sur le prix global actuel) */}
               <label style={{color: "#888", fontSize: "0.8rem", marginTop:"15px", display:"flex", justifyContent:"space-between"}}>
                 <span>Quantité (WATT)</span>
                 <span style={{color: "var(--primary)"}}>
@@ -453,7 +460,6 @@ function App() {
               </label>
               <input type="number" placeholder="Ex: 10" value={orderAmount} onChange={(e) => setOrderAmount(e.target.value)} />
               
-              {/* 💡 CHAMP TOTAL BTC AVEC USD ESTIMÉ */}
               <label style={{color: "#888", fontSize: "0.8rem", marginTop:"10px", display:"flex", justifyContent:"space-between"}}>
                 <span>Total à {orderType === "buy" ? "payer" : "recevoir"} (BTC)</span>
                 <span style={{color: "#F7931A"}}>
@@ -462,7 +468,6 @@ function App() {
               </label>
               <input type="number" placeholder="Ex: 0.001" value={orderTotalBtc} onChange={(e) => setOrderTotalBtc(e.target.value)} />
               
-              {/* 💡 RÉTRO-AFFICHAGE DU PRIX UNITAIRE IMPLICITE (BTC et USD) */}
               {orderAmount && orderTotalBtc && parseFloat(orderAmount) > 0 && (
                 <div style={{ background: "rgba(0,0,0,0.4)", padding: "10px", borderRadius: "5px", marginBottom: "15px", border: "1px solid #444", textAlign: "center" }}>
                   <span style={{color: "#888", fontSize: "0.85rem"}}>Prix unitaire implicite :</span><br/>
@@ -508,6 +513,7 @@ function App() {
   }
   
   if (view === "swaps") {
+    // ... [Code identique]
     return (
       <div className="dashboard-layout"><Sidebar activeTab="swaps" />
         <main className="main-content">
@@ -543,7 +549,6 @@ function App() {
                         <td style={{ fontWeight: "bold" }}>{s.watt_amount_flames / 1000000000}</td>
                         <td style={{ fontWeight: "bold" }}>
                           {s.btc_amount_sats / 100000000}
-                          {/* 💡 NOUVEAU : Affichage de l'estimation en USD */}
                           <div style={{fontSize: "0.8rem", color: "#aaa", fontWeight: "normal"}}>
                             ≈ ${((s.btc_amount_sats / 100000000) * btcUsdPrice).toFixed(2)}
                           </div>
@@ -556,47 +561,24 @@ function App() {
                           )}
                           {isBob && (
                             <div style={{ display: "flex", gap: "5px", flexDirection: "column" }}>
-                              <button 
-                                className="btn-secondary" 
-                                style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
-                                disabled={isProcessing}
-                                onClick={() => handleBobLockWatt(s)}
-                              >
+                              <button className="btn-secondary" style={{ padding: "5px 15px", fontSize: "0.9rem" }} disabled={isProcessing} onClick={() => handleBobLockWatt(s)}>
                                 {isProcessing ? "⏳ Verrouillage..." : "🔒 1. Verrouiller mes WATT"}
                               </button>
-
-                              {/* 💡 Bouton Réclamation BTC (Avec correction appel API) */}
-                              <button 
-                                className="btn-primary" 
-                                style={{ padding: "5px 15px", fontSize: "0.9rem" }} 
-                                disabled={isProcessing}
-                                onClick={async () => {
+                              <button className="btn-primary" style={{ padding: "5px 15px", fontSize: "0.9rem" }} disabled={isProcessing} onClick={async () => {
                                   try {
                                     setIsProcessing(true);
-                                    
-                                    // 1. On recrée l'adresse du contrat localement
                                     const contractAddress = await invoke("create_btc_htlc", {
-                                      buyerPubkeyHex: s.buyer_btc_pubkey,
-                                      sellerPubkeyHex: s.seller_btc_pubkey,
-                                      secretHex: s.htlc_secret, // 💡 CORRIGÉ : On passe le secret
-                                      locktime: 144 
+                                      buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey, secretHex: s.htlc_secret, locktime: 144 
                                     });
-
-                                    // 2. ON APPELLE LE CLAIM AVEC *TOUS* LES PARAMÈTRES !
                                     const res = await invoke("claim_btc_swap", {
-                                      masterSeedHex: walletData.master_seed_hex,
-                                      htlcAddress: contractAddress,
-                                      secretHex: s.htlc_secret,
-                                      buyerPubkeyHex: s.buyer_btc_pubkey,
-                                      sellerPubkeyHex: s.seller_btc_pubkey // 💡 AJOUTÉ
+                                      masterSeedHex: walletData.master_seed_hex, htlcAddress: contractAddress, secretHex: s.htlc_secret,
+                                      buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey 
                                     });
-                                    
                                     alert(res);
                                   } catch (e) { alert("Erreur Claim BTC : " + e); }
                                   finally { setIsProcessing(false); }
-                                }}
-                              >
-                                {isProcessing ? "⏳ Signature L1 en cours..." : "💰 2. Réclamer les BTC (Secret)"}
+                                }}>
+                                {isProcessing ? "⏳ Signature L1 en cours..." : "💰 2. Réclamer les BTC"}
                               </button>
                             </div>
                           )}
@@ -607,7 +589,6 @@ function App() {
                 </table>
               )}
 
-              {/* Console de commandement d'Alice (N'apparaît que si Alice a initialisé le contrat) */}
               {activeContractAddress && (
                 <div style={{ marginTop: "30px", padding: "20px", background: "rgba(247, 147, 26, 0.1)", border: "1px solid #F7931A", borderRadius: "8px" }}>
                   <h3 style={{ color: "#F7931A", textAlign: "center", margin: "0 0 15px 0" }}>🔐 Coffre HTLC Bitcoin L1 (Pour Alice)</h3>
@@ -618,45 +599,26 @@ function App() {
                   <div style={{ textAlign: "center", marginTop: "20px", display: "flex", gap: "10px", justifyContent: "center" }}>
 					<button className="btn-primary" disabled={swapProgress > 0 || isProcessing} onClick={async () => {
                       try {
-                        setIsProcessing(true); // 💡 On verrouille
-                        setSwapProgress(1);
-                        await invoke("send_btc_to_htlc", {
-                          masterSeedHex: walletData.master_seed_hex,
-                          htlcAddress: activeContractAddress,
-                          amountBtc: pendingSwaps[0].btc_amount_sats / 100000000
-                        });
+                        setIsProcessing(true); setSwapProgress(1);
+                        await invoke("send_btc_to_htlc", { masterSeedHex: walletData.master_seed_hex, htlcAddress: activeContractAddress, amountBtc: pendingSwaps[0].btc_amount_sats / 100000000 });
                         setSwapProgress(2);
                         alert("✅ BTC envoyés sur le Testnet ! Attendez que le vendeur verrouille ses WATT.");
                       } catch (error) { alert("Erreur L1 : " + error); setSwapProgress(0); }
-                      finally { setIsProcessing(false); } // 💡 On libère
+                      finally { setIsProcessing(false); } 
                     }}>
                       {isProcessing && swapProgress === 1 ? "⏳ Sync BDK en cours..." : "2️⃣ Envoyer les BTC"}
                     </button>
                     <button className="btn-secondary" disabled={swapProgress < 2 || swapProgress === 4} onClick={async () => {
                       try {
                         setSwapProgress(3);
-                        await invoke("claim_wattcoin_swap", { 
-                          secret: pendingSwaps[0].htlc_secret, 
-                          hash: pendingSwaps[0].htlc_hash,
-                          wattAddress: walletData.watt_address,
-                          amount: pendingSwaps[0].watt_amount_flames / 1000000000
-                        });
+                        await invoke("claim_wattcoin_swap", { secret: pendingSwaps[0].htlc_secret, hash: pendingSwaps[0].htlc_hash, wattAddress: walletData.watt_address, amount: pendingSwaps[0].watt_amount_flames / 1000000000 });
                         setSwapProgress(4);
-                      } catch (e) { 
-                        alert("Erreur Claim : Le Nœud a rejeté. Le vendeur a-t-il bien verrouillé les WATT ?"); 
-                        setSwapProgress(2); 
-                      }
+                      } catch (e) { alert("Erreur Claim."); setSwapProgress(2); }
                     }}>
                       3️⃣ Réclamer les WATT
                     </button>
                   </div>
-
-                  {swapProgress === 4 && (
-                    <div className="success-banner" style={{ marginTop: "20px" }}>
-                      🎉 ATOMIC SWAP RÉUSSI !<br/>
-                      <span style={{fontSize: "0.9rem", color: "white"}}>Vos WATT sont débloqués sur votre portefeuille.</span>
-                    </div>
-                  )}
+                  {swapProgress === 4 && (<div className="success-banner" style={{ marginTop: "20px" }}>🎉 ATOMIC SWAP RÉUSSI !<br/><span style={{fontSize: "0.9rem", color: "white"}}>Vos WATT sont débloqués.</span></div>)}
                 </div>
               )}
             </div>
@@ -678,7 +640,6 @@ function App() {
 
           <div className="glass-panel" style={{ padding: "30px", maxWidth: "800px" }}>
             <div style={{ marginTop: "10px" }}>
-              
               {txHistory.length === 0 ? (
                 <div style={{ textAlign: "center", color: "#888", padding: "40px 0" }}>
                   Aucune transaction détectée sur la blockchain.
@@ -687,23 +648,16 @@ function App() {
                 txHistory.map((tx, idx) => (
                   <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "#111", padding: "15px", borderRadius: "8px", marginBottom: "10px", borderLeft: "4px solid #00FF00" }}>
                     <div>
-                      <div style={{ color: "#FFF", fontWeight: "bold", fontSize: "1.1rem" }}>
-                        ⬇️ Reçu
-                      </div>
+                      <div style={{ color: "#FFF", fontWeight: "bold", fontSize: "1.1rem" }}>⬇️ Reçu</div>
                       <div style={{ color: "#888", fontSize: "0.9rem" }}>{tx.date} • {tx.id}</div>
                     </div>
                     <div style={{ textAlign: "right" }}>
-                      <div style={{ color: "#00FF00", fontWeight: "bold", fontSize: "1.2rem" }}>
-                        +{tx.amount.toFixed(4)} {tx.coin}
-                      </div>
-                      <div style={{ color: tx.status.includes("Dépensé") ? "#FF3333" : "#888", fontSize: "0.8rem", fontWeight: "bold" }}>
-                        {tx.status}
-                      </div>
+                      <div style={{ color: "#00FF00", fontWeight: "bold", fontSize: "1.2rem" }}>+{tx.amount.toFixed(4)} {tx.coin}</div>
+                      <div style={{ color: tx.status.includes("Dépensé") ? "#FF3333" : "#888", fontSize: "0.8rem", fontWeight: "bold" }}>{tx.status}</div>
                     </div>
                   </div>
                 ))
               )}
-
             </div>
           </div>
         </main>
@@ -712,16 +666,9 @@ function App() {
   }
 
   if (view === "settings") {
-    
-    // 💡 NOUVEAU : Appel du backend Rust pour créer le fichier
     const handleDownloadMinerScript = async (os) => {
-      try {
-        const address = walletData.watt_address;
-        const message = await invoke("save_miner_script", { os: os, address: address });
-        alert("✅ " + message);
-      } catch (error) {
-        alert("❌ Erreur : " + error);
-      }
+      try { const message = await invoke("save_miner_script", { os: os, address: walletData.watt_address }); alert("✅ " + message); } 
+      catch (error) { alert("❌ Erreur : " + error); }
     };
 
     return (
@@ -749,48 +696,25 @@ function App() {
               )}
             </div>
 
-            {/* 💡 NOUVEAU : SECTION SCRIPTS DE MINAGE */}
             <div className="security-section" style={{ marginTop: "40px" }}>
               <h3 style={{ color: "#10b981" }}>⛏️ Scripts de Minage</h3>
-              <p style={{ color: "#AAA" }}>Téléchargez un script pré-configuré avec votre adresse de réception (3000 caractères) pour lancer votre propre nœud de minage sans faire d'erreur.</p>
-              
+              <p style={{ color: "#AAA" }}>Téléchargez un script pré-configuré avec votre adresse de réception.</p>
               <div style={{ display: "flex", gap: "15px", marginTop: "15px" }}>
-                <button 
-                  className="btn-secondary" 
-                  style={{ flex: 1, padding: "12px", border: "1px solid #10b981", color: "#10b981", background: "rgba(16, 185, 129, 0.1)" }}
-                  onClick={() => handleDownloadMinerScript("linux")}
-                >
-                  🐧 Générer start_miner.sh (Linux/Mac)
-                </button>
-                <button 
-                  className="btn-secondary" 
-                  style={{ flex: 1, padding: "12px", border: "1px solid #3b82f6", color: "#3b82f6", background: "rgba(59, 130, 246, 0.1)" }}
-                  onClick={() => handleDownloadMinerScript("windows")}
-                >
-                  🪟 Générer start_miner.bat (Windows)
-                </button>
+                <button className="btn-secondary" style={{ flex: 1, padding: "12px", border: "1px solid #10b981", color: "#10b981", background: "rgba(16, 185, 129, 0.1)" }} onClick={() => handleDownloadMinerScript("linux")}>🐧 Générer start_miner.sh (Linux)</button>
+                <button className="btn-secondary" style={{ flex: 1, padding: "12px", border: "1px solid #3b82f6", color: "#3b82f6", background: "rgba(59, 130, 246, 0.1)" }} onClick={() => handleDownloadMinerScript("windows")}>🪟 Générer start_miner.bat (Windows)</button>
               </div>
             </div>
 
             <div className="security-section" style={{ marginTop: "50px", borderTop: "1px solid #444", paddingTop: "30px" }}>
               <h3 style={{ color: "#FF3333" }}>🚨 Zone de Danger</h3>
-              <p style={{ color: "#AAA" }}>Détruire le coffre supprimera le fichier chiffré de cet ordinateur.</p>
-              
               <button 
                 style={{ background: "#FF3333", color: "#FFF", padding: "10px 20px", border: "none", borderRadius: "5px", cursor: "pointer", fontWeight: "bold", marginTop: "10px" }}
                 onClick={async () => {
                   if(window.confirm("⚠️ Êtes-vous ABSOLUMENT certain de vouloir détruire ce coffre ?")) {
-                    try {
-                      await invoke("destroy_vault");
-                      setWalletData(null); 
-                      setView('onboarding'); 
-                      alert("Coffre détruit avec succès.");
-                    } catch (e) {
-                      alert("Erreur lors de la destruction : " + e);
-                    }
+                    try { await invoke("destroy_vault"); setWalletData(null); setView('onboarding'); alert("Coffre détruit."); } 
+                    catch (e) { alert("Erreur : " + e); }
                   }
-                }}
-              >
+                }}>
                 🔥 Détruire le Coffre-Fort
               </button>
             </div>

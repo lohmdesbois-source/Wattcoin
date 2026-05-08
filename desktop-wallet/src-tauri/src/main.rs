@@ -1,13 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
-use bitcoin::bip32::{DerivationPath, Xpriv};
-use bitcoin::network::Network;
-use bitcoin::{Address, PrivateKey};
-use bitcoin::blockdata::script::Builder;
-use bitcoin::opcodes::all::*;
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::Secp256k1; 
 use rand::RngCore; 
 use serde::{Serialize, Deserialize};
 use std::str::FromStr;
@@ -20,18 +13,220 @@ use tauri::Emitter;
 use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as _, SecretKey as _};
 use pqcrypto_traits::sign::{SignedMessage, PublicKey as _, SecretKey as _};
 
-//const NODE_URL: &str = "http://127.0.0.1:8100";
-const NODE_URL: &str = "http://80.78.26.243:8100";
-const VAULT_FILE: &str = ".wattcoin_vault";
+use once_cell::sync::Lazy;
+use arti_client::{TorClient, TorClientConfig, StreamPrefs};
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::sync::Mutex as AsyncMutex;
+use tor_rtcompat::PreferredRuntime;
 
+// 💡 L'ADRESSE IMMUABLE DE TON NŒUD RELAIS (DARKNET UNIQUEMENT)
+const ONION_NODE: &str = "jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64yd.onion:8100";
+const VAULT_FILE: &str = ".wattcoin_vault";
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
+
+// 💡 LE MOTEUR TOR GLOBAL
+static TOR_CLIENT: Lazy<AsyncMutex<Option<TorClient<PreferredRuntime>>>> = Lazy::new(|| AsyncMutex::new(None));
+
+// 💡 LE CADENAS ANTI-DDOS (NOUVEAU)
+static TOR_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
+
+// 💡 NOTRE PROPRE SERVEUR SOCKS5 INTÉGRÉ ET INSTRUMENTÉ !
+async fn start_arti_socks_proxy(tor_client: arti_client::TorClient<PreferredRuntime>) {
+    if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:9150").await {
+        println!("🥷 [PROXY] Micro-serveur SOCKS5 ouvert sur le port 9150 !");
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let tc = tor_client.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 256];
+                        
+                        // 1. Handshake SOCKS5
+                        if stream.read_exact(&mut buf[0..2]).await.is_err() { return; }
+                        if buf[0] != 0x05 { println!("❌ [PROXY] Erreur: Ce n'est pas du SOCKS5"); return; }
+                        let num_methods = buf[1] as usize;
+                        if stream.read_exact(&mut buf[0..num_methods]).await.is_err() { return; }
+                        if stream.write_all(&[0x05, 0x00]).await.is_err() { return; } 
+                        
+                        // 2. Lecture de la cible
+                        if stream.read_exact(&mut buf[0..4]).await.is_err() { return; }
+                        if buf[0] != 0x05 || buf[1] != 0x01 { println!("❌ [PROXY] Erreur: Commande non supportée"); return; } 
+                        
+                        let host = match buf[3] {
+                            0x01 => { // IPv4
+                                if stream.read_exact(&mut buf[0..4]).await.is_err() { return; }
+                                format!("{}.{}.{}.{}", buf[0], buf[1], buf[2], buf[3])
+                            }
+                            0x03 => { // Nom de domaine
+                                let mut len_buf = [0u8; 1];
+                                if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                                let mut domain_buf = vec![0u8; len_buf[0] as usize];
+                                if stream.read_exact(&mut domain_buf).await.is_err() { return; }
+                                String::from_utf8_lossy(&domain_buf).into_owned()
+                            }
+                            _ => { println!("❌ [PROXY] Erreur: Type d'adresse IPv6 non supporté"); return; }
+                        };
+
+                        let mut port_buf = [0u8; 2];
+                        if stream.read_exact(&mut port_buf).await.is_err() { return; }
+                        let port = u16::from_be_bytes(port_buf);
+
+                        println!("🥷 [PROXY] BDK demande une connexion vers {}:{}...", host, port);
+
+                        let mut prefs = arti_client::StreamPrefs::new();
+                        prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
+                        
+                        match tc.connect_with_prefs((host.clone(), port), &prefs).await {
+                            Ok(mut tor_stream) => {
+                                println!("✅ [PROXY] Tunnel Tor établi avec succès pour {} !", host);
+                                if stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]).await.is_err() { return; }
+                                let _ = tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await;
+                            }
+                            Err(e) => {
+                                println!("❌ [PROXY] Arti n'a pas pu joindre {} : {}", host, e);
+                                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0,0,0,0, 0,0]).await;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    } else {
+        println!("⚠️ [TOR] Impossible d'ouvrir le port 9150");
+    }
+}
+
+async fn get_tor_client() -> Result<TorClient<PreferredRuntime>, String> {
+    let mut lock = TOR_CLIENT.lock().await;
+    if let Some(client) = &*lock { return Ok(client.clone()); }
+    
+    println!("🧅 [TOR] Initialisation du blindage Arti...");
+    let config = TorClientConfig::default();
+    let client = TorClient::create_bootstrapped(config).await.map_err(|e| format!("Erreur Bootstrap: {}", e))?;
+    
+    // 💡 On lance notre propre proxy SOCKS5 invisible en arrière-plan !
+    start_arti_socks_proxy(client.clone()).await;
+    
+    *lock = Some(client.clone());
+    Ok(client)
+}
+
+// 💡 LE TIREUR D'ÉLITE (Remplace Reqwest pour les routes WATT)
+async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result<String, String> {
+    // 1. Cadenas anti-DDoS
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(60), TOR_LOCK.lock())
+        .await.map_err(|_| "❌ [TOR] Timeout file d'attente".to_string())?;
+
+    let tor_client = get_tor_client().await?;
+    let mut prefs = StreamPrefs::new();
+    prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
+
+    println!("\n==============================================");
+    println!("🕵️ [TOR] Début de la mission vers {}", endpoint);
+    
+    let mut stream = None;
+    for i in 1..=3 {
+        println!("⏳ [TOR] Percée du tunnel (Tentative {}/3)...", i);
+        match tokio::time::timeout(std::time::Duration::from_secs(20), tor_client.connect_with_prefs(ONION_NODE, &prefs)).await {
+            Ok(Ok(s)) => { 
+                println!("✅ [TOR] Tunnel établi !");
+                stream = Some(s); 
+                break; 
+            },
+            Ok(Err(e)) => println!("⚠️ [TOR] Arti a échoué : {}", e),
+            Err(_) => println!("⚠️ [TOR] Timeout 20s !"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    let mut stream = stream.ok_or_else(|| "❌ [TOR] Abandon de la mission.".to_string())?;
+
+    println!("📤 [TOR] Envoi de la requête HTTP...");
+    
+    // 💡 FIX 1 : HTTP/1.1 Standard
+    let req = if let Some(ref b) = body {
+        format!("{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: WattcoinWallet/1.0\r\nAccept: application/json\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", method, endpoint, ONION_NODE, b.len(), b)
+    } else {
+        format!("{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: WattcoinWallet/1.0\r\nAccept: application/json\r\nConnection: close\r\n\r\n", method, endpoint, ONION_NODE)
+    };
+
+    stream.write_all(req.as_bytes()).await.map_err(|e| format!("Erreur écriture: {}", e))?;
+    
+    // 💡 FIX 2 : LE FLUSH ! On force le départ du paquet HTTP vers le Darknet
+    stream.flush().await.map_err(|e| format!("Erreur flush: {}", e))?;
+
+    println!("📥 [TOR] Attente de la réponse...");
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192]; // Buffer de 8 Ko
+
+    // 💡 FIX 3 : Lecture incrémentale sécurisée (Au lieu du read_to_end destructeur)
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                println!("✅ [TOR] Le Serveur Relais a terminé l'envoi.");
+                break;
+            }
+            Ok(Ok(n)) => {
+                response.extend_from_slice(&buf[..n]);
+            }
+            Ok(Err(e)) => return Err(format!("Erreur lecture: {}", e)),
+            Err(_) => {
+                println!("⚠️ [TOR] Timeout 5s ! Le serveur refuse de couper la ligne, on garde les {} octets reçus.", response.len());
+                break;
+            }
+        }
+    }
+
+    let resp_str = String::from_utf8_lossy(&response);
+    
+    if let Some(idx) = resp_str.find("\r\n\r\n") {
+        let headers = &resp_str[..idx];
+        let mut body_content = resp_str[idx+4..].to_string(); 
+        
+        if headers.to_lowercase().contains("transfer-encoding: chunked") {
+            println!("🧩 [TOR] Découpage Chunked détecté. Reconstruction en cours...");
+            let mut decoded = String::new();
+            let mut curr = body_content.as_str();
+            while let Some(i) = curr.find("\r\n") {
+                let hex_str = curr[..i].trim();
+                if let Ok(len) = usize::from_str_radix(hex_str, 16) {
+                    if len == 0 { break; } 
+                    curr = &curr[i+2..];
+                    if curr.len() >= len {
+                        decoded.push_str(&curr[..len]);
+                        curr = &curr[len..];
+                        if curr.starts_with("\r\n") { curr = &curr[2..]; }
+                    } else { 
+                        decoded.push_str(curr); 
+                        break; 
+                    }
+                } else { break; }
+            }
+            body_content = decoded;
+        }
+
+        let final_body = body_content.trim().to_string();
+
+        if headers.contains("200 OK") {
+            println!("🎯 [TOR] Extraction réussie ({} octets)", final_body.len());
+            Ok(final_body)
+        } else {
+            Err(format!("Erreur HTTP: {}", headers))
+        }
+    } else {
+        println!("❌ [TOR] Réponse inexploitable ({} octets)", response.len());
+        Err("Réponse corrompue".to_string())
+    }
+}
+
+// ================= STRUCTS =================
 
 #[derive(Serialize, Deserialize, Clone)]
 struct WalletKeys {
     mnemonic: String,
     btc_address: String,
-    btc_pubkey_hex: String, // 💡 NOUVEAU
+    btc_pubkey_hex: String,
     watt_address: String, 
     master_seed_hex: String,
     kyber_secret_hex: String,
@@ -82,7 +277,7 @@ pub struct HistoryItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    pub tx_type: TransactionType, // 💡 Le nouveau moteur
+    pub tx_type: TransactionType,
     pub inputs: Vec<TransactionInput>, 
     pub outputs: Vec<TransactionOutput>, 
     pub fee: u64, 
@@ -108,15 +303,25 @@ impl LatticeCommitment {
     pub fn commit(amount: u64, blinding_factor: u64) -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let q: u64 = 8380417; 
         let c1 = vec![
-            (blinding_factor * rng.gen_range(1..100)) % q,
-            (blinding_factor * rng.gen_range(1..100)) % q,
-            (blinding_factor * rng.gen_range(1..100)) % q,
+            (blinding_factor * rng.gen_range(1..100)) % LATTICE_Q as u64,
+            (blinding_factor * rng.gen_range(1..100)) % LATTICE_Q as u64,
+            (blinding_factor * rng.gen_range(1..100)) % LATTICE_Q as u64,
         ];
-        let c2 = (blinding_factor * 12345 + amount) % q;
+        let c2 = (blinding_factor * 12345 + amount) % LATTICE_Q as u64;
         LatticeCommitment { c1, c2 }
     }
+}
+
+// ================= TAURI COMMANDS =================
+
+#[tauri::command]
+async fn get_network_info() -> Result<serde_json::Value, String> {
+    let res_str = tor_fetch("GET", "/info", None).await?;
+    serde_json::from_str(&res_str).map_err(|e| {
+        println!("❌ [JSON ERROR INFO] {} | Data: {}", e, res_str);
+        e.to_string()
+    })
 }
 
 #[tauri::command]
@@ -131,34 +336,25 @@ async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: 
         "amount_flames": amount_flames, 
         "price_sats": price_sats,        
         "btc_address": btc_address,
-        "btc_pubkey": btc_pubkey, // 💡 NOUVEAU
+        "btc_pubkey": btc_pubkey,
         "watt_address": watt_address
     });
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/order", NODE_URL);
-    client.post(&url) 
-        .json(&order_data)
-        .send().await.map_err(|_| "⚠️ Impossible de joindre le Nœud Relais !".to_string())?;
+    tor_fetch("POST", "/order", Some(order_data.to_string())).await?;
     Ok(())
 }
 
 #[tauri::command]
 async fn get_dark_pool() -> Result<Vec<Order>, String> {
-    let url = format!("{}/pool", NODE_URL); 
-    let res = reqwest::get(&url)
-        .await.map_err(|_| "⚠️ Nœud Relais hors ligne.".to_string())?;
-    let pool = res.json::<Vec<Order>>().await.map_err(|e| e.to_string())?;
+    let res_str = tor_fetch("GET", "/pool", None).await?;
+    let pool = serde_json::from_str::<Vec<Order>>(&res_str).map_err(|e| e.to_string())?;
     Ok(pool)
 }
 
 #[tauri::command]
 async fn resolve_batch() -> Result<BatchResult, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/resolve", NODE_URL); 
-    let res = client.post(&url)
-        .send().await.map_err(|_| "⚠️ Nœud Relais hors ligne.".to_string())?;
-    let result = res.json::<BatchResult>().await.map_err(|e| e.to_string())?;
+    let res_str = tor_fetch("POST", "/resolve", None).await?;
+    let result = serde_json::from_str::<BatchResult>(&res_str).map_err(|e| e.to_string())?;
     Ok(result)
 }
 
@@ -168,6 +364,7 @@ async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys
     use bitcoin::Network as BtcNetwork;
     use bitcoin::bip32::{Xpriv, DerivationPath}; 
     use bitcoin::{PrivateKey as BtcPrivateKey, PublicKey as BtcPublicKey, Address as BtcAddress};
+	use bitcoin::secp256k1::Secp256k1;
     
     use pqcrypto_kyber::kyber768;
     use pqcrypto_dilithium::dilithium3;
@@ -197,7 +394,7 @@ async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys
     Ok(WalletKeys {
         mnemonic: mnemonic.to_string(),
         btc_address,
-        btc_pubkey_hex: btc_pub.to_string(), // 💡 NOUVEAU
+        btc_pubkey_hex: btc_pub.to_string(),
         master_seed_hex: hex::encode(seed),
         watt_address: hex::encode(kyber_pk.as_bytes()),
         kyber_secret_hex: hex::encode(kyber_sk.as_bytes()),
@@ -258,15 +455,13 @@ async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
 
 #[tauri::command]
 async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/all_transactions", NODE_URL); 
-    
-    let all_txs: Vec<Transaction> = client.get(&url)
-        .send().await.map_err(|_| "Nœud injoignable".to_string())?
-        .json().await.map_err(|_| "Erreur JSON".to_string())?;
+    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+	let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|e| {
+		println!("❌ [JSON ERROR BALANCE] {}", e);
+		"Erreur JSON".to_string()
+	})?;
 
     let mut balance_flames: u64 = 0;
-
     use pqcrypto_kyber::kyber768;
 
     let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
@@ -278,18 +473,10 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     }
 
     for tx in all_txs {
-        // 💡 NOUVEAU : On détecte si la transaction est un verrouillage HTLC
         let is_lock_tx = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
 
-        // On itère avec l'index pour savoir quel Output on regarde
         for (index, out) in tx.outputs.iter().enumerate() {
-            
             if spent_capsules.contains(&out.kyber_capsule) { continue; }
-
-            // 💡 LE CORRECTIF EST LÀ : 
-            // Si c'est un contrat de Lock, le premier output (index 0 = l'argent verrouillé)
-            // n'est plus dans le solde libre de Bob ! Il appartient au contrat.
-            // Par contre, le rendu de monnaie (index 1) appartient toujours à Bob.
             if is_lock_tx && index == 0 { continue; }
 
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
@@ -299,9 +486,7 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
             } else if out.stealth_address.starts_with("pq_watt_") {
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
-                        
                         let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
-                        
                         if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
                             if vault_bytes.len() > 12 {
                                 let nonce = Nonce::from_slice(&vault_bytes[0..12]);
@@ -325,16 +510,13 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
             }
         }
     }
-
     Ok(balance_flames as f64 / 1_000_000_000.0)
 }
 
 #[tauri::command]
 async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/all_transactions", NODE_URL); 
-    
-    let all_txs: Vec<Transaction> = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?.json().await.map_err(|_| "Erreur JSON".to_string())?;
+    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
 
     let mut history = Vec::new();
     use pqcrypto_kyber::kyber768;
@@ -343,7 +525,6 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
     let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
 
-    // On charge la liste des pièces que l'on a déjà dépensées
     let mut spent_capsules = std::collections::HashSet::new();
     if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
@@ -353,12 +534,11 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
         let is_lock = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
 
         for (out_idx, out) in tx.outputs.iter().enumerate() {
-            if is_lock && out_idx == 0 { continue; } // On ignore les contrats bloqués
+            if is_lock && out_idx == 0 { continue; } 
 
             let is_spent = spent_capsules.contains(&out.kyber_capsule);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
-            // 1. Détection des récompenses de Minage (Coinbase)
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     history.push(HistoryItem {
@@ -371,7 +551,6 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                     });
                 }
             } 
-            // 2. Détection des Transferts et Swaps (Déchiffrement Kyber)
             else if out.stealth_address.starts_with("pq_watt_") {
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
@@ -406,42 +585,11 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             }
         }
     }
-    
-    // On inverse pour afficher les transactions les plus récentes en haut
     history.reverse();
     Ok(history)
 }
 
-#[tauri::command]
-async fn get_btc_balance(master_seed_hex: String) -> Result<f64, String> {
-    tokio::task::spawn_blocking(move || {
-        use bdk::bitcoin::Network as BdkNetwork;
-        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
-        use bdk::blockchain::{EsploraBlockchain};
-        use bdk::{Wallet, SyncOptions};
-        use bdk::database::MemoryDatabase;
 
-        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
-        
-        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
-        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
-
-        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
-            .map_err(|e| e.to_string())?;
-
-        let blockchain = EsploraBlockchain::new("https://mempool.space/testnet/api", 20);
-        
-        wallet.sync(&blockchain, SyncOptions::default()).map_err(|e| e.to_string())?;
-
-        let balance = wallet.get_balance().map_err(|e| e.to_string())?;
-        let total_sats = balance.confirmed + balance.untrusted_pending + balance.trusted_pending;
-        
-        Ok(total_sats as f64 / 100_000_000.0)
-    })
-    .await
-    .unwrap_or_else(|_| Err("Erreur critique du thread".to_string()))
-}
 
 #[tauri::command]
 async fn send_wattcoin(
@@ -451,7 +599,6 @@ async fn send_wattcoin(
     sender_dilithium_public_hex: String,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
-    // 💡 NOUVEAU : Paramètres optionnels pour l'Atomic Swap
     htlc_hash_hex: Option<String>, 
     htlc_timeout: Option<u64>
 ) -> Result<String, String> {
@@ -464,13 +611,8 @@ async fn send_wattcoin(
     let fee: u64 = 1000;
     let required_total = amount_in_flames + fee;
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/all_transactions", NODE_URL); 
-    
-    // ==========================================================
-    // 🧠 1. COIN SELECTION (Chasse aux UTXO)
-    // ==========================================================
-    let all_txs: Vec<Transaction> = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?.json().await.map_err(|_| "Erreur JSON".to_string())?;
+    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
     
     let mut spent_capsules = HashSet::new();
     if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
@@ -496,10 +638,7 @@ async fn send_wattcoin(
             } else if out.stealth_address.starts_with("pq_watt_") {
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
-                        
-                        // 💡 CORRIGÉ : decapsulate direct !
                         let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
-                        
                         if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
                             if vault_bytes.len() > 12 {
                                 let nonce = Nonce::from_slice(&vault_bytes[0..12]);
@@ -537,12 +676,7 @@ async fn send_wattcoin(
 
     let change_amount = current_input_sum - required_total;
 
-    // ==========================================================
-    // 🎁 2. CRÉATION DES OUTPUTS (Destinataire + Rendu de Monnaie)
-    // ==========================================================
     let mut outputs = Vec::new();
-
-    // -- OUTPUT 1 : LE DESTINATAIRE --
     let recipient_bytes = hex::decode(&recipient_kyber_hex).map_err(|_| "Adresse invalide".to_string())?;
     let bob_pk = kyber768::PublicKey::from_bytes(&recipient_bytes).map_err(|_| "Clé Kyber corrompue".to_string())?;
     let (alice_shared_secret, kyber_capsule_1) = kyber768::encapsulate(&bob_pk);
@@ -564,7 +698,6 @@ async fn send_wattcoin(
         lattice_commitment: commitment_1.clone(),
     });
 
-    // -- OUTPUT 2 : LE RENDU DE MONNAIE (ZKP LATTICE MAGIC) --
     if change_amount > 0 {
         let my_pk_bytes = hex::decode(&sender_kyber_public_hex).unwrap();
         let my_pk = kyber768::PublicKey::from_bytes(&my_pk_bytes).unwrap();
@@ -577,10 +710,8 @@ async fn send_wattcoin(
         let encrypted_data_2 = Aes256Gcm::new(aes_key_2).encrypt(Nonce::from_slice(&nonce_bytes_2), payload_2.as_bytes()).unwrap();
         let mut final_vault_2 = nonce_bytes_2.to_vec(); final_vault_2.extend_from_slice(&encrypted_data_2);
 
-        // ⚖️ L'ILLUSION HOMOMORPHE PARFAITE : On forge c2 pour que la balance du Nœud soit parfaite !
         let sum_inputs_c2 = selected_utxos.iter().map(|u| u.2.c2).sum::<u64>() % (LATTICE_Q as u64);
         let fee_c2 = fee % (LATTICE_Q as u64);
-        // sum_in = out_1 + out_2 + fee  =>  out_2 = sum_in - out_1 - fee
         let expected_outputs_sum = (sum_inputs_c2 + (LATTICE_Q as u64) - fee_c2) % (LATTICE_Q as u64);
         let perfect_change_c2 = (expected_outputs_sum + (LATTICE_Q as u64) - commitment_1.c2) % (LATTICE_Q as u64);
 
@@ -596,15 +727,11 @@ async fn send_wattcoin(
             lattice_commitment: commitment_2,
         });
     } else {
-        // S'il n'y a pas de rendu, on doit ajuster la seule sortie pour que le ZKP passe
         let sum_inputs_c2 = selected_utxos.iter().map(|u| u.2.c2).sum::<u64>() % (LATTICE_Q as u64);
         let fee_c2 = fee % (LATTICE_Q as u64);
         outputs[0].lattice_commitment.c2 = (sum_inputs_c2 + (LATTICE_Q as u64) - fee_c2) % (LATTICE_Q as u64);
     }
 
-    // ==========================================================
-    // 🌀 3. CRÉATION DES INPUTS (Signatures en Anneaux Multiples)
-    // ==========================================================
     let tx_data_to_sign = format!("{:?}{}", outputs, fee);
     let mut final_inputs = Vec::new();
 
@@ -612,13 +739,12 @@ async fn send_wattcoin(
     let dilithium_secret = dilithium3::SecretKey::from_bytes(&sk_bytes).unwrap();
     let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
 
-    // On forge un anneau pour CHAQUE pièce dépensée
+    // 💡 Fetch des Decoys via TOR
+    let decoy_res = tor_fetch("GET", "/get_decoys/10", None).await.unwrap_or_default();
+    let real_decoys: Vec<String> = serde_json::from_str(&decoy_res).unwrap_or_default();
+
     for utxo in &selected_utxos {
-        let decoy_url = format!("{}/get_decoys/10", NODE_URL);
-        let mut pq_ring: Vec<String> = Vec::new();
-        if let Ok(res) = client.get(&decoy_url).send().await {
-            if let Ok(real_decoys) = res.json::<Vec<String>>().await { pq_ring.extend(real_decoys); }
-        }
+        let mut pq_ring: Vec<String> = real_decoys.clone();
         while pq_ring.len() < 10 {
             let (fake_pk, _) = dilithium3::keypair();
             pq_ring.push(hex::encode(fake_pk.as_bytes()));
@@ -696,7 +822,6 @@ async fn send_wattcoin(
             }
         }
 
-        // 💡 FIX : L'Image Clé (Anti-Double Dépense) est générée spécifiquement pour CET UTXO
         let unique_seed = format!("{}{}", hex::encode(&sk_bytes), utxo.1);
         let key_image = hex::encode(blake3::hash(unique_seed.as_bytes()).as_bytes());
 
@@ -714,7 +839,6 @@ async fn send_wattcoin(
         });
     }
 
-    // 💡 NOUVEAU : On détermine le type de transaction en fonction des paramètres reçus
     let tx_type = match (htlc_hash_hex, htlc_timeout) {
         (Some(hash), Some(timeout)) => {
             println!("🔒 CRÉATION D'UN CONTRAT HTLC LOCK ! Hash: {}", hash);
@@ -724,139 +848,44 @@ async fn send_wattcoin(
     };
 
     let tx_pq = Transaction {
-        tx_type, // 💡 Le type est maintenant dynamique !
+        tx_type, 
         inputs: final_inputs,
-        outputs, // Si c'est un Lock, l'output 0 est le coffre bloqué.
+        outputs, 
         fee,
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
 
-    let url = format!("{}/send_tx", NODE_URL); 
-    let res = client.post(&url) 
-        .json(&tx_pq).send().await.map_err(|_| "Nœud injoignable !".to_string())?;
+    // 💡 Soumission via TOR
+    let tx_json = serde_json::to_string(&tx_pq).unwrap();
+    let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
-    if res.status().is_success() {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
-            for utxo in &selected_utxos {
-                writeln!(file, "{}", utxo.1).unwrap();
-            }
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
+        for utxo in &selected_utxos {
+            writeln!(file, "{}", utxo.1).unwrap();
         }
-        
-        // 💡 Petit message de succès adapté
-        if tx_pq.tx_type == TransactionType::Standard {
-             Ok(format!("☢️ TX ZKP ENVOYÉE !\n\nInputs : {}\nOutputs : {}\nPoids : {} octets", selected_utxos.len(), tx_pq.outputs.len(), serde_json::to_string(&tx_pq).unwrap().len()))
-        } else {
-             Ok(format!("🔒 CONTRAT HTLC DÉPLOYÉ ! Les fonds sont verrouillés sur le réseau Wattcoin."))
-        }
-       
+    }
+    
+    if tx_pq.tx_type == TransactionType::Standard {
+        Ok(format!("☢️ TX ZKP ENVOYÉE !\n\nInputs : {}\nOutputs : {}\nPoids : {} octets", selected_utxos.len(), tx_pq.outputs.len(), serde_json::to_string(&tx_pq).unwrap().len()))
     } else {
-        Err("❌ Transaction rejetée par le Tribunal ZKP.".to_string())
+        Ok("🔒 CONTRAT HTLC DÉPLOYÉ ! Les fonds sont verrouillés sur le réseau Wattcoin.".to_string())
     }
 }
 
 #[tauri::command]
-async fn create_btc_htlc(
-    buyer_pubkey_hex: String, 
-    seller_pubkey_hex: String, 
-    secret_hex: String, 
-    locktime: u32
-) -> Result<String, String> {
-    use bitcoin::hashes::{sha256, Hash};
-    use bitcoin::blockdata::script::Builder;
-    use bitcoin::opcodes::all::*;
-    use bitcoin::{Address, Network};
-    use std::str::FromStr;
-
-    let buyer_pubkey = bitcoin::PublicKey::from_str(&buyer_pubkey_hex).map_err(|_| "Clé Alice invalide".to_string())?;
-    let seller_pubkey = bitcoin::PublicKey::from_str(&seller_pubkey_hex).map_err(|_| "Clé Bob invalide".to_string())?;
-
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
-    let btc_hash = sha256::Hash::hash(&secret_bytes);
-
-    let htlc_script = Builder::new()
-        .push_opcode(OP_IF)
-            .push_opcode(OP_SHA256)
-            .push_slice(&btc_hash.to_byte_array()) // 💡 CORRIGÉ : to_byte_array()
-            .push_opcode(OP_EQUALVERIFY)
-            .push_key(&seller_pubkey) 
-        .push_opcode(OP_ELSE)
-            .push_int(locktime as i64)
-            .push_opcode(OP_CSV)
-            .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey)  
-        .push_opcode(OP_ENDIF)
-        .push_opcode(OP_CHECKSIG)
-        .into_script();
-
-    // 💡 CORRIGÉ : Pas de .unwrap() ici !
-    let address = Address::p2wsh(&htlc_script, Network::Testnet);
-    Ok(address.to_string())
-}
-
-
-#[tauri::command]
-async fn send_btc_to_htlc(
-    master_seed_hex: String, 
-    htlc_address: String, 
-    amount_btc: f64
-) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        use bdk::bitcoin::Network as BdkNetwork;
-        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
-        use bdk::bitcoin::Address as BdkAddress;
-        use bdk::blockchain::{EsploraBlockchain, Blockchain};
-        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
-        use bdk::database::MemoryDatabase;
-        use std::str::FromStr;
-
-        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-        
-        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
-        
-        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
-        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
-
-        let wallet = Wallet::new(
-            &desc, 
-            Some(&change_desc), 
-            BdkNetwork::Testnet, 
-            MemoryDatabase::default()
-        ).map_err(|e| format!("Erreur Init Wallet: {}", e))?;
-
-        println!("⏳ [BDK] Scan de la blockchain...");
-        let blockchain = EsploraBlockchain::new("https://mempool.space/testnet/api", 20);
-        wallet.sync(&blockchain, SyncOptions::default()).map_err(|e| format!("Erreur Sync: {}", e))?;
-
-        let target_address = BdkAddress::from_str(&htlc_address).map_err(|_| "Adresse HTLC invalide".to_string())?;
-        let amount_sats = (amount_btc * 100_000_000.0) as u64;
-
-        println!("🛠️ [BDK] Construction de la TX...");
-        let (mut psbt, _details) = {
-            let mut builder = wallet.build_tx();
-            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
-            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
-            builder.finish().map_err(|e| format!("Erreur TX Builder: {}", e))?
-        };
-
-        println!("✍️ [BDK] Signature SegWit...");
-        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
-        if !finalized {
-            return Err("❌ BDK n'a pas pu signer.".to_string());
-        }
-
-        let raw_tx = psbt.extract_tx();
-        let txid = raw_tx.txid();
-        println!("🚀 [BDK] Diffusion...");
-        blockchain.broadcast(&raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
-
-        Ok(format!("✅ TX Bitcoin validée !\nTXID: {}", txid))
-    })
-    .await
-    .unwrap_or_else(|_| Err("Erreur critique du thread BDK".to_string()))
-}
+async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<Vec<SwapContract>, String> {
+    let res_str = tor_fetch("GET", "/swaps", None).await?;
+    let all_swaps: Vec<SwapContract> = serde_json::from_str(&res_str).unwrap_or_default();
     
+    let my_swaps: Vec<SwapContract> = all_swaps.into_iter()
+        .filter(|s| s.buyer_btc_address == btc_address || s.seller_watt_address == watt_address)
+        .collect();
+        
+    Ok(my_swaps)
+}
+
 #[tauri::command]
 async fn claim_wattcoin_swap(
     secret: String, 
@@ -870,10 +899,8 @@ async fn claim_wattcoin_swap(
         return Err("❌ Le secret révélé par le DEX est un faux !".to_string());
     }
 
-    // 🕵️ 1. SCAN DE LA BLOCKCHAIN POUR TROUVER LE COFFRE WATTCOIN
-    let client = reqwest::Client::new();
-    let url = format!("{}/all_transactions", NODE_URL);
-    let all_txs: Vec<Transaction> = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?.json().await.map_err(|_| "Erreur JSON".to_string())?;
+    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
 
     let mut locked_utxo = None;
     let mut locked_commitment = None;
@@ -890,15 +917,13 @@ async fn claim_wattcoin_swap(
 
     let (utxo_id, commitment) = match (locked_utxo, locked_commitment) {
         (Some(u), Some(c)) => (u, c),
-        _ => return Err("⏳ Le vendeur n'a pas encore verrouillé ses WATT sur la blockchain ! Veuillez patienter.".to_string()),
+        _ => return Err("⏳ Le vendeur n'a pas encore verrouillé ses WATT !".to_string()),
     };
 
-    // 🛡️ 2. PRÉPARATION DE L'INPUT
     let key_image = hex::encode(blake3::hash(format!("CLAIM_{}_{}", secret, utxo_id).as_bytes()).as_bytes());
     let dummy_signature = PQLatticeRingSignature { key_image, c0: String::new(), z_responses: vec![], p_keys: vec![] };
     let claim_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment };
 
-    // 🎁 3. PRÉPARATION DE L'OUTPUT
     use pqcrypto_kyber::kyber768;
     use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
     use rand::RngCore;
@@ -933,21 +958,10 @@ async fn claim_wattcoin_swap(
         dilithium_signature: hash.clone(), 
     };
 
-    let res = client.post(&format!("{}/send_tx", NODE_URL)).json(&claim_tx).send().await.map_err(|_| "Nœud injoignable !".to_string())?;
+    let tx_json = serde_json::to_string(&claim_tx).unwrap();
+    let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
-    if res.status().is_success() {
-        Ok(format!("🎉 ATOMIC SWAP RÉUSSI ! Le réseau a validé votre Secret HTLC et débloqué {} WATT !", amount))
-    } else {
-        Err("❌ Le Tribunal a rejeté votre transaction Claim !".to_string())
-    }
-}
-
-#[tauri::command]
-async fn simulate_bot_lock(keys: WalletKeys, hash_hex: String, amount: f64) -> Result<String, String> {
-    send_wattcoin(
-        keys.watt_address.clone(), amount, keys.dilithium_secret_hex, keys.dilithium_public_hex,
-        keys.kyber_secret_hex, keys.watt_address, Some(hash_hex), Some(144) 
-    ).await
+    Ok(format!("🎉 ATOMIC SWAP RÉUSSI ! Le réseau a validé votre Secret HTLC et débloqué {} WATT !", amount))
 }
 
 #[tauri::command]
@@ -964,280 +978,28 @@ fn destroy_vault() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<Vec<SwapContract>, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/swaps", NODE_URL);
-    let res = client.get(&url).send().await.map_err(|_| "Nœud injoignable".to_string())?;
-    
-    if res.status().is_success() {
-        let all_swaps: Vec<SwapContract> = res.json().await.map_err(|_| "Erreur JSON".to_string())?;
-        
-        // 💡 Le Wallet filtre pour ne garder que les contrats qui l'intéressent !
-        let my_swaps: Vec<SwapContract> = all_swaps.into_iter()
-            .filter(|s| s.buyer_btc_address == btc_address || s.seller_watt_address == watt_address)
-            .collect();
-            
-        Ok(my_swaps)
-    } else {
-        Ok(vec![])
-    }
-}
-
-// ========================================================================
-// 🏆 LE VRAI BOSS FINAL : LA RÉCLAMATION BITCOIN L1 PURE ET DURE !
-// ========================================================================
-#[tauri::command]
-async fn claim_btc_swap(
-    master_seed_hex: String, 
-    htlc_address: String, 
-    secret_hex: String,
-    buyer_pubkey_hex: String,
-    seller_pubkey_hex: String 
-) -> Result<String, String> {
-    use bdk::bitcoin::Network;
-    use bdk::bitcoin::bip32::{ExtendedPrivKey, DerivationPath}; // 💡 FIX: Plus de 'util::'
-    use bdk::bitcoin::{Address, PrivateKey, PublicKey, OutPoint, Txid, Sequence, Transaction, TxIn, TxOut, Witness, ScriptBuf};
-    use bdk::bitcoin::blockdata::script::Builder;
-    use bdk::bitcoin::opcodes::all::*;
-    use bdk::bitcoin::hashes::{sha256, Hash};
-    use bdk::bitcoin::secp256k1::{Secp256k1, Message};
-    use bdk::bitcoin::sighash::{SighashCache, EcdsaSighashType}; // 💡 FIX: Plus de 'util::'
-    use bdk::bitcoin::absolute::LockTime; // 💡 FIX: LockTime au lieu de PackedLockTime
-    use std::str::FromStr;
-
-    let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-    let xprv = ExtendedPrivKey::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
-    let secp = Secp256k1::new();
-    
-    // --- 1. CLÉS ---
-    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
-    let child = xprv.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
-    let bob_priv_key = PrivateKey::new(child.private_key, Network::Testnet);
-    
-    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey_hex).unwrap();
-    let seller_pubkey = PublicKey::from_str(&seller_pubkey_hex).unwrap();
-    
-    // 💡 FIX: Ajout du .unwrap() car Address::p2wpkh renvoie un Result en v0.30
-    let bob_address = Address::p2wpkh(&seller_pubkey, Network::Testnet).unwrap();
-
-    // --- 2. RECONSTRUIRE LE SCRIPT HTLC EXACT (SHA256) ---
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
-    let btc_hash = sha256::Hash::hash(&secret_bytes); 
-    
-    let htlc_script = Builder::new()
-        .push_opcode(OP_IF)
-            .push_opcode(OP_SHA256)
-            .push_slice(&btc_hash.to_byte_array()) 
-            .push_opcode(OP_EQUALVERIFY)
-            .push_key(&seller_pubkey) // 💡 FIX: On utilise seller_pubkey (Bob)
-        .push_opcode(OP_ELSE)
-            .push_int(144)
-            .push_opcode(OP_CSV)
-            .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey) // Alice
-        .push_opcode(OP_ENDIF)
-        .push_opcode(OP_CHECKSIG)
-        .into_script();
-
-    let p2wsh_address = Address::p2wsh(&htlc_script, Network::Testnet);
-    if p2wsh_address.to_string() != htlc_address {
-        return Err("Erreur critique: Le script reconstruit ne correspond pas à l'adresse HTLC !".to_string());
-    }
-
-    // --- 3. RÉCUPÉRER L'UTXO VIA MEMPOOL.SPACE ---
-    let client = reqwest::Client::new();
-    let url = format!("https://mempool.space/testnet/api/address/{}/utxo", htlc_address);
-    let res = client.get(&url).send().await.map_err(|_| "Impossible de joindre le Testnet".to_string())?;
-    
-    let utxos: serde_json::Value = res.json().await.map_err(|_| "Erreur JSON".to_string())?;
-    if utxos.as_array().unwrap_or(&vec![]).is_empty() {
-        return Err("❌ Aucun Bitcoin trouvé ! La Tx d'Alice n'est pas encore confirmée par les mineurs Testnet.".to_string());
-    }
-    
-    let txid_str = utxos[0]["txid"].as_str().unwrap();
-    let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
-    let vout = utxos[0]["vout"].as_u64().unwrap() as u32;
-    let value_sats = utxos[0]["value"].as_u64().unwrap();
-
-    let fee_sats = 600; 
-    if value_sats <= fee_sats { return Err("Montant trop faible pour payer les frais !".to_string()); }
-    let amount_to_receive = value_sats - fee_sats;
-
-    // --- 4. CONSTRUIRE LA TRANSACTION BRUTE ---
-    let txin = TxIn {
-        previous_output: OutPoint { txid, vout },
-        script_sig: ScriptBuf::new(), // 💡 FIX: Utilisation de ScriptBuf::new()
-        sequence: Sequence::MAX, 
-        witness: Witness::new(), 
-    };
-
-    let txout = TxOut {
-        value: amount_to_receive,
-        script_pubkey: bob_address.script_pubkey(),
-    };
-
-    let mut tx = Transaction {
-        version: 2,
-        lock_time: LockTime::ZERO, // 💡 FIX: absolute::LockTime::ZERO
-        input: vec![txin],
-        output: vec![txout],
-    };
-
-    // --- 5. SIGNER LA TRANSACTION ---
-    let mut sighash_cache = SighashCache::new(&mut tx);
-    let sighash = sighash_cache.segwit_signature_hash(
-        0, &htlc_script, value_sats, EcdsaSighashType::All,
-    ).map_err(|e| e.to_string())?;
-
-    let message = Message::from_slice(&sighash.to_byte_array()).unwrap();
-    let signature = secp.sign_ecdsa(&message, &bob_priv_key.inner);
-    
-    let mut sig_with_hashtype = signature.serialize_der().to_vec();
-    sig_with_hashtype.push(EcdsaSighashType::All as u8);
-
-    let mut witness = Witness::new();
-    witness.push(sig_with_hashtype);  // 1. Signature
-    witness.push(secret_bytes);       // 2. Le Secret !
-    witness.push(vec![1]);            // 3. OP_TRUE (Branche IF)
-    witness.push(htlc_script.into_bytes()); // 4. Script
-
-    tx.input[0].witness = witness;
-
-    // --- 6. DIFFUSER LA TRANSACTION ---
-    let raw_tx_bytes = bdk::bitcoin::consensus::encode::serialize(&tx);
-    let raw_tx_hex = hex::encode(raw_tx_bytes);
-
-    let broadcast_res = client.post("https://mempool.space/testnet/api/tx")
-        .body(raw_tx_hex)
-        .send().await.map_err(|_| "Erreur réseau (Mempool)".to_string())?;
-
-    if broadcast_res.status().is_success() {
-         Ok(format!("🎉 VRAI SWAP RÉUSSI ! Tx diffusée : {}\nVous avez reçu {} sats !", tx.txid(), amount_to_receive))
-    } else {
-         let err_text = broadcast_res.text().await.unwrap_or_default();
-         Err(format!("Rejeté par Bitcoin : {}", err_text))
-    }
-}
-
-// ========================================================================
-// 💸 FONCTION BONUS : ENVOI DIRECT DE BITCOIN L1 (P2WPKH -> P2WPKH)
-// ========================================================================
-#[tauri::command]
-async fn send_btc_direct(
-    master_seed_hex: String, 
-    recipient_address: String, 
-    amount_btc: f64
-) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        use bdk::bitcoin::Network as BdkNetwork;
-        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
-        use bdk::bitcoin::Address as BdkAddress;
-        use bdk::blockchain::{EsploraBlockchain, Blockchain};
-        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
-        use bdk::database::MemoryDatabase;
-        use std::str::FromStr;
-
-        // 1. DÉCHIFFRER LA SEED ET INITIALISER LE WALLET
-        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
-        
-        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
-        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
-
-        let wallet = Wallet::new(
-            &desc, 
-            Some(&change_desc), 
-            BdkNetwork::Testnet, 
-            MemoryDatabase::default()
-        ).map_err(|e| format!("Erreur Init Wallet: {}", e))?;
-
-        // 2. SYNCHRONISATION AVEC LA BLOCKCHAIN (Mempool.space)
-        println!("⏳ [BDK] Scan de la blockchain pour envoi direct...");
-        let blockchain = EsploraBlockchain::new("https://mempool.space/testnet/api", 20);
-        wallet.sync(&blockchain, SyncOptions::default()).map_err(|e| format!("Erreur Sync: {}", e))?;
-
-        // 3. PRÉPARATION DE LA CIBLE ET DU MONTANT
-        let target_address = BdkAddress::from_str(&recipient_address).map_err(|_| "Adresse BTC de destination invalide".to_string())?;
-        let amount_sats = (amount_btc * 100_000_000.0) as u64;
-
-        // Vérifier le solde avant de construire la Tx
-        let balance = wallet.get_balance().unwrap();
-        let total_available = balance.confirmed + balance.untrusted_pending + balance.trusted_pending;
-        
-        if total_available < amount_sats + 1000 { // + 1000 pour prévoir les frais
-             return Err(format!("Fonds insuffisants ! Vous avez {} sats mais essayez d'envoyer {} sats.", total_available, amount_sats));
-        }
-
-        // 4. CONSTRUCTION DE LA TRANSACTION
-        println!("🛠️ [BDK] Construction de la TX...");
-        let (mut psbt, _details) = {
-            let mut builder = wallet.build_tx();
-            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
-            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
-            builder.finish().map_err(|e| format!("Erreur TX Builder: {}", e))?
-        };
-
-        // 5. SIGNATURE ET DIFFUSION
-        println!("✍️ [BDK] Signature...");
-        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
-        if !finalized {
-            return Err("❌ BDK n'a pas pu signer. Clés manquantes ?".to_string());
-        }
-
-        let raw_tx = psbt.extract_tx();
-        let txid = raw_tx.txid();
-        println!("🚀 [BDK] Diffusion de la TX L1...");
-        blockchain.broadcast(&raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
-
-        Ok(format!("✅ TX Bitcoin envoyée avec succès !\nTXID: {}", txid))
-    })
-    .await
-    .unwrap_or_else(|_| Err("Erreur critique du thread BDK".to_string()))
-}
-
-#[tauri::command]
 fn save_miner_script(os: String, address: String) -> Result<String, String> {
-    // 1. Trouver le dossier principal de l'utilisateur
-    let home = if cfg!(windows) {
-        std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
-    } else {
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-    };
-
+    let home = if cfg!(windows) { std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string()) } else { std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()) };
     let base_dir = std::path::PathBuf::from(&home);
     
-    // 2. Chasse au trésor : Trouver le bon dossier (Anglais ou Français)
     let mut target_dir = base_dir.join("Downloads");
-    if !target_dir.exists() {
-        target_dir = base_dir.join("Téléchargements");
-    }
-    if !target_dir.exists() {
-        target_dir = base_dir.join("Desktop");
-    }
-    if !target_dir.exists() {
-        target_dir = base_dir.join("Bureau");
-    }
-    if !target_dir.exists() {
-        target_dir = base_dir; // Fallback : on met à la racine (/home/lucien/)
-    }
+    if !target_dir.exists() { target_dir = base_dir.join("Téléchargements"); }
+    if !target_dir.exists() { target_dir = base_dir.join("Desktop"); }
+    if !target_dir.exists() { target_dir = base_dir.join("Bureau"); }
+    if !target_dir.exists() { target_dir = base_dir; }
 
-    // 3. Nommer le fichier
     let filename = if os == "linux" { "start_miner.sh" } else { "start_miner.bat" };
     let file_path = target_dir.join(filename);
-
     let short_addr = if address.len() > 15 { &address[0..15] } else { &address };
 
-    // 4. Contenu du script
     let content = if os == "linux" {
-        format!("#!/bin/bash\n\n# Lancement du Nœud Wattcoin avec Minage\n# Le port local est défini sur 8001 pour éviter les conflits.\necho \"🔥 Démarrage du Nœud Cypherpunk pour {}...\"\n./wattcoin_core 8001 {} 80.78.26.243:8000 --live\n", short_addr, address)
+        format!("#!/bin/bash\n\n# Lancement du Nœud Wattcoin\necho \"🔥 Démarrage du Nœud pour {}...\"\n./wattcoin_core 8001 {} jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64yd.onion:8000 --live\n", short_addr, address)
     } else {
-        format!("@echo off\n:: Lancement du Nœud Wattcoin avec Minage\n:: Le port local est defini sur 8001 pour eviter les conflits.\necho 🔥 Demarrage du Noeud Cypherpunk pour {}...\nwattcoin_core.exe 8001 {} 80.78.26.243:8000 --live\npause\n", short_addr, address)
+        format!("@echo off\n:: Lancement du Nœud Wattcoin\necho 🔥 Demarrage du Noeud pour {}...\nwattcoin_core.exe 8001 {} jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64yd.onion:8000 --live\npause\n", short_addr, address)
     };
 
-    // 5. Écrire le fichier
     std::fs::write(&file_path, content).map_err(|e| format!("Erreur d'écriture : {}", e))?;
 
-    // 6. Rendre le script exécutable sous Linux
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1250,7 +1012,402 @@ fn save_miner_script(os: String, address: String) -> Result<String, String> {
     Ok(format!("Script généré avec succès dans :\n{}", file_path.display()))
 }
 
+// ========================================================================
+// 🏆 BITCOIN FUNCTIONS (100% INJECTION DIRECTE VIA ARTI)
+// ========================================================================
 
+// ---------------------------------------------------------
+// LES COMMANDES TAURI SIMPLIFIÉES ET BLINDÉES
+// ---------------------------------------------------------
+
+#[tauri::command]
+async fn create_btc_htlc(buyer_pubkey_hex: String, seller_pubkey_hex: String, secret_hex: String, locktime: u32) -> Result<String, String> {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::blockdata::script::Builder;
+    use bitcoin::opcodes::all::*;
+    use bitcoin::{Address, Network};
+    use std::str::FromStr;
+
+    let buyer_pubkey = bitcoin::PublicKey::from_str(&buyer_pubkey_hex).map_err(|_| "Clé Alice invalide".to_string())?;
+    let seller_pubkey = bitcoin::PublicKey::from_str(&seller_pubkey_hex).map_err(|_| "Clé Bob invalide".to_string())?;
+    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
+    let btc_hash = sha256::Hash::hash(&secret_bytes);
+
+    let htlc_script = Builder::new()
+        .push_opcode(OP_IF)
+            .push_opcode(OP_SHA256)
+            .push_slice(&btc_hash.to_byte_array())
+            .push_opcode(OP_EQUALVERIFY)
+            .push_key(&seller_pubkey) 
+        .push_opcode(OP_ELSE)
+            .push_int(locktime as i64)
+            .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP)
+            .push_key(&buyer_pubkey)  
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+
+    let address = Address::p2wsh(&htlc_script, Network::Testnet);
+    Ok(address.to_string())
+}
+
+#[tauri::command]
+async fn get_btc_balance(master_seed_hex: String) -> Result<f64, String> {
+    let _tor = get_tor_client().await?; 
+
+    let task = tokio::task::spawn_blocking(move || -> Result<f64, String> {
+        use bdk::bitcoin::Network as BdkNetwork;
+        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
+        use bdk::blockchain::esplora::EsploraBlockchainConfig;
+        use bdk::blockchain::{EsploraBlockchain, ConfigurableBlockchain}; 
+        use bdk::{Wallet, SyncOptions};
+        use bdk::database::MemoryDatabase;
+
+        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
+        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
+        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
+        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
+
+        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
+            .map_err(|e| e.to_string())?;
+
+        let endpoints = [
+            "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
+            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
+        ];
+
+        let mut synced = false;
+        for endpoint in endpoints {
+            println!("📡 [BDK] Lancement de la Sync BTC vers {}...", &endpoint[7..20]);
+            
+            let config = EsploraBlockchainConfig {
+                base_url: endpoint.to_string(),
+                proxy: Some("socks5h://127.0.0.1:9150".to_string()), 
+                concurrency: Some(4),
+                stop_gap: 20,
+                timeout: Some(120), // 💡 120 SECONDES de patience !
+            };
+
+            if let Ok(blockchain) = EsploraBlockchain::from_config(&config) {
+                if wallet.sync(&blockchain, SyncOptions::default()).is_ok() {
+                    println!("✅ [BDK] Sync BTC réussie !");
+                    synced = true;
+                    break;
+                } else {
+                    println!("⚠️ [BDK] Échec de la sync sur ce serveur.");
+                }
+            } else {
+                println!("⚠️ [BDK] Impossible de configurer Esplora.");
+            }
+        }
+
+        if !synced { return Err("❌ Services cachés Bitcoin injoignables.".to_string()); }
+
+        let balance = wallet.get_balance().map_err(|e| e.to_string())?;
+        Ok((balance.confirmed + balance.untrusted_pending) as f64 / 100_000_000.0)
+    });
+
+    // 💡 300 SECONDES DE TIMEOUT GLOBAL (Tor peut être très lent à démarrer)
+    match tokio::time::timeout(std::time::Duration::from_secs(300), task).await {
+        Ok(Ok(Ok(bal))) => Ok(bal), // 💡 3 "Ok" pour ouvrir les 3 couches !
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(format!("Thread crash: {}", e)),
+        Err(_) => Err("Timeout API Bitcoin via Tor".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn send_btc_to_htlc(master_seed_hex: String, htlc_address: String, amount_btc: f64) -> Result<String, String> {
+    let _tor = get_tor_client().await?; // On s'assure que le Micro-Proxy est allumé
+    
+    let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use bdk::bitcoin::Network as BdkNetwork;
+        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
+        use bdk::bitcoin::Address as BdkAddress;
+        use bdk::blockchain::esplora::EsploraBlockchainConfig;
+        use bdk::blockchain::{EsploraBlockchain, ConfigurableBlockchain};
+        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
+        use bdk::database::MemoryDatabase;
+        use std::str::FromStr;
+
+        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
+        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
+        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
+        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
+
+        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
+            .map_err(|e| format!("Erreur Init Wallet: {}", e))?;
+
+        let endpoints = [
+            "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
+            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
+        ];
+
+        let mut active_blockchain = None;
+        for endpoint in endpoints {
+            println!("📡 [BDK] Lancement de la Sync BTC (HTLC) vers {}...", &endpoint[7..20]);
+            let config = EsploraBlockchainConfig {
+                base_url: endpoint.to_string(),
+                proxy: Some("socks5h://127.0.0.1:9150".to_string()),
+                concurrency: Some(4),
+                stop_gap: 20,
+                timeout: Some(120),
+            };
+
+            if let Ok(blockchain) = EsploraBlockchain::from_config(&config) {
+                if wallet.sync(&blockchain, SyncOptions::default()).is_ok() {
+                    active_blockchain = Some(blockchain);
+                    break;
+                }
+            }
+        }
+
+        let blockchain = active_blockchain.ok_or_else(|| "❌ Services cachés BTC injoignables.".to_string())?;
+
+        let target_address = BdkAddress::from_str(&htlc_address).map_err(|_| "Adresse HTLC invalide".to_string())?;
+        let amount_sats = (amount_btc * 100_000_000.0) as u64;
+
+        let (mut psbt, _details) = {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
+            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
+            builder.finish().map_err(|e| format!("Erreur TX Builder: {}", e))?
+        };
+
+        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
+        if !finalized { return Err("❌ BDK n'a pas pu signer.".to_string()); }
+
+        let raw_tx = psbt.extract_tx();
+        println!("📤 [BDK] Broadcast HTLC via Micro-Proxy SOCKS5...");
+        bdk::blockchain::Blockchain::broadcast(&blockchain, &raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
+
+        Ok(format!("✅ Contrat BTC déployé via Tor !\nTXID: {}", raw_tx.txid()))
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(300), task).await {
+        Ok(Ok(Ok(res))) => Ok(res),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(format!("Thread crash: {}", e)),
+        Err(_) => Err("Timeout Tor".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn send_btc_direct(master_seed_hex: String, recipient_address: String, amount_btc: f64) -> Result<String, String> {
+    let _tor = get_tor_client().await?; 
+    
+    let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use bdk::bitcoin::Network as BdkNetwork;
+        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
+        use bdk::bitcoin::Address as BdkAddress;
+        use bdk::blockchain::esplora::EsploraBlockchainConfig;
+        use bdk::blockchain::{EsploraBlockchain, ConfigurableBlockchain};
+        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
+        use bdk::database::MemoryDatabase;
+        use std::str::FromStr;
+
+        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
+        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
+        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
+        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
+
+        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
+            .map_err(|e| format!("Erreur Init Wallet: {}", e))?;
+
+        let endpoints = [
+            "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
+            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
+        ];
+
+        let mut active_blockchain = None;
+        for endpoint in endpoints {
+            println!("📡 [BDK] Lancement de la Sync BTC (Direct) vers {}...", &endpoint[7..20]);
+            let config = EsploraBlockchainConfig {
+                base_url: endpoint.to_string(),
+                proxy: Some("socks5h://127.0.0.1:9150".to_string()),
+                concurrency: Some(4),
+                stop_gap: 20,
+                timeout: Some(120),
+            };
+
+            if let Ok(blockchain) = EsploraBlockchain::from_config(&config) {
+                if wallet.sync(&blockchain, SyncOptions::default()).is_ok() {
+                    active_blockchain = Some(blockchain);
+                    break;
+                }
+            }
+        }
+
+        let blockchain = active_blockchain.ok_or_else(|| "❌ Services cachés BTC injoignables.".to_string())?;
+        let target_address = BdkAddress::from_str(&recipient_address).map_err(|_| "Adresse invalide".to_string())?;
+        let amount_sats = (amount_btc * 100_000_000.0) as u64;
+
+        let balance = wallet.get_balance().map_err(|e| e.to_string())?;
+        if (balance.confirmed + balance.untrusted_pending) < amount_sats + 1000 {
+            return Err("Fonds insuffisants !".to_string());
+        }
+
+        let (mut psbt, _details) = {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
+            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
+            builder.finish().map_err(|e| format!("Erreur Builder: {}", e))?
+        };
+
+        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
+        if !finalized { return Err("Échec signature".to_string()); }
+
+        let raw_tx = psbt.extract_tx();
+        println!("📤 [BDK] Broadcast BTC via Micro-Proxy SOCKS5...");
+        bdk::blockchain::Blockchain::broadcast(&blockchain, &raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
+
+        Ok(format!("✅ BTC envoyés via Tor !\nTXID: {}", raw_tx.txid()))
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(300), task).await {
+        Ok(Ok(Ok(res))) => Ok(res),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(format!("Thread crash: {}", e)),
+        Err(_) => Err("Timeout Tor".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_hex: String, buyer_pubkey_hex: String, seller_pubkey_hex: String) -> Result<String, String> {
+    use bdk::bitcoin::Network;
+    use bdk::bitcoin::bip32::{ExtendedPrivKey, DerivationPath}; 
+    use bdk::bitcoin::{Address, PrivateKey, PublicKey, OutPoint, Txid, Sequence, Transaction, TxIn, TxOut, Witness, ScriptBuf};
+    use bdk::bitcoin::blockdata::script::Builder;
+    use bdk::bitcoin::opcodes::all::*;
+    use bdk::bitcoin::hashes::{sha256, Hash};
+    use bdk::bitcoin::secp256k1::{Secp256k1, Message};
+    use bdk::bitcoin::sighash::{SighashCache, EcdsaSighashType}; 
+    use bdk::bitcoin::absolute::LockTime; 
+    use std::str::FromStr;
+
+    let _tor = get_tor_client().await?; // On allume notre propre Proxy !
+
+    let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
+    let xprv = ExtendedPrivKey::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
+    let secp = Secp256k1::new();
+    
+    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
+    let child = xprv.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
+    let bob_priv_key = PrivateKey::new(child.private_key, Network::Testnet);
+    
+    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey_hex).unwrap();
+    let seller_pubkey = PublicKey::from_str(&seller_pubkey_hex).unwrap();
+    let bob_address = Address::p2wpkh(&seller_pubkey, Network::Testnet).unwrap();
+
+    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
+    let btc_hash = sha256::Hash::hash(&secret_bytes); 
+    
+    let htlc_script = Builder::new()
+        .push_opcode(OP_IF)
+            .push_opcode(OP_SHA256)
+            .push_slice(&btc_hash.to_byte_array()) 
+            .push_opcode(OP_EQUALVERIFY)
+            .push_key(&seller_pubkey) 
+        .push_opcode(OP_ELSE)
+            .push_int(144)
+            .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP)
+            .push_key(&buyer_pubkey)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+
+    let p2wsh_address = Address::p2wsh(&htlc_script, Network::Testnet);
+    if p2wsh_address.to_string() != htlc_address { return Err("Erreur critique: Script reconstruit invalide.".to_string()); }
+
+    // 💡 CONNEXION VIA NOTRE MICRO-PROXY 9150 !
+    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9150").map_err(|_| "Impossible de lier le proxy".to_string())?;
+    let client = reqwest::Client::builder().proxy(proxy).build().map_err(|_| "Erreur HTTP".to_string())?;
+
+    let endpoints = [
+        "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
+        "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
+    ];
+
+    let mut utxos = None;
+    let mut active_endpoint = String::new();
+
+    for endpoint in endpoints {
+        println!("📡 [CLAIM] Recherche de l'UTXO via le Proxy sur {}...", &endpoint[7..20]);
+        let url = format!("{}/address/{}/utxo", endpoint, htlc_address);
+        if let Ok(res) = client.get(&url).send().await {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                utxos = Some(json);
+                active_endpoint = endpoint.to_string();
+                break;
+            }
+        }
+    }
+
+    let utxos = utxos.ok_or_else(|| "❌ Services cachés Bitcoin injoignables.".to_string())?;
+    if utxos.as_array().unwrap_or(&vec![]).is_empty() { return Err("❌ Aucun Bitcoin trouvé dans le contrat !".to_string()); }
+    
+    let txid_str = utxos[0]["txid"].as_str().unwrap();
+    let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
+    let vout = utxos[0]["vout"].as_u64().unwrap() as u32;
+    let value_sats = utxos[0]["value"].as_u64().unwrap();
+
+    let fee_sats = 600; 
+    if value_sats <= fee_sats { return Err("Montant trop faible pour payer les frais !".to_string()); }
+    let amount_to_receive = value_sats - fee_sats;
+
+    let txin = TxIn {
+        previous_output: OutPoint { txid, vout },
+        script_sig: ScriptBuf::new(), 
+        sequence: Sequence::MAX, 
+        witness: Witness::new(), 
+    };
+
+    let txout = TxOut {
+        value: amount_to_receive,
+        script_pubkey: bob_address.script_pubkey(),
+    };
+
+    let mut tx = Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO, 
+        input: vec![txin],
+        output: vec![txout],
+    };
+
+    let mut sighash_cache = SighashCache::new(&mut tx);
+    let sighash = sighash_cache.segwit_signature_hash(0, &htlc_script, value_sats, EcdsaSighashType::All).map_err(|e| e.to_string())?;
+
+    let message = Message::from_slice(&sighash.to_byte_array()).unwrap();
+    let signature = secp.sign_ecdsa(&message, &bob_priv_key.inner);
+    
+    let mut sig_with_hashtype = signature.serialize_der().to_vec();
+    sig_with_hashtype.push(EcdsaSighashType::All as u8);
+
+    let mut witness = Witness::new();
+    witness.push(sig_with_hashtype);  
+    witness.push(secret_bytes);       
+    witness.push(vec![1]);            
+    witness.push(htlc_script.into_bytes()); 
+
+    tx.input[0].witness = witness;
+
+    let raw_tx_bytes = bdk::bitcoin::consensus::encode::serialize(&tx);
+    let raw_tx_hex = hex::encode(raw_tx_bytes);
+
+    let broadcast_url = format!("{}/tx", active_endpoint);
+    let broadcast_res = client.post(&broadcast_url)
+        .body(raw_tx_hex)
+        .send().await.map_err(|_| "Erreur réseau (Broadcast via Tor)".to_string())?;
+
+    if broadcast_res.status().is_success() {
+         Ok(format!("🎉 VRAI SWAP RÉUSSI VIA TOR ! Tx diffusée : {}\nVous avez reçu {} sats !", tx.txid(), amount_to_receive))
+    } else {
+         let err_text = broadcast_res.text().await.unwrap_or_default();
+         Err(format!("Rejeté par Bitcoin : {}", err_text))
+    }
+}
 
 // ============== LA FONCTION MAIN ==================
 
@@ -1261,15 +1418,13 @@ fn main() {
             let app_handle = app.handle().clone();
             
             tauri::async_runtime::spawn(async move {
-                let client = reqwest::Client::new();
                 let mut last_blocks = 0;
                 
                 loop {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    let url = format!("{}/info", NODE_URL);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     
-                    if let Ok(res) = client.get(&url).send().await {
-                        if let Ok(info) = res.json::<serde_json::Value>().await {
+                    if let Ok(res_str) = tor_fetch("GET", "/info", None).await {
+                        if let Ok(info) = serde_json::from_str::<serde_json::Value>(&res_str) {
                             if let Some(blocks) = info["blocks"].as_u64() {
                                 if blocks > last_blocks {
                                     last_blocks = blocks;
@@ -1283,10 +1438,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
+            get_network_info, generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
             submit_order, get_dark_pool, resolve_batch, get_watt_balance, get_btc_balance,
-            send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, simulate_bot_lock,
-            destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, save_miner_script
+            send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap,
+            destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, 
+			save_miner_script
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -32,7 +32,7 @@ aes-gcm = "0.10.3"
 pbkdf2 = "0.12.2"  # 🐛 FIX : On passe à la version 0.12.2 !
 sha2 = "0.10.6"
 blake3 = "1.5.0"
-reqwest = { version = "0.12", features = ["json"] } # 📻 Le Walkie-Tal
+reqwest = { version = "0.12", features = ["json", "socks"] }# 📻 Le Walkie-Tal
 curve25519-dalek = "4.1.2"
 bdk = { version = "0.29.0", features = ["compiler", "use-esplora-reqwest", "reqwest-default-tls"] }
 tokio = { version = "1", features = ["full"] }
@@ -40,3 +40,8 @@ monero = "0.21.0"
 pqcrypto-kyber = "0.8"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
+# Ajout de "on-demand-vpn" (pour la gestion réseau) et "full" pour les services proxy
+arti-client = { version = "0.22.0", features = ["tokio", "rustls", "onion-service-client", "full"] }
+once_cell = "1.19.0"
+tor-rtcompat = "0.22.0"
+
