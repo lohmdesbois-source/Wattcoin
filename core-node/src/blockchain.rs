@@ -55,7 +55,7 @@ impl Blockchain {
         let path_obj = std::path::Path::new(path);
         if !path_obj.exists() {
             println!("🌱 Aucune blockchain locale trouvée, initialisation du Genesis Block.");
-            let mut new_chain = Blockchain::new();
+            let new_chain = Blockchain::new();
             new_chain.save_to_disk(path);
             return Ok(new_chain);
         }

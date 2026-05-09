@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
-use rand::RngCore; 
+use rand::{Rng, RngCore}; 
 use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 use std::fs; 
@@ -26,7 +26,7 @@ const LATTICE_Q: u32 = 8380417;
 const LATTICE_DIM: usize = 4;
 
 // ================= GESTION DES ERREURS (PRO-LEVEL) =================
-use std::fmt;
+
 
 #[derive(Debug)]
 pub enum WattError {

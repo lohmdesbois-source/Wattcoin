@@ -17,7 +17,7 @@ pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
 
 // ================= GESTION DES ERREURS (PRO-LEVEL) =================
-use std::fmt;
+
 
 #[derive(Debug)]
 pub enum WattError {
