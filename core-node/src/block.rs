@@ -36,7 +36,7 @@ impl Block {
                     stealth_address: "GENESIS".to_string(),
                     kyber_capsule: "GENESIS_KEY".to_string(),
                     aes_vault: "Wattcoin: L'énergie libre, anonyme et post-quantique. 03/Mai/2026 - Le monde change aujourd'hui.".to_string(),
-                    lattice_commitment: crate::lattice::LatticeCommitment::commit(0, 0), 
+                    lattice_commitment: crate::lattice::LWECommitment::commit(0, [0, 0, 0, 0]),
                 }
             ],
             fee: 0,

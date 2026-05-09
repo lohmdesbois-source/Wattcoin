@@ -16,6 +16,25 @@ use api::SharedPool;
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
 
+// ================= GESTION DES ERREURS (PRO-LEVEL) =================
+use std::fmt;
+
+#[derive(Debug)]
+pub enum WattError {
+    Crypto(String),
+    Network(String),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+}
+
+impl From<std::io::Error> for WattError {
+    fn from(err: std::io::Error) -> Self { WattError::Io(err) }
+}
+impl From<serde_json::Error> for WattError {
+    fn from(err: serde_json::Error) -> Self { WattError::Json(err) }
+}
+// ===================================================================
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -50,7 +69,7 @@ async fn main() {
     }
     
     let db_file = format!("chain_{}.json", port);
-    let shared_chain = Arc::new(Mutex::new(Blockchain::load_from_disk(&db_file)));
+    let shared_chain = Arc::new(Mutex::new(Blockchain::load_from_disk(&db_file).unwrap_or_else(|_| Blockchain::new())));
     let mempool: SharedMempool = Arc::new(Mutex::new(Vec::new()));
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
 

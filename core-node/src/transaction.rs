@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use crate::lattice::LatticeCommitment;
+use crate::lattice::LWECommitment;
 
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;   
@@ -25,7 +25,7 @@ pub struct PQLatticeRingSignature {
 pub struct TransactionInput {
     pub pq_ring_inputs: Vec<String>,
     pub pq_ring_signature: PQLatticeRingSignature,
-    pub commitment: LatticeCommitment,
+    pub commitment: LWECommitment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ pub struct TransactionOutput {
     pub stealth_address: String,      
     pub kyber_capsule: String,        
     pub aes_vault: String,            
-    pub lattice_commitment: LatticeCommitment,
+    pub lattice_commitment: LWECommitment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,19 +89,13 @@ impl Transaction {
         }
 
         // =================================================================
-        // ⚖️ 2. L'ILLUSION HOMOMORPHE (ZKP)
+        // ⚖️ 2. LE MASQUAGE POST-QUANTIQUE (LWE)
         // =================================================================
-        let mut sum_inputs_c2 = 0u64;
-        for input in &self.inputs { sum_inputs_c2 = (sum_inputs_c2 + input.commitment.c2) % (LATTICE_Q as u64); }
+        let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
+        let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
 
-        let mut sum_outputs_c2 = 0u64;
-        for out in &self.outputs { sum_outputs_c2 = (sum_outputs_c2 + out.lattice_commitment.c2) % (LATTICE_Q as u64); }
-
-        let fee_commitment_c2 = self.fee % (LATTICE_Q as u64);
-        let required_output_sum = (sum_outputs_c2 + fee_commitment_c2) % (LATTICE_Q as u64);
-
-        if sum_inputs_c2 != required_output_sum {
-            println!("🛑 REJET ZKP : Les montants cachés ne s'équilibrent pas !");
+        if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) {
+            println!("🛑 REJET LWE : Les montants cachés ne s'équilibrent pas ! (Création de fausse monnaie détectée)");
             return false;
         }
 

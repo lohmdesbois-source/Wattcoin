@@ -5,6 +5,7 @@ use num_bigint::BigUint;
 use std::collections::HashSet;
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXVM};
 use rand::seq::SliceRandom;
+use crate::WattError;
 
 const FLAME: u64 = 1_000_000_000;
 const MATURITY_BLOCKS: u64 = 3; 
@@ -50,35 +51,40 @@ impl Blockchain {
         }
     }
 
-    pub fn load_from_disk(filename: &str) -> Self {
-        if let Ok(data) = fs::read_to_string(filename) {
-            if let Ok(chain) = serde_json::from_str::<Vec<Block>>(&data) {
-                println!("💾 HISTORIQUE CHARGÉ : {} blocs retrouvés.", chain.len());
-                let max_target = BigUint::from_bytes_be(&[0xFF; 32]);
-                
-                let mut spent_key_images = HashSet::new();
-                for block in &chain {
-                    for tx in &block.transactions {
-                        if tx.tx_type != TransactionType::Coinbase {
-                            for input in &tx.inputs {
-                                spent_key_images.insert(input.pq_ring_signature.key_image.clone());
-                            }
-                        }
+    pub fn load_from_disk(path: &str) -> Result<Self, WattError> {
+        let path_obj = std::path::Path::new(path);
+        if !path_obj.exists() {
+            println!("🌱 Aucune blockchain locale trouvée, initialisation du Genesis Block.");
+            let mut new_chain = Blockchain::new();
+            new_chain.save_to_disk(path);
+            return Ok(new_chain);
+        }
+
+        let data = fs::read_to_string(path)?;
+        let chain: Vec<Block> = serde_json::from_str(&data)?;
+        println!("💾 HISTORIQUE CHARGÉ : {} blocs retrouvés.", chain.len());
+        
+        let max_target = BigUint::from_bytes_be(&[0xFF; 32]);
+        let mut spent_key_images = HashSet::new();
+        
+        for block in &chain {
+            for tx in &block.transactions {
+                if tx.tx_type != TransactionType::Coinbase {
+                    for input in &tx.inputs {
+                        spent_key_images.insert(input.pq_ring_signature.key_image.clone());
                     }
                 }
-
-                let mut blockchain = Blockchain {
-                    chain,
-                    target: max_target >> INITIAL_DIFFICULTY_SHIFT, 
-                    spent_key_images,
-                };
-                
-                blockchain.recalculate_target_from_scratch();
-                return blockchain;
             }
         }
-        println!("🌱 Aucun historique trouvé. Création du Genesis Block...");
-        Blockchain::new()
+
+        let mut blockchain = Blockchain {
+            chain,
+            target: max_target >> INITIAL_DIFFICULTY_SHIFT, 
+            spent_key_images,
+        };
+        
+        blockchain.recalculate_target_from_scratch();
+        Ok(blockchain)
     }
     
     pub fn save_to_disk(&self, filename: &str) {
@@ -145,7 +151,7 @@ impl Blockchain {
                     stealth_address: format!("COINBASE_{}", miner_address), 
                     kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
                     aes_vault: calculated_reward.to_string(), 
-                    lattice_commitment: crate::lattice::LatticeCommitment::commit(calculated_reward, 0),
+                    lattice_commitment: crate::lattice::LWECommitment::commit(calculated_reward, [0, 0, 0, 0]),
                 }
             ],
             fee: 0,

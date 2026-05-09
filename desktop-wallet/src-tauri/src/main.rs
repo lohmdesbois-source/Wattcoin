@@ -25,6 +25,42 @@ const VAULT_FILE: &str = ".wattcoin_vault";
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
 
+// ================= GESTION DES ERREURS (PRO-LEVEL) =================
+use std::fmt;
+
+#[derive(Debug)]
+pub enum WattError {
+    Crypto(String),
+    Network(String),
+    Io(std::io::Error),
+    Vault(String),
+    Json(serde_json::Error),
+}
+
+// Permet de convertir automatiquement les erreurs de fichiers (I/O) en WattError
+impl From<std::io::Error> for WattError {
+    fn from(err: std::io::Error) -> Self { WattError::Io(err) }
+}
+
+// Permet de convertir automatiquement les erreurs JSON en WattError
+impl From<serde_json::Error> for WattError {
+    fn from(err: serde_json::Error) -> Self { WattError::Json(err) }
+}
+
+// 💡 INDISPENSABLE POUR TAURI : Convertit notre erreur en String pour le Front-End React
+impl From<WattError> for String {
+    fn from(err: WattError) -> String {
+        match err {
+            WattError::Crypto(msg) => format!("🔒 Erreur Cryptographique : {}", msg),
+            WattError::Network(msg) => format!("🧅 Erreur Réseau Tor : {}", msg),
+            WattError::Io(err) => format!("💾 Erreur Disque/Fichier : {}", err),
+            WattError::Vault(msg) => format!("🏦 Erreur Coffre-Fort : {}", msg),
+            WattError::Json(err) => format!("🧩 Erreur Données : {}", err),
+        }
+    }
+}
+// ===================================================================
+
 // 💡 LE MOTEUR TOR GLOBAL
 static TOR_CLIENT: Lazy<AsyncMutex<Option<TorClient<PreferredRuntime>>>> = Lazy::new(|| AsyncMutex::new(None));
 
@@ -242,19 +278,56 @@ pub struct PQLatticeRingSignature {
     pub p_keys: Vec<Vec<u32>>, 
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LWECommitment {
+    pub a_matrix_seed: [u8; 32], 
+    pub t_vector: Vec<u32>,      
+}
+
+impl LWECommitment {
+    pub fn commit(amount: u64, blinding_factor: [u32; LATTICE_DIM]) -> Self {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::thread_rng();
+        
+        let mut a_matrix_seed = [0u8; 32];
+        rng.fill_bytes(&mut a_matrix_seed);
+        
+        // Génération de la matrice A
+        let mut a_matrix = vec![vec![0u32; LATTICE_DIM]; LATTICE_DIM];
+        let mut seed_rng = rand::rngs::StdRng::from_seed(a_matrix_seed);
+        for row in a_matrix.iter_mut() {
+            for val in row.iter_mut() { *val = seed_rng.gen_range(0..LATTICE_Q); }
+        }
+
+        // Calcul LWE : t = A * s + e + m*(Q/2)
+        let mut t_vector = vec![0u32; LATTICE_DIM];
+        for i in 0..LATTICE_DIM {
+            let mut sum: u64 = 0;
+            for j in 0..LATTICE_DIM {
+                sum += (a_matrix[i][j] as u64 * blinding_factor[j] as u64) % LATTICE_Q as u64;
+            }
+            let error_term = rng.gen_range(0..5); 
+            let message_term = if i == 0 { (amount * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64 } else { 0 };
+            t_vector[i] = ((sum + error_term as u64 + message_term) % LATTICE_Q as u64) as u32;
+        }
+
+        LWECommitment { a_matrix_seed, t_vector }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionOutput {
     pub stealth_address: String,
     pub kyber_capsule: String,
     pub aes_vault: String,
-    pub lattice_commitment: LatticeCommitment, 
+    pub lattice_commitment: LWECommitment, // 💡 Changé !
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
-    pub pq_ring_inputs: Vec<String>, 
+    pub pq_ring_inputs: Vec<String>,
     pub pq_ring_signature: PQLatticeRingSignature,
-    pub commitment: LatticeCommitment, 
+    pub commitment: LWECommitment, // 💡 Changé !
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -293,25 +366,7 @@ struct SwapContract { pub buyer_btc_address: String, pub buyer_btc_pubkey: Strin
 #[derive(Serialize, Deserialize, Clone)]
 struct BatchResult { pub success: bool, pub message: String, pub clearing_price_sats: u64, pub total_volume_flames: u64, pub swaps: Vec<SwapContract> }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct LatticeCommitment {
-    pub c1: Vec<u64>,
-    pub c2: u64,
-}
 
-impl LatticeCommitment {
-    pub fn commit(amount: u64, blinding_factor: u64) -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let c1 = vec![
-            (blinding_factor * rng.gen_range(1..100)) % LATTICE_Q as u64,
-            (blinding_factor * rng.gen_range(1..100)) % LATTICE_Q as u64,
-            (blinding_factor * rng.gen_range(1..100)) % LATTICE_Q as u64,
-        ];
-        let c2 = (blinding_factor * 12345 + amount) % LATTICE_Q as u64;
-        LatticeCommitment { c1, c2 }
-    }
-}
 
 // ================= TAURI COMMANDS =================
 
@@ -416,14 +471,16 @@ fn encrypt_vault(password: String, keys_json_string: String) -> Result<(), Strin
     let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     
-    let ciphertext = cipher.encrypt(nonce, keys_json_string.as_bytes()).map_err(|_| "Erreur d'encryptage")?;
+    let ciphertext = cipher.encrypt(nonce, keys_json_string.as_bytes())
+        .map_err(|_| WattError::Crypto("Échec du chiffrement AES-256-GCM".to_string()))?;
     
     let mut final_data = Vec::new();
     final_data.extend_from_slice(&salt); 
     final_data.extend_from_slice(&nonce_bytes); 
     final_data.extend_from_slice(&ciphertext);
     
-    fs::write(VAULT_FILE, final_data).unwrap(); 
+    // 💡 Le `?` convertit automatiquement l'erreur std::io::Error en WattError::Io grâce à notre impl From !
+    fs::write(VAULT_FILE, final_data).map_err(WattError::from)?; 
     Ok(())
 }
 
@@ -432,8 +489,9 @@ async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
 
-    let file_data = fs::read(VAULT_FILE).map_err(|_| "Coffre introuvable.".to_string())?;
-    if file_data.len() < 28 { return Err("Fichier corrompu.".to_string()); }
+    // 💡 Disque blindé
+    let file_data = fs::read(VAULT_FILE).map_err(|e| WattError::Io(e))?;
+    if file_data.len() < 28 { return Err(WattError::Vault("Fichier corrompu ou incomplet.".to_string()).into()); }
 
     let salt = &file_data[0..16];
     let nonce_bytes = &file_data[16..28];
@@ -445,10 +503,14 @@ async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| "Mot de passe incorrect.".to_string())?;
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|_| WattError::Vault("Mot de passe incorrect ou coffre altéré.".to_string()))?;
     
-    let json_string = String::from_utf8(plaintext).map_err(|_| "Erreur UTF-8".to_string())?;
-    let keys: WalletKeys = serde_json::from_str(&json_string).map_err(|_| "Erreur de lecture du Keystore".to_string())?;
+    let json_string = String::from_utf8(plaintext)
+        .map_err(|_| WattError::Crypto("Erreur de décodage UTF-8 post-déchiffrement.".to_string()))?;
+        
+    let keys: WalletKeys = serde_json::from_str(&json_string)
+        .map_err(|e| WattError::Json(e))?;
 
     Ok(keys)
 }
@@ -620,9 +682,9 @@ async fn send_wattcoin(
     }
 
     let sk_bytes = hex::decode(&sender_kyber_secret_hex).unwrap_or_default();
-    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
+    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).map_err(|_| "Clé Kyber corrompue".to_string())?;
     
-    let mut selected_utxos: Vec<(u64, String, LatticeCommitment)> = Vec::new();
+    let mut selected_utxos: Vec<(u64, String, LWECommitment)> = Vec::new();
     let mut current_input_sum = 0u64;
 
     for tx in all_txs {
@@ -675,8 +737,11 @@ async fn send_wattcoin(
     }
 
     let change_amount = current_input_sum - required_total;
-
     let mut outputs = Vec::new();
+
+    // ==========================================
+    // OUTPUT 1 : LE DESTINATAIRE
+    // ==========================================
     let recipient_bytes = hex::decode(&recipient_kyber_hex).map_err(|_| "Adresse invalide".to_string())?;
     let bob_pk = kyber768::PublicKey::from_bytes(&recipient_bytes).map_err(|_| "Clé Kyber corrompue".to_string())?;
     let (alice_shared_secret, kyber_capsule_1) = kyber768::encapsulate(&bob_pk);
@@ -685,11 +750,13 @@ async fn send_wattcoin(
     let payload_1 = format!("{}|{}", amount_in_flames, hex::encode(otp_1));
     let aes_key_1 = Key::<Aes256Gcm>::from_slice(alice_shared_secret.as_bytes());
     let mut nonce_bytes_1 = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes_1);
-    let encrypted_data_1 = Aes256Gcm::new(aes_key_1).encrypt(Nonce::from_slice(&nonce_bytes_1), payload_1.as_bytes()).unwrap();
+    let encrypted_data_1 = Aes256Gcm::new(aes_key_1).encrypt(Nonce::from_slice(&nonce_bytes_1), payload_1.as_bytes()).map_err(|_| "Erreur AES".to_string())?;
     let mut final_vault_1 = nonce_bytes_1.to_vec(); final_vault_1.extend_from_slice(&encrypted_data_1);
 
-    let bf_1 = rand::thread_rng().gen_range(100..9999);
-    let commitment_1 = LatticeCommitment::commit(amount_in_flames, bf_1);
+    // 💡 LWE BLINDING FACTOR
+    let mut bf_1 = [0u32; LATTICE_DIM];
+    for val in bf_1.iter_mut() { *val = rand::thread_rng().gen_range(0..LATTICE_Q); }
+    let commitment_1 = LWECommitment::commit(amount_in_flames, bf_1);
 
     outputs.push(TransactionOutput {
         stealth_address: format!("pq_watt_{}", hex::encode(&otp_1[0..8])),
@@ -698,6 +765,9 @@ async fn send_wattcoin(
         lattice_commitment: commitment_1.clone(),
     });
 
+    // ==========================================
+    // OUTPUT 2 : LA MONNAIE RENDUE (CHANGE)
+    // ==========================================
     if change_amount > 0 {
         let my_pk_bytes = hex::decode(&sender_kyber_public_hex).unwrap();
         let my_pk = kyber768::PublicKey::from_bytes(&my_pk_bytes).unwrap();
@@ -710,15 +780,17 @@ async fn send_wattcoin(
         let encrypted_data_2 = Aes256Gcm::new(aes_key_2).encrypt(Nonce::from_slice(&nonce_bytes_2), payload_2.as_bytes()).unwrap();
         let mut final_vault_2 = nonce_bytes_2.to_vec(); final_vault_2.extend_from_slice(&encrypted_data_2);
 
-        let sum_inputs_c2 = selected_utxos.iter().map(|u| u.2.c2).sum::<u64>() % (LATTICE_Q as u64);
-        let fee_c2 = fee % (LATTICE_Q as u64);
-        let expected_outputs_sum = (sum_inputs_c2 + (LATTICE_Q as u64) - fee_c2) % (LATTICE_Q as u64);
-        let perfect_change_c2 = (expected_outputs_sum + (LATTICE_Q as u64) - commitment_1.c2) % (LATTICE_Q as u64);
+        // 💡 Équilibrage LWE
+        let sum_inputs_t0 = selected_utxos.iter().map(|u| u.2.t_vector[0] as u64).sum::<u64>() % (LATTICE_Q as u64);
+        let fee_t0 = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
+        let expected_outputs_sum = (sum_inputs_t0 + (LATTICE_Q as u64) - fee_t0) % (LATTICE_Q as u64);
+        let perfect_change_t0 = (expected_outputs_sum + (LATTICE_Q as u64) - commitment_1.t_vector[0] as u64) % (LATTICE_Q as u64);
 
-        let commitment_2 = LatticeCommitment {
-            c1: vec![rand::thread_rng().gen_range(0..LATTICE_Q as u64), rand::thread_rng().gen_range(0..LATTICE_Q as u64), rand::thread_rng().gen_range(0..LATTICE_Q as u64)],
-            c2: perfect_change_c2
-        };
+        let mut t_vector_2 = vec![0u32; LATTICE_DIM];
+        t_vector_2[0] = perfect_change_t0 as u32;
+        for i in 1..LATTICE_DIM { t_vector_2[i] = rand::thread_rng().gen_range(0..LATTICE_Q); }
+
+        let commitment_2 = LWECommitment { a_matrix_seed: [0u8; 32], t_vector: t_vector_2 };
 
         outputs.push(TransactionOutput {
             stealth_address: format!("pq_watt_{}", hex::encode(&otp_2[0..8])),
@@ -727,9 +799,9 @@ async fn send_wattcoin(
             lattice_commitment: commitment_2,
         });
     } else {
-        let sum_inputs_c2 = selected_utxos.iter().map(|u| u.2.c2).sum::<u64>() % (LATTICE_Q as u64);
-        let fee_c2 = fee % (LATTICE_Q as u64);
-        outputs[0].lattice_commitment.c2 = (sum_inputs_c2 + (LATTICE_Q as u64) - fee_c2) % (LATTICE_Q as u64);
+        let sum_inputs_t0 = selected_utxos.iter().map(|u| u.2.t_vector[0] as u64).sum::<u64>() % (LATTICE_Q as u64);
+        let fee_t0 = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
+        outputs[0].lattice_commitment.t_vector[0] = ((sum_inputs_t0 + (LATTICE_Q as u64) - fee_t0) % (LATTICE_Q as u64)) as u32;
     }
 
     let tx_data_to_sign = format!("{:?}{}", outputs, fee);
@@ -739,7 +811,6 @@ async fn send_wattcoin(
     let dilithium_secret = dilithium3::SecretKey::from_bytes(&sk_bytes).unwrap();
     let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
 
-    // 💡 Fetch des Decoys via TOR
     let decoy_res = tor_fetch("GET", "/get_decoys/10", None).await.unwrap_or_default();
     let real_decoys: Vec<String> = serde_json::from_str(&decoy_res).unwrap_or_default();
 
@@ -841,7 +912,6 @@ async fn send_wattcoin(
 
     let tx_type = match (htlc_hash_hex, htlc_timeout) {
         (Some(hash), Some(timeout)) => {
-            println!("🔒 CRÉATION D'UN CONTRAT HTLC LOCK ! Hash: {}", hash);
             TransactionType::HTLCLock { hash, timeout_block: timeout }
         },
         _ => TransactionType::Standard,
@@ -855,20 +925,19 @@ async fn send_wattcoin(
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
 
-    // 💡 Soumission via TOR
-    let tx_json = serde_json::to_string(&tx_pq).unwrap();
+    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
     let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
     use std::fs::OpenOptions;
     use std::io::Write;
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
         for utxo in &selected_utxos {
-            writeln!(file, "{}", utxo.1).unwrap();
+            let _ = writeln!(file, "{}", utxo.1);
         }
     }
     
     if tx_pq.tx_type == TransactionType::Standard {
-        Ok(format!("☢️ TX ZKP ENVOYÉE !\n\nInputs : {}\nOutputs : {}\nPoids : {} octets", selected_utxos.len(), tx_pq.outputs.len(), serde_json::to_string(&tx_pq).unwrap().len()))
+        Ok(format!("☢️ TX ZKP ENVOYÉE !\nInputs : {}\nOutputs : {}", selected_utxos.len(), tx_pq.outputs.len()))
     } else {
         Ok("🔒 CONTRAT HTLC DÉPLOYÉ ! Les fonds sont verrouillés sur le réseau Wattcoin.".to_string())
     }
@@ -895,9 +964,7 @@ async fn claim_wattcoin_swap(
 ) -> Result<String, String> {
     let secret_bytes = hex::decode(&secret).unwrap_or_default();
     let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-    if calculated_hash != hash {
-        return Err("❌ Le secret révélé par le DEX est un faux !".to_string());
-    }
+    if calculated_hash != hash { return Err("❌ Le secret révélé par le DEX est un faux !".to_string()); }
 
     let res_str = tor_fetch("GET", "/all_transactions", None).await?;
     let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
@@ -932,16 +999,22 @@ async fn claim_wattcoin_swap(
     let pk = kyber768::PublicKey::from_bytes(&recipient_bytes).unwrap();
     let (shared_secret, kyber_capsule) = kyber768::encapsulate(&pk);
 
-    let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
+    let total_locked_flames = (amount * 1_000_000_000.0) as u64; 
+    let fee: u64 = 1000;
+    if total_locked_flames <= fee { return Err("❌ Montant bloqué trop faible pour payer les frais réseau.".to_string()); }
+    let amount_to_receive = total_locked_flames - fee;
+
     let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
-    let payload = format!("{}|{}", amount_in_flames, hex::encode(otp));
+    let payload = format!("{}|{}", amount_to_receive, hex::encode(otp));
     
     let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
     let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).unwrap();
     let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
 
-    let out_commitment = LatticeCommitment::commit(amount_in_flames, 0);
+    let mut bf_claim = [0u32; LATTICE_DIM];
+    for val in bf_claim.iter_mut() { *val = rand::thread_rng().gen_range(0..LATTICE_Q); }
+    let out_commitment = LWECommitment::commit(amount_to_receive, bf_claim);
 
     let claim_tx = Transaction {
         tx_type: TransactionType::HTLCClaim { secret: secret.clone() },
@@ -954,15 +1027,16 @@ async fn claim_wattcoin_swap(
                 lattice_commitment: out_commitment,
             }
         ],
-        fee: 0,
+        fee, 
         dilithium_signature: hash.clone(), 
     };
 
-    let tx_json = serde_json::to_string(&claim_tx).unwrap();
+    let tx_json = serde_json::to_string(&claim_tx).map_err(|e| e.to_string())?;
     let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
-    Ok(format!("🎉 ATOMIC SWAP RÉUSSI ! Le réseau a validé votre Secret HTLC et débloqué {} WATT !", amount))
+    Ok(format!("🎉 ATOMIC SWAP RÉUSSI ! Le secret a débloqué les fonds (Frais réseau payés : {} Flames).", fee))
 }
+
 
 #[tauri::command]
 fn destroy_vault() -> Result<String, String> {

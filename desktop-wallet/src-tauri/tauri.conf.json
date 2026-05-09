@@ -11,12 +11,16 @@
   },
   "app": {
     "windows": [
-      {
-        "title": "Wattcoin-wallet",
-        "width": 1000,
-        "height": 600
-      }
-    ],
+        {
+          "title": "Wattcoin Wallet",
+          "width": 1200,    
+          "height": 800,      
+          "minWidth": 950, 
+          "minHeight": 650,
+          "resizable": true,
+          "fullscreen": false
+        }
+      ],
     "security": {
       "csp": null
     }
