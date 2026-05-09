@@ -9,14 +9,14 @@ use crate::WattError;
 
 const FLAME: u64 = 1_000_000_000;
 const MATURITY_BLOCKS: u64 = 3; 
-const EXPECTED_BLOCK_TIME: u64 = 120; 
+const EXPECTED_BLOCK_TIME: u64 = 600; 
 const INITIAL_REWARD: f64 = 50.0 * (FLAME as f64);    
 const DECAY_FACTOR: f64 = 0.999999;  
 const TAIL_EMISSION: u64 = 1 * FLAME; 
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
 
 // 💡 NOUVEAU : Changement de Dataset tous les 20 blocs pour tuer les ASICs !
-pub const EPOCH_BLOCKS: u64 = 20; 
+pub const EPOCH_BLOCKS: u64 = 51; 
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
@@ -414,15 +414,33 @@ impl Blockchain {
     pub fn update_target(&mut self) {
         let current_len = self.chain.len(); 
         if current_len < 2 { return; }
-        let previous_block = &self.chain[current_len - 2];
-        let last_block = &self.chain[current_len - 1];
-        let mut time_taken = last_block.header.timestamp - previous_block.header.timestamp;
-        if time_taken > (EXPECTED_BLOCK_TIME * 5) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 5) as i64; }
-        if time_taken <= 0 { time_taken = 1; } 
+
+        let window_size = 17; // 💡 Fenêtre glissante (Inspiré de Monero/Zcash)
+        let start_idx = if current_len > window_size { current_len - window_size } else { 0 };
+        
+        let mut total_time = 0;
+        let mut num_blocks = 0;
+        
+        for i in (start_idx + 1)..current_len {
+            let prev = &self.chain[i - 1];
+            let curr = &self.chain[i];
+            let mut time_taken = curr.header.timestamp - prev.header.timestamp;
+            
+            // 🛡️ Bornes de sécurité : Empêche un pirate de truquer son horloge pour faire chuter la difficulté
+            if time_taken > (EXPECTED_BLOCK_TIME * 3) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 3) as i64; }
+            if time_taken <= 0 { time_taken = 1; } 
+            
+            total_time += time_taken as u64;
+            num_blocks += 1;
+        }
+        
+        if num_blocks == 0 { return; }
+        let avg_time = total_time / num_blocks;
 
         let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
-        let dampening = 4; 
-        let damped_time = (time_taken as u64 + (EXPECTED_BLOCK_TIME * (dampening - 1))) / dampening;
+        let dampening = 3; // Réaction agressive pour les Hashrate Spikes
+        let damped_time = (avg_time + (EXPECTED_BLOCK_TIME * (dampening - 1))) / dampening;
+        
         self.target = &self.target * damped_time / EXPECTED_BLOCK_TIME;
         if self.target > max_target { self.target = max_target; }
     }
@@ -430,17 +448,30 @@ impl Blockchain {
     pub fn recalculate_target_from_scratch(&mut self) {
         let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
         let mut current_target = &max_target >> INITIAL_DIFFICULTY_SHIFT; 
+        let window_size = 17;
+        
         for i in 2..=self.chain.len() {
-            let previous_block = &self.chain[i - 2];
-            let last_block = &self.chain[i - 1];
-            let mut time_taken = last_block.header.timestamp - previous_block.header.timestamp;
-            if time_taken > (EXPECTED_BLOCK_TIME * 5) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 5) as i64; }
-            if time_taken <= 0 { time_taken = 1; } 
-
-            let dampening = 4; 
-            let damped_time = (time_taken as u64 + (EXPECTED_BLOCK_TIME * (dampening - 1))) / dampening;
-            current_target = &current_target * damped_time / EXPECTED_BLOCK_TIME;
-            if current_target > max_target { current_target = max_target.clone(); }
+            let start_idx = if i > window_size { i - window_size } else { 0 };
+            let mut total_time = 0;
+            let mut num_blocks = 0;
+            
+            for j in (start_idx + 1)..i {
+                let prev = &self.chain[j - 1];
+                let curr = &self.chain[j];
+                let mut time_taken = curr.header.timestamp - prev.header.timestamp;
+                if time_taken > (EXPECTED_BLOCK_TIME * 3) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 3) as i64; }
+                if time_taken <= 0 { time_taken = 1; } 
+                total_time += time_taken as u64;
+                num_blocks += 1;
+            }
+            
+            if num_blocks > 0 {
+                let avg_time = total_time / num_blocks;
+                let dampening = 3; 
+                let damped_time = (avg_time + (EXPECTED_BLOCK_TIME * (dampening - 1))) / dampening;
+                current_target = &current_target * damped_time / EXPECTED_BLOCK_TIME;
+                if current_target > max_target { current_target = max_target.clone(); }
+            }
         }
         self.target = current_target;
     }
@@ -449,19 +480,31 @@ impl Blockchain {
         let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
         let mut current_target = &max_target >> INITIAL_DIFFICULTY_SHIFT;
         let mut total_work = num_bigint::BigUint::from(0u32);
+        let window_size = 17;
 
         for i in 0..chain_to_measure.len() {
             if i >= 2 {
-                let previous_block = &chain_to_measure[i - 2];
-                let last_block = &chain_to_measure[i - 1];
-                let mut time_taken = last_block.header.timestamp - previous_block.header.timestamp;
-                if time_taken > (EXPECTED_BLOCK_TIME * 5) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 5) as i64; }
-                if time_taken <= 0 { time_taken = 1; } 
-
-                let dampening = 4; 
-                let damped_time = (time_taken as u64 + (EXPECTED_BLOCK_TIME * (dampening - 1))) / dampening;
-                current_target = &current_target * damped_time / EXPECTED_BLOCK_TIME;
-                if current_target > max_target { current_target = max_target.clone(); }
+                let start_idx = if i > window_size { i - window_size } else { 0 };
+                let mut total_time = 0;
+                let mut num_blocks = 0;
+                
+                for j in (start_idx + 1)..i {
+                    let prev = &chain_to_measure[j - 1];
+                    let curr = &chain_to_measure[j];
+                    let mut time_taken = curr.header.timestamp - prev.header.timestamp;
+                    if time_taken > (EXPECTED_BLOCK_TIME * 3) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 3) as i64; }
+                    if time_taken <= 0 { time_taken = 1; } 
+                    total_time += time_taken as u64;
+                    num_blocks += 1;
+                }
+                
+                if num_blocks > 0 {
+                    let avg_time = total_time / num_blocks;
+                    let dampening = 3; 
+                    let damped_time = (avg_time + (EXPECTED_BLOCK_TIME * (dampening - 1))) / dampening;
+                    current_target = &current_target * damped_time / EXPECTED_BLOCK_TIME;
+                    if current_target > max_target { current_target = max_target.clone(); }
+                }
             }
             total_work += &max_target / &current_target;
         }

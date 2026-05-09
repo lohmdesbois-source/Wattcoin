@@ -16,6 +16,19 @@ use api::SharedPool;
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
 
+// ===================================================================
+// 📦 CONTENEUR UNSAFE POUR LE WARM-UP RANDOMX
+// RandomX utilise des pointeurs C. Rust refuse de les changer de thread.
+// En implémentant 'Send' de manière 'unsafe', on force l'autorisation.
+// C'est sans danger ici car on transfère uniquement l'appartenance (Ownership).
+// ===================================================================
+struct WarmUpContainer {
+    cache: RandomXCache,
+    dataset: RandomXDataset,
+}
+unsafe impl Send for WarmUpContainer {}
+unsafe impl Sync for WarmUpContainer {}
+
 // ================= GESTION DES ERREURS (PRO-LEVEL) =================
 
 
@@ -129,7 +142,6 @@ async fn main() {
         println!("\n⚙️  Initialisation du moteur RandomX...");
         let start_rx = std::time::Instant::now();
         
-        // 💡 NOUVEAU : On gère l'époque dynamique !
         let flags = RandomXFlag::get_recommended_flags();
         let mut current_epoch = 0;
         let mut seed_hash = shared_chain.lock().unwrap().get_epoch_seed(1);
@@ -142,15 +154,21 @@ async fn main() {
         println!("✅ RandomX prêt en {:.2?} !", start_rx.elapsed());
 
         println!("\n⛏️  Début de l'extraction pour l'adresse : {}...", miner_address);
+    
+        // 💡 NOTRE BOÎTE BLINDÉE POUR LE PRÉ-CALCUL EN ARRIÈRE-PLAN
+        let next_dataset: Arc<Mutex<Option<WarmUpContainer>>> = Arc::new(Mutex::new(None));
+        let mut warming_up_epoch = current_epoch;
+    
         loop {
-
             let (mut candidate_block, target) = {
                 let mut chain = shared_chain.lock().unwrap();
                 let pending_txs = mempool.lock().unwrap().clone();
                 chain.prepare_block_template(pending_txs, &miner_address)
             };
 
-            // 💡 VÉRIFICATION DE L'ÉPOQUE : Si on franchit le cap, on détruit les ASICs !
+            // ==========================================================
+            // ⚙️ 1. LE CHANGEMENT D'ÉPOQUE INSTANTANÉ (Zéro délai !)
+            // ==========================================================
             let target_epoch = (candidate_block.header.index - 1) / EPOCH_BLOCKS;
             if target_epoch > current_epoch {
                 println!("\n==========================================================");
@@ -160,15 +178,52 @@ async fn main() {
                 
                 seed_hash = shared_chain.lock().unwrap().get_epoch_seed(candidate_block.header.index);
 
-                println!("⏳ Recalcul du Dataset de 2 Go pour éjecter les ASICs... (Cela prendra ~30s)");
-                cache = RandomXCache::new(flags, seed_hash.as_bytes()).unwrap();
-                dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
-                vm = RandomXVM::new(flags, Some(cache.clone()), Some(dataset.clone())).unwrap();
-                println!("✅ Nouvelle Ère prête ! Le réseau est sécurisé.");
+                // On ouvre la boîte blindée pour récupérer le travail du thread d'arrière-plan
+                let precalculated = next_dataset.lock().unwrap().take();
+                
+                if let Some(warm_data) = precalculated {
+                    println!("⚡ [WARM-UP] Utilisation du Dataset précalculé en RAM ! Zéro temps d'arrêt pour le mineur.");
+                    cache = warm_data.cache;
+                    dataset = warm_data.dataset;
+                    vm = RandomXVM::new(flags, Some(cache.clone()), Some(dataset.clone())).unwrap();
+                } else {
+                    println!("⏳ Pas de cache prêt (serveur fraîchement démarré), calcul synchrone... (~30s)");
+                    cache = RandomXCache::new(flags, seed_hash.as_bytes()).unwrap();
+                    dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
+                    vm = RandomXVM::new(flags, Some(cache.clone()), Some(dataset.clone())).unwrap();
+                }
+                println!("✅ Nouvelle Ère prête ! Le réseau est 100% sécurisé.");
+            }
+
+            // ==========================================================
+            // 🔥 2. LE DÉCLENCHEUR DE WARM-UP ASYNCHRONE
+            // ==========================================================
+            let blocks_until_next = EPOCH_BLOCKS - ((candidate_block.header.index - 1) % EPOCH_BLOCKS);
+            let next_epoch = current_epoch + 1;
+            
+            // 💡 À 10 blocs de la fin de l'époque, on lance le thread fantôme !
+            if blocks_until_next <= 10 && warming_up_epoch != next_epoch {
+                warming_up_epoch = next_epoch;
+                let next_seed = { shared_chain.lock().unwrap().get_epoch_seed(candidate_block.header.index + blocks_until_next + 1) };
+                let nd_clone = Arc::clone(&next_dataset);
+                
+                println!("\n🔥 [WARM-UP] Transition imminente ({} blocs). Début de la compilation en arrière-plan du Dataset {}...", blocks_until_next, next_epoch);
+                
+                // Ce thread tourne sur un autre cœur du CPU, le mineur principal ne s'arrête PAS !
+                tokio::task::spawn_blocking(move || {
+                    let flags = RandomXFlag::get_recommended_flags();
+                    if let Ok(warm_cache) = RandomXCache::new(flags, next_seed.as_bytes()) {
+                        if let Ok(warm_dataset) = RandomXDataset::new(flags, warm_cache.clone(), 0) {
+                            let container = WarmUpContainer { cache: warm_cache, dataset: warm_dataset };
+                            *nd_clone.lock().unwrap() = Some(container);
+                            println!("✅ [WARM-UP TERMINE] Dataset {} chargé en RAM. Prêt pour la bascule !", next_epoch);
+                        }
+                    }
+                });
             }
 
             let mut mined = false;
-
+            
             loop {
                 if candidate_block.header.nonce % 2000 == 0 {
                     let chain = shared_chain.lock().unwrap();

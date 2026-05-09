@@ -4,13 +4,14 @@ use crate::lattice::LWECommitment;
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;   
 
-// 💡 NOUVEAU : Le typage strict des transactions !
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransactionType {
     Coinbase,
     Standard,
-    HTLCLock { hash: String, timeout_block: u64 }, // Bloque les fonds avec un Hash
-    HTLCClaim { secret: String },                  // Débloque les fonds avec le Secret
+    HTLCLock { hash: String, timeout_block: u64 }, // Bloque les fonds
+    HTLCClaim { secret: String },                  // Débloque avec le Secret
+    HTLCRefund { hash: String },                   // 💡 NOUVEAU : Récupère les fonds si délai expiré
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +87,18 @@ impl Transaction {
                 return false;
             }
             // Le Lock suit ensuite les règles ZKP normales ci-dessous pour cacher le montant bloqué
+        }
+		
+		if let TransactionType::HTLCRefund { hash } = &self.tx_type {
+            if hash.len() != 64 { 
+                println!("🛑 REJET HTLC : Le Hash du contrat Refund est invalide.");
+                return false; 
+            }
+            if self.inputs.is_empty() { 
+                println!("🛑 REJET HTLC : Aucun contrat ciblé.");
+                return false; 
+            }
+            return true; // Si la structure est bonne, l'API vérifiera le chrono
         }
 
         // =================================================================

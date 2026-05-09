@@ -90,27 +90,72 @@ pub async fn start_api_server(
         .and(warp::path("send_tx"))
         .and(warp::body::json())
         .and(mempool_filter.clone())
+        .and(chain_filter.clone()) // 💡 AJOUT : On donne l'accès à la Blockchain pour vérifier l'historique !
         .and(active_peers_filter.clone()) 
-        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
-            if tx.is_valid() {
-                let mut pool = mempool.lock().unwrap();
-                // 💡 FIX : On compare le 1er output
-                if !pool.iter().any(|t| t.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule) {
-                    pool.push(tx.clone());
-                    println!("📥 [API] Nouvelle TX ajoutée au Mempool !");
-
-                    let tx_clone = tx.clone();
-                    tokio::spawn(async move {
-                        crate::network::broadcast_transaction(tx_clone, active_peers).await;
-                    });
-                    
-                    warp::reply::with_status(warp::reply::json(&"✅ TX acceptée"), warp::http::StatusCode::OK)
-                } else {
-                    warp::reply::with_status(warp::reply::json(&"⚠️ Déjà dans le mempool"), warp::http::StatusCode::BAD_REQUEST)
-                }
-            } else {
-                warp::reply::with_status(warp::reply::json(&"❌ Cryptographie invalide !"), warp::http::StatusCode::BAD_REQUEST)
+        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, chain_arc: Arc<Mutex<Blockchain>>, active_peers: crate::network::ActivePeers| {
+            
+            // 1. Vérification Cryptographique Pure (Signatures, LWE Commitments)
+            if !tx.is_valid() {
+                return warp::reply::with_status(warp::reply::json(&"❌ Cryptographie invalide !"), warp::http::StatusCode::BAD_REQUEST);
             }
+
+            // 2. 🛡️ LE PARE-FEU ANTI DOUBLE-DÉPENSE
+            if tx.tx_type != crate::transaction::TransactionType::Coinbase {
+                let chain_lock = chain_arc.lock().unwrap();
+                let pool_lock = mempool.lock().unwrap();
+
+                for input in &tx.inputs {
+                    let ki = &input.pq_ring_signature.key_image;
+                    
+                    // A. Est-ce que cette pièce a DÉJÀ été minée et dépensée dans le passé ?
+                    if chain_lock.spent_key_images.contains(ki) {
+                        println!("🛑 [PARE-FEU] Double-dépense rejetée (Déjà dans la blockchain) : {}", ki);
+                        return warp::reply::with_status(warp::reply::json(&"❌ Fonds déjà dépensés !"), warp::http::StatusCode::BAD_REQUEST);
+                    }
+                    
+                    // B. Est-ce qu'un pirate essaie de spammer le mempool avec la même pièce simultanément ?
+                    if pool_lock.iter().any(|m_tx| m_tx.inputs.iter().any(|m_in| &m_in.pq_ring_signature.key_image == ki)) {
+                        println!("🛑 [PARE-FEU] Double-dépense rejetée (Déjà dans le mempool) : {}", ki);
+                        return warp::reply::with_status(warp::reply::json(&"❌ Transaction déjà en attente !"), warp::http::StatusCode::BAD_REQUEST);
+                    }
+                }
+            }
+			
+			// 🛡️ PARE-FEU HTLC REFUND (Vérification du Timelock)
+            if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
+                let chain_lock = chain_arc.lock().unwrap();
+                let current_height = chain_lock.chain.len() as u64;
+                let mut timeout_passed = false;
+                
+                for block in &chain_lock.chain {
+                    for past_tx in &block.transactions {
+                        if let crate::transaction::TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
+                            if lock_hash == hash {
+                                if current_height >= *timeout_block { timeout_passed = true; }
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if !timeout_passed { 
+                    println!("🛑 [PARE-FEU] Tentative de Refund prématurée ! (Contrat: {})", hash);
+                    return warp::reply::with_status(warp::reply::json(&"⏳ Le délai (Timelock) n'est pas encore expiré !"), warp::http::StatusCode::BAD_REQUEST); 
+                }
+            }
+
+            // 3. Si on arrive ici, la transaction est mathématiquement saine ET unique !
+            let mut pool = mempool.lock().unwrap();
+            pool.push(tx.clone());
+            println!("📥 [API] Nouvelle TX ZKP ajoutée au Mempool !");
+
+            // 4. On hurle la transaction sur le réseau Tor (Gossip Protocol)
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                crate::network::broadcast_transaction(tx_clone, active_peers).await;
+            });
+            
+            warp::reply::with_status(warp::reply::json(&"✅ TX acceptée par le réseau"), warp::http::StatusCode::OK)
         });
     
     // 2. ROUTE : HISTORIQUE POUR LE WALLET

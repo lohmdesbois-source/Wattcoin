@@ -358,7 +358,7 @@ pub struct Transaction {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub btc_pubkey: String, pub watt_address: String }
+struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub btc_pubkey: String, pub watt_address: String, pub expires_at: i64 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SwapContract { pub buyer_btc_address: String, pub buyer_btc_pubkey: String, pub seller_watt_address: String, pub seller_btc_pubkey: String, pub watt_amount_flames: u64, pub btc_amount_sats: u64, pub htlc_secret: String, pub htlc_hash: String }
@@ -384,6 +384,14 @@ async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: 
     let mut rand_bytes = [0u8; 4]; rand::thread_rng().fill_bytes(&mut rand_bytes);
     let amount_flames = (amount * 1_000_000_000.0) as u64; 
     let price_sats = (price * 100_000_000.0) as u64; 
+    
+    // 💡 On utilise l'horloge native de Rust, pas besoin de librairie externe !
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+        
+    let expires_at = now + 7200; // L'ordre expire dans 2 Heures !
 
     let order_data = serde_json::json!({
         "id": hex::encode(rand_bytes),
@@ -392,7 +400,8 @@ async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: 
         "price_sats": price_sats,        
         "btc_address": btc_address,
         "btc_pubkey": btc_pubkey,
-        "watt_address": watt_address
+        "watt_address": watt_address,
+        "expires_at": expires_at 
     });
 
     tor_fetch("POST", "/order", Some(order_data.to_string())).await?;

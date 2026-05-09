@@ -457,9 +457,7 @@ function App() {
               <div className="trading-pair" style={{display: "flex", alignItems: "center", gap: "10px"}}><Zap color="var(--primary)"/> WATT / BTC <Bitcoin color="var(--btc-color)"/></div>
               <div className="batch-timer">{Math.floor(countdown / 60).toString().padStart(2, '0')}:{(countdown % 60).toString().padStart(2, '0')}</div>
             </div>
-            <div style={{ marginBottom: "20px" }}>
-               <button onClick={() => setCountdown(1)} className="btn-secondary">⏩ Forcer Résolution du Batch</button>
-            </div>
+            
             <div className="dex-grid">
               <div className="order-form">
                 <h3>Placer un ordre furtif</h3>
