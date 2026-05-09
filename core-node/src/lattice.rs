@@ -49,18 +49,30 @@ impl LWECommitment {
     }
 
     /// ⚖️ Validation Homomorphe (Vérifie Input_Sum == Output_Sum) (Nœud)
-    pub fn verify_balance(inputs: &[LWECommitment], outputs: &[LWECommitment], fee: u64) -> bool {
-        let mut sum_in = 0u64;
-        let mut sum_out = 0u64;
-        
-        for i in inputs { sum_in = (sum_in + i.t_vector[0] as u64) % LATTICE_Q as u64; }
-        for o in outputs { sum_out = (sum_out + o.t_vector[0] as u64) % LATTICE_Q as u64; }
-        
-        let fee_encoded = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
-        let expected_out = (sum_out + fee_encoded) % LATTICE_Q as u64;
+	pub fn verify_balance(inputs: &[LWECommitment], outputs: &[LWECommitment], fee: u64) -> bool {
+		let mut sum_in = 0u64;
+		let mut sum_out = 0u64;
+		
+		// On additionne les composantes t[0] (là où le message est encodé)
+		for i in inputs { sum_in = (sum_in + i.t_vector[0] as u64) % LATTICE_Q as u64; }
+		for o in outputs { sum_out = (sum_out + o.t_vector[0] as u64) % LATTICE_Q as u64; }
+		
+		// Le montant des frais est encodé de la même manière que les messages (m * Q/2)
+		let fee_encoded = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
+		let expected_out = (sum_out + fee_encoded) % LATTICE_Q as u64;
 
-        // Tolérance d'erreur inhérente aux Lattices (LWE Noise)
-        let diff = if sum_in > expected_out { sum_in - expected_out } else { expected_out - sum_in };
-        diff < 50 // Le bruit s'accumule, mais reste très petit par rapport à Q/2
-    }
-}
+		// Calcul de la distance sur le cercle du modulo Q
+		let diff = if sum_in > expected_out {
+			let d = sum_in - expected_out;
+			std::cmp::min(d, LATTICE_Q as u64 - d)
+		} else {
+			let d = expected_out - sum_in;
+			std::cmp::min(d, LATTICE_Q as u64 - d)
+		};
+
+		// Tolérance : On accepte une dérive liée au bruit e. 
+		// Plus il y a d'inputs/outputs, plus le bruit augmente.
+		let noise_threshold = (inputs.len() + outputs.len()) as u64 * 10; 
+		diff < noise_threshold
+	}
+ }

@@ -343,73 +343,85 @@ impl Blockchain {
         false
     }
     
-    pub fn validate_and_add_external_block(&mut self, block: Block) -> Result<(), String> {
-        let last_block = self.chain.last().unwrap();
-        if block.header.index != last_block.header.index + 1 { return Err("Index de bloc invalide.".to_string()); }
-        if block.header.previous_hash != last_block.header.hash { return Err("Rupture de la chaîne.".to_string()); }
+	pub fn validate_and_add_external_block(&mut self, block: Block) -> Result<(), String> {
+		let last_block = self.chain.last().unwrap();
+		
+		// 1. Vérifications de base de la structure
+		if block.header.index != last_block.header.index + 1 { return Err("Index de bloc invalide.".to_string()); }
+		if block.header.previous_hash != last_block.header.hash { return Err("Rupture de la chaîne.".to_string()); }
 
-        let flags = RandomXFlag::get_recommended_flags();
-        // 💡 FIX : Le Tribunal charge le Dataset de la bonne époque pour juger le bloc !
-        let seed = self.get_epoch_seed(block.header.index);
-        let cache = RandomXCache::new(flags, seed.as_bytes()).map_err(|_| "Erreur Cache")?;
-        let vm = RandomXVM::new(flags, Some(cache), None).map_err(|_| "Erreur VM")?;
+		// 2. Le Tribunal RandomX (Vérification du PoW)
+		let flags = randomx_rs::RandomXFlag::get_recommended_flags();
+		let seed = self.get_epoch_seed(block.header.index);
+		let cache = randomx_rs::RandomXCache::new(flags, seed.as_bytes()).map_err(|_| "Erreur Cache")?;
+		let vm = randomx_rs::RandomXVM::new(flags, Some(cache), None).map_err(|_| "Erreur VM")?;
 
-        let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
-        let hash_bytes = vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur calcul")?;
-        
-        if block.header.hash != hex::encode(&hash_bytes) { return Err("Hash frauduleux.".to_string()); }
+		let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
+		let hash_bytes = vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur calcul")?;
+		
+		if block.header.hash != hex::encode(&hash_bytes) { return Err("Hash frauduleux.".to_string()); }
 
-        let hash_bigint = BigUint::parse_bytes(block.header.hash.as_bytes(), 16).unwrap_or_default();
-        if hash_bigint > self.target { return Err("Preuve de travail insuffisante.".to_string()); }
+		let hash_bigint = num_bigint::BigUint::parse_bytes(block.header.hash.as_bytes(), 16).unwrap_or_default();
+		if hash_bigint > self.target { return Err("Preuve de travail insuffisante.".to_string()); }
 
-        let mut coinbase_count = 0;
-        let mut block_key_images = HashSet::new(); 
+		// --- LOGIQUE DE CONSENSUS ÉTENDUE ---
+		let mut coinbase_count = 0;
+		let mut total_block_fees = 0u64;
+		let mut block_key_images = HashSet::new();
 
-        for tx in &block.transactions {
-            if !tx.is_valid() { return Err("Signature invalide.".to_string()); }
+		// Calcul de la récompense théorique attendue (basée sur ta formule decay)
+		let current_height = block.header.index;
+		let mut expected_subsidy = (INITIAL_REWARD * DECAY_FACTOR.powf(current_height as f64)) as u64;
+		if expected_subsidy < TAIL_EMISSION { expected_subsidy = TAIL_EMISSION; }
 
-            if tx.tx_type == TransactionType::Coinbase {
-                coinbase_count += 1;
-                if tx.outputs.is_empty() || !tx.outputs[0].kyber_capsule.starts_with("COINBASE_CAPSULE") { 
-                    return Err("Montant Coinbase illégal.".to_string());
-                }
-            } else {
-                for input in &tx.inputs {
-                    for input_ref in &input.pq_ring_inputs {
-                        for (height, past_block) in self.chain.iter().enumerate() {
-                            if let Some(source_tx) = past_block.transactions.iter().find(|t| t.outputs.iter().any(|o| &o.stealth_address == input_ref)) {
-                                if source_tx.tx_type == TransactionType::Coinbase {
-                                    let age = block.header.index - (height as u64);
-                                    if age < MATURITY_BLOCKS {
-                                        return Err(format!("Fonds immatures (Âge: {} blocs).", age));
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
+		// Premier passage : On calcule les frais totaux et on valide les TX standards
+		for tx in &block.transactions {
+			if tx.tx_type == TransactionType::Coinbase {
+				coinbase_count += 1;
+				continue;
+			}
 
-                    if self.spent_key_images.contains(&input.pq_ring_signature.key_image) {
-                        return Err(format!("Double dépense !"));
-                    }
-                    if !block_key_images.insert(input.pq_ring_signature.key_image.clone()) {
-                        return Err("Double dépense simultanée !".to_string());
-                    }
-                }
-            }
-        }
+			// A. Vérification de la validité intrinsèque (ZKP / Ring / LWE)
+			if !tx.is_valid() { return Err("Signature ou preuve ZKP invalide.".to_string()); }
 
-        if coinbase_count != 1 { return Err("Il faut exactement UNE transaction Coinbase.".to_string()); }
+			// B. Vérification mathématique de la non-création de monnaie (LWE Balance)
+			let in_commitments: Vec<_> = tx.inputs.iter().map(|i| i.commitment.clone()).collect();
+			let out_commitments: Vec<_> = tx.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
+			if !crate::lattice::LWECommitment::verify_balance(&in_commitments, &out_commitments, tx.fee) {
+				return Err("Déséquilibre monétaire détecté dans une transaction !".to_string());
+			}
 
-        for ki in block_key_images { self.spent_key_images.insert(ki); }
+			// C. Anti-Double Dépense
+			for input in &tx.inputs {
+				if self.spent_key_images.contains(&input.pq_ring_signature.key_image) || 
+				   !block_key_images.insert(input.pq_ring_signature.key_image.clone()) {
+					return Err("Tentative de double-dépense détectée !".to_string());
+				}
+			}
+			total_block_fees += tx.fee;
+		}
 
-        println!("✅ Bloc {} validé ! Équation ZKP respectée. Identités protégées.", block.header.index);
-        self.chain.push(block);
-        self.prune_old_signatures(); 
-        self.update_target(); 
+		if coinbase_count != 1 { return Err("Un bloc doit contenir exactement une Coinbase.".to_string()); }
 
-        Ok(())
-    }
+		// Deuxième passage : On valide la Coinbase (Reward + Fees)
+		let coinbase_tx = &block.transactions[0];
+		if coinbase_tx.tx_type != TransactionType::Coinbase { return Err("La première TX doit être la Coinbase.".to_string()); }
+		
+		// Extraction du montant réel miné (stocké dans l'AES Vault de la Coinbase)
+		let actual_reward: u64 = coinbase_tx.outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
+		if actual_reward > (expected_subsidy + total_block_fees) {
+			return Err(format!("Inflation illégale ! Max attendu: {}", expected_subsidy + total_block_fees));
+		}
+
+		// Si tout est OK, on met à jour l'état
+		for ki in block_key_images { self.spent_key_images.insert(ki); }
+		self.chain.push(block);
+		self.prune_old_signatures();
+		self.update_target();
+
+		println!("✅ Bloc {} validé. Masse monétaire intègre.", current_height);
+		Ok(())
+	}
     
     pub fn update_target(&mut self) {
         let current_len = self.chain.len(); 

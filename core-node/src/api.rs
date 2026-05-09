@@ -92,12 +92,26 @@ pub async fn start_api_server(
         .and(mempool_filter.clone())
         .and(chain_filter.clone()) // 💡 AJOUT : On donne l'accès à la Blockchain pour vérifier l'historique !
         .and(active_peers_filter.clone()) 
-        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, chain_arc: Arc<Mutex<Blockchain>>, active_peers: crate::network::ActivePeers| {
-            
-            // 1. Vérification Cryptographique Pure (Signatures, LWE Commitments)
-            if !tx.is_valid() {
-                return warp::reply::with_status(warp::reply::json(&"❌ Cryptographie invalide !"), warp::http::StatusCode::BAD_REQUEST);
-            }
+		.map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, chain_arc: Arc<Mutex<Blockchain>>, active_peers: crate::network::ActivePeers| {
+			
+			// 1. Protection Anti-Poussière (Min Fee : 1000 Flames)
+			if tx.fee < 1000 && tx.tx_type != crate::transaction::TransactionType::Coinbase {
+				return warp::reply::with_status(warp::reply::json(&"❌ Frais de réseau insuffisants (Min: 1000)"), warp::http::StatusCode::BAD_REQUEST);
+			}
+
+			// 2. Limite de taille du Mempool
+			{
+				let pool_check = mempool.lock().unwrap();
+				if pool_check.len() >= 2000 {
+					return warp::reply::with_status(warp::reply::json(&"❌ Réseau saturé, réessayez plus tard"), warp::http::StatusCode::SERVICE_UNAVAILABLE);
+				}
+			}
+
+			// 3. Vérification Cryptographique Pure
+			if !tx.is_valid() {
+				return warp::reply::with_status(warp::reply::json(&"❌ Preuve ZKP ou signature invalide"), warp::http::StatusCode::BAD_REQUEST);
+			}
+
 
             // 2. 🛡️ LE PARE-FEU ANTI DOUBLE-DÉPENSE
             if tx.tx_type != crate::transaction::TransactionType::Coinbase {
