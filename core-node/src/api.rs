@@ -19,6 +19,7 @@ pub struct Order {
     pub btc_address: String,
     pub btc_pubkey: String, 
     pub watt_address: String,
+	pub expires_at: i64,
 }
 
 pub async fn start_api_server(
