@@ -4,14 +4,27 @@ use crate::lattice::LWECommitment;
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;   
 
+// Le contrat est maintenant au cœur de la blockchain !
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwapContract {
+    pub buyer_btc_address: String,
+    pub buyer_btc_pubkey: String,
+    pub seller_watt_address: String,
+    pub seller_btc_pubkey: String,
+    pub watt_amount_flames: u64,
+    pub btc_amount_sats: u64,
+    pub htlc_secret: String,
+    pub htlc_hash: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransactionType {
     Coinbase,
     Standard,
-    HTLCLock { hash: String, timeout_block: u64 }, // Bloque les fonds
-    HTLCClaim { secret: String },                  // Débloque avec le Secret
-    HTLCRefund { hash: String },                   // 💡 NOUVEAU : Récupère les fonds si délai expiré
+    HTLCLock { hash: String, timeout_block: u64 }, 
+    HTLCClaim { secret: String },                  
+    HTLCRefund { hash: String },                   
+    DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> }, // 💡 NOUVEAU : LE DEX ON-CHAIN
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,7 +52,7 @@ pub struct TransactionOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    pub tx_type: TransactionType, // 💡 FINI le 'is_coinbase' booléen !
+    pub tx_type: TransactionType, 
     pub inputs: Vec<TransactionInput>,  
     pub outputs: Vec<TransactionOutput>, 
     pub fee: u64,                     
@@ -48,7 +61,8 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn is_valid(&self) -> bool {
-        if self.tx_type == TransactionType::Coinbase || self.dilithium_signature == "PRUNED" { 
+        // 💡 Les transactions DexSettlement sont générées par les mineurs, pas besoin de ZKP
+        if self.tx_type == TransactionType::Coinbase || self.dilithium_signature == "PRUNED" || matches!(self.tx_type, TransactionType::DexSettlement { .. }) { 
             return true; 
         }
 
@@ -56,49 +70,23 @@ impl Transaction {
         // 🔐 1. LE TRIBUNAL DES CONTRATS INTELLIGENTS (HTLC)
         // =================================================================
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-            if secret.is_empty() { 
-                println!("🛑 REJET HTLC : Le secret est vide !");
-                return false; 
-            }
-            
-            // On vérifie que la transaction tente bien de dépenser un UTXO
-            if self.inputs.is_empty() {
-                println!("🛑 REJET HTLC : Aucune pièce bloquée n'est ciblée en Input.");
-                return false;
-            }
+            if secret.is_empty() { return false; }
+            if self.inputs.is_empty() { return false; }
 
-            // On vérifie le contrat mathématique
             let secret_bytes = hex::decode(secret).unwrap_or_default();
             let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
 
-            // Pour valider le contrat, le secret révélé DOIT correspondre au Vault (Hash) 
-            // stocké dans l'UTXO précédent (qu'on a récupéré lors de la création de la Tx).
-            // Le DEX inscrira le hash du lock ciblé dans 'dilithium_signature' pour le contrôle
-            if calculated_hash != self.dilithium_signature {
-                println!("🛑 REJET HTLC FATAL : Le secret révélé '{}' ne produit pas le Hash d'origine ! Le voleur est repoussé.", secret);
-                return false;
-            }
-            return true; // Le contrat est rempli ! Pas besoin du ZKP standard pour un Claim direct.
+            if calculated_hash != self.dilithium_signature { return false; }
+            return true; 
         }
 
         if let TransactionType::HTLCLock { hash, timeout_block: _ } = &self.tx_type {
-            if hash.len() != 64 { // Un hash Blake3 fait 64 caractères hexadécimaux
-                println!("🛑 REJET HTLC : Le Hash du contrat est invalide.");
-                return false;
-            }
-            // Le Lock suit ensuite les règles ZKP normales ci-dessous pour cacher le montant bloqué
+            if hash.len() != 64 { return false; }
         }
-		
-		if let TransactionType::HTLCRefund { hash } = &self.tx_type {
-            if hash.len() != 64 { 
-                println!("🛑 REJET HTLC : Le Hash du contrat Refund est invalide.");
-                return false; 
-            }
-            if self.inputs.is_empty() { 
-                println!("🛑 REJET HTLC : Aucun contrat ciblé.");
-                return false; 
-            }
-            return true; // Si la structure est bonne, l'API vérifiera le chrono
+        
+        if let TransactionType::HTLCRefund { hash } = &self.tx_type {
+            if hash.len() != 64 || self.inputs.is_empty() { return false; }
+            return true; 
         }
 
         // =================================================================
@@ -107,10 +95,7 @@ impl Transaction {
         let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
         let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
 
-        if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) {
-            println!("🛑 REJET LWE : Les montants cachés ne s'équilibrent pas ! (Création de fausse monnaie détectée)");
-            return false;
-        }
+        if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { return false; }
 
         // =================================================================
         // 🌀 3. L'ÉPREUVE DU CERCLE LATTICE
@@ -147,10 +132,7 @@ impl Transaction {
                 current_c = hasher.finalize().as_bytes().to_vec();
             }
 
-            if hex::encode(&current_c) != pq_ring.c0 {
-                println!("🛑 REJET : L'équation du réseau euclidien est brisée sur l'un des Inputs !");
-                return false;
-            }
+            if hex::encode(&current_c) != pq_ring.c0 { return false; }
         }
         true 
     }

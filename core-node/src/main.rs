@@ -12,6 +12,7 @@ use randomx_rs::{RandomXFlag, RandomXCache, RandomXDataset, RandomXVM};
 use blockchain::{Blockchain, EPOCH_BLOCKS}; // 💡 On importe la constante
 use transaction::{Transaction, TransactionType};
 use api::SharedPool; 
+use rand::RngCore;
 
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
@@ -160,9 +161,87 @@ async fn main() {
         let mut warming_up_epoch = current_epoch;
     
         loop {
+            // 💡 0. LE MOTEUR DEX (FBA) ON-CHAIN : Exécuté par le mineur avant de forger
+            let mut dex_settlement_tx = None;
+            {
+                let mut p = dex_pool.lock().unwrap();
+                let mut buys: Vec<_> = p.iter().filter(|o| o.order_type == "buy").cloned().collect();
+                let mut sells: Vec<_> = p.iter().filter(|o| o.order_type == "sell").cloned().collect();
+
+                buys.sort_by(|a, b| b.price_sats.cmp(&a.price_sats));
+                sells.sort_by(|a, b| a.price_sats.cmp(&b.price_sats));
+
+                let mut generated_swaps = Vec::new();
+                let mut clearing_price_sats = 0;
+                let mut total_volume_flames = 0;
+
+                let mut buy_idx = 0;
+                let mut sell_idx = 0;
+
+                while buy_idx < buys.len() && sell_idx < sells.len() {
+                    let buy = &mut buys[buy_idx];
+                    let sell = &mut sells[sell_idx];
+
+                    if buy.price_sats >= sell.price_sats {
+                        clearing_price_sats = (buy.price_sats + sell.price_sats) / 2; 
+
+                        let matched_volume = std::cmp::min(buy.amount_flames, sell.amount_flames);
+                        total_volume_flames += matched_volume;
+
+                        let mut secret_bytes = [0u8; 32];
+                        rand::thread_rng().fill_bytes(&mut secret_bytes);
+                        let htlc_secret = hex::encode(secret_bytes);
+                        let htlc_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+
+                        let btc_amount = (matched_volume as f64 / 1_000_000_000.0 * clearing_price_sats as f64) as u64;
+
+                        if btc_amount >= 1000 { // Sécurité Anti-Poussière
+                            generated_swaps.push(crate::transaction::SwapContract {
+                                buyer_btc_address: buy.btc_address.clone(),
+                                buyer_btc_pubkey: buy.btc_pubkey.clone(),
+                                seller_watt_address: sell.watt_address.clone(),
+                                seller_btc_pubkey: sell.btc_pubkey.clone(),
+                                watt_amount_flames: matched_volume,
+                                btc_amount_sats: btc_amount,
+                                htlc_secret,
+                                htlc_hash,
+                            });
+                        }
+
+                        buy.amount_flames -= matched_volume;
+                        sell.amount_flames -= matched_volume;
+
+                        if buy.amount_flames == 0 { buy_idx += 1; }
+                        if sell.amount_flames == 0 { sell_idx += 1; }
+                    } else { break; }
+                }
+
+                p.clear(); // Le mineur vide la piscine locale une fois le batch traité
+
+                if total_volume_flames > 0 {
+                    println!("⚖️ [MINEUR DEX] Ordres croisés ! Volume: {} Flames, Prix: {} Sats", total_volume_flames, clearing_price_sats);
+                    crate::api::LAST_PRICE_SATS.store(clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
+                    
+                    // 💡 On crée la transaction de Règlement qui sera minée
+                    dex_settlement_tx = Some(Transaction {
+                        tx_type: TransactionType::DexSettlement { clearing_price_sats, total_volume_flames, swaps: generated_swaps },
+                        inputs: vec![],
+                        outputs: vec![],
+                        fee: 0,
+                        dilithium_signature: "DEX_SETTLEMENT_ON_CHAIN".to_string(),
+                    });
+                }
+            }
+
             let (mut candidate_block, target) = {
                 let mut chain = shared_chain.lock().unwrap();
-                let pending_txs = mempool.lock().unwrap().clone();
+                let mut pending_txs = mempool.lock().unwrap().clone();
+                
+                // 💡 On injecte le résultat du DEX directement dans le bloc !
+                if let Some(dex_tx) = dex_settlement_tx {
+                    pending_txs.push(dex_tx);
+                }
+                
                 chain.prepare_block_template(pending_txs, &miner_address)
             };
 

@@ -223,7 +223,27 @@ function App() {
     }
   };
 
+  // Pour le personne qui envoie les BTC
   const handleFundSwap = async (swap) => {
+    // 🛡️ VÉRIFICATION DE SÉCURITÉ CÔTÉ CLIENT
+    const expectedPriceBtc = swap.btc_amount_sats / swap.watt_amount_flames;
+    // Ici, tu devrais idéalement stocker l'ordre original d'Alice dans le LocalStorage
+    // pour le comparer. Mais à minima, demande une confirmation avec le prix RÉEL du contrat.
+
+    const userConfirmed = window.confirm(
+        `🚨 VÉRIFICATION DE SÉCURITÉ 🚨\n\n` +
+        `Le Nœud Relais propose l'échange suivant :\n` +
+        `- Vous envoyez : ${(swap.btc_amount_sats / 100000000).toFixed(8)} BTC\n` +
+        `- Vous recevrez : ${swap.watt_amount_flames / 1000000000} WATT\n` +
+        `Prix unitaire : ${expectedPriceBtc.toFixed(8)} BTC/WATT\n\n` +
+        `Est-ce bien le prix que vous aviez demandé ?`
+    );
+
+    if (!userConfirmed) {
+        toast.error("Échange annulé pour des raisons de sécurité.");
+        return;
+    }
+
     const loadingToast = toast.loading("Calcul du script HTLC Bitcoin...");
     try {
       const address = await invoke("create_btc_htlc", {
@@ -239,7 +259,25 @@ function App() {
     }
   };
 
+  // Pour le personne qui envoie les WATT
   const handleBobLockWatt = async (swap) => {
+    // 🛡️ VÉRIFICATION DE SÉCURITÉ CÔTÉ CLIENT
+    const expectedPriceBtc = swap.btc_amount_sats / swap.watt_amount_flames;
+
+    const userConfirmed = window.confirm(
+        `🚨 VÉRIFICATION DE SÉCURITÉ 🚨\n\n` +
+        `Le Nœud Relais propose l'échange suivant :\n` +
+        `- Vous bloquez : ${swap.watt_amount_flames / 1000000000} WATT\n` +
+        `- Vous recevrez : ${(swap.btc_amount_sats / 100000000).toFixed(8)} BTC\n` +
+        `Prix unitaire : ${expectedPriceBtc.toFixed(8)} BTC/WATT\n\n` +
+        `Si ce prix ne correspond pas à votre ordre initial, ANNULEZ.`
+    );
+
+    if (!userConfirmed) {
+        toast.error("Échange annulé pour des raisons de sécurité.");
+        return;
+    }
+
     if (isProcessing) return;
     setIsProcessing(true);
     const loadingToast = toast.loading("Verrouillage Post-Quantique en cours...");

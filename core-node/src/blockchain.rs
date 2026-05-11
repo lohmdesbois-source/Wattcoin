@@ -381,6 +381,12 @@ impl Blockchain {
 				continue;
 			}
 
+			// 💡 Le Nœud met à jour son oracle de prix global en lisant le bloc !
+			if let TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
+				crate::api::LAST_PRICE_SATS.store(*clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
+				continue; // 💡 Le prix est mis à jour en mémoire vive. Pas de fichier vulnérable.
+			}
+
 			// A. Vérification de la validité intrinsèque (ZKP / Ring / LWE)
 			if !tx.is_valid() { return Err("Signature ou preuve ZKP invalide.".to_string()); }
 
