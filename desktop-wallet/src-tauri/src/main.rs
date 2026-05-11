@@ -336,6 +336,8 @@ pub enum TransactionType {
     Standard,
     HTLCLock { hash: String, timeout_block: u64 },
     HTLCClaim { secret: String },
+    HTLCRefund { hash: String },
+    DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> },
 }
 
 #[derive(Serialize)]
@@ -413,13 +415,6 @@ async fn get_dark_pool() -> Result<Vec<Order>, String> {
     let res_str = tor_fetch("GET", "/pool", None).await?;
     let pool = serde_json::from_str::<Vec<Order>>(&res_str).map_err(|e| e.to_string())?;
     Ok(pool)
-}
-
-#[tauri::command]
-async fn resolve_batch() -> Result<BatchResult, String> {
-    let res_str = tor_fetch("POST", "/resolve", None).await?;
-    let result = serde_json::from_str::<BatchResult>(&res_str).map_err(|e| e.to_string())?;
-    Ok(result)
 }
 
 #[tauri::command]
@@ -1492,6 +1487,12 @@ async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_he
     }
 }
 
+#[tauri::command]
+async fn cancel_order(order_id: String) -> Result<String, String> {
+    tor_fetch("DELETE", &format!("/order/{}", order_id), None).await?;
+    Ok("Ordre annulé avec succès".to_string())
+}
+
 // ============== LA FONCTION MAIN ==================
 
 fn main() {
@@ -1522,10 +1523,10 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_network_info, generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
-            submit_order, get_dark_pool, resolve_batch, get_watt_balance, get_btc_balance,
+            submit_order, get_dark_pool, get_watt_balance, get_btc_balance,
             send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap,
             destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, 
-			save_miner_script
+			save_miner_script, cancel_order
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

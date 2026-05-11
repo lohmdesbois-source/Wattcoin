@@ -181,6 +181,15 @@ pub async fn start_api_server(
             }
             warp::reply::json(&"Ordre ajouté et propagé")
         });
+		
+	let cancel_order = warp::delete()
+        .and(warp::path!("order" / String))
+        .and(dex_pool_filter.clone())
+        .map(|id: String, pool: SharedPool| {
+            let mut p = pool.lock().unwrap();
+            p.retain(|o| o.id != id);
+            warp::reply::json(&"✅ Ordre supprimé")
+        });
 
     let info_route = warp::path("info")
         .and(warp::get())
@@ -192,14 +201,17 @@ pub async fn start_api_server(
                 "blocks": chain_lock.chain.len(), 
                 "connected_peers": peers.lock().unwrap().len(),
                 "last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed), 
-                "version": "Wattcoin V1.1.0 (On-Chain DEX)"
+                "version": "Wattcoin V2.2.0 (On-Chain DEX)"
             }))
         });
     
-    let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST"]);
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec!["content-type"])
+        .allow_methods(vec!["GET", "POST", "DELETE"]); // 💡 Ajout de DELETE ici
 
-    // 💡 La route resolve a totalement disparu !
-    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(info_route).or(get_swaps).with(cors);
+    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(cancel_order).or(info_route).or(get_swaps)
+        .with(cors);
     
     warp::serve(routes).run((host_ip, port)).await;
 }

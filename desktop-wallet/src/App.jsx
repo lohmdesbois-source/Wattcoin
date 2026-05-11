@@ -122,23 +122,16 @@ function App() {
     };
     setupListener();
 
+    // 💡 Le Timer ne fait plus de matching, il met juste à jour l'affichage du Darkpool
+    // en attendant que le mineur fasse son travail dans le prochain bloc.
     const timerDex = setInterval(async () => {
       if (view === "dex") {
-        setCountdown((prev) => {
-          if (prev <= 1) {
-            invoke("resolve_batch").then(result => {
-               if(result.success) {
-                 toast.success(`Le Batch est résolu ! Volume: ${result.total_volume_flames} Flames`);
-                 setPendingSwaps(result.swaps);
-                 setGlobalWattPriceSats(result.clearing_price_sats);
-               }
-            }).catch(e => console.error("Erreur Resolve:", e));
-            return 120;
-          }
-          return prev - 1;
-        });
+        try { 
+          const pool = await invoke("get_dark_pool"); 
+          setDarkPool(pool); 
+        } catch (e) {}
       }
-    }, 1000);
+    }, 5000); // Rafraîchit la piscine toutes les 5 secondes
 
     return () => { clearInterval(timerDex); if (unlisten) unlisten(); };
   }, [view, walletData]);
@@ -168,6 +161,8 @@ function App() {
 
   const handleSubmitOrder = async () => {
     if (!orderAmount || !orderTotalBtc) return;
+    if (isProcessing) return; // 💡 ANTI DOUBLE CLIC
+    
     const amountWATT = parseFloat(orderAmount);
     const totalBTC = parseFloat(orderTotalBtc);
 
@@ -177,6 +172,7 @@ function App() {
     
     const unitPriceBtc = totalBTC / amountWATT;
     const loadingToast = toast.loading("Envoi de l'ordre via Tor...");
+    setIsProcessing(true); // 💡 ON BLOQUE LE BOUTON
 
     try {
       await invoke("submit_order", {
@@ -189,6 +185,20 @@ function App() {
       toast.success("Ordre ajouté au Dark Pool !", { id: loadingToast });
     } catch (e) { 
       toast.error(e, { id: loadingToast }); 
+    } finally {
+      setIsProcessing(false); // 💡 ON DÉBLOQUE LE BOUTON
+    }
+  };
+  
+  const handleCancelOrder = async (id) => {
+    const toastId = toast.loading("Annulation de l'ordre...");
+    try {
+      await invoke("cancel_order", { orderId: id });
+      const pool = await invoke("get_dark_pool");
+      setDarkPool(pool);
+      toast.success("Ordre retiré avec succès !", { id: toastId });
+    } catch (e) {
+      toast.error("Erreur : " + e, { id: toastId });
     }
   };
 
@@ -493,7 +503,7 @@ function App() {
           <main className="main-content">
             <div className="dex-header">
               <div className="trading-pair" style={{display: "flex", alignItems: "center", gap: "10px"}}><Zap color="var(--primary)"/> WATT / BTC <Bitcoin color="var(--btc-color)"/></div>
-              <div className="batch-timer">{Math.floor(countdown / 60).toString().padStart(2, '0')}:{(countdown % 60).toString().padStart(2, '0')}</div>
+              <div className="batch-timer" style={{ fontSize: "0.9rem" }}>⏳ En attente du prochain bloc...</div>
             </div>
             
             <div className="dex-grid">
@@ -532,15 +542,27 @@ function App() {
               <div className="dark-pool">
                 <h3>🌊 Piscine d'ordres anonymes</h3>
                 <table className="pool-table">
-                  <thead><tr><th>Type</th><th>Quantité WATT</th><th>Prix BTC</th></tr></thead>
+                  <thead><tr><th>Type</th><th>Quantité WATT</th><th>Prix BTC</th><th>Action</th></tr></thead>
                   <tbody>
-                    {darkPool.map((o) => (
+                    {darkPool.map((o) => {
+                      // Vérifie si cet ordre t'appartient
+                      const isMyOrder = walletData && o.watt_address === walletData.watt_address;
+                      return (
                       <tr key={o.id} className={o.order_type === "buy" ? "row-buy" : "row-sell"}>
                         <td>{o.order_type === "buy" ? "Achat" : "Vente"}</td>
                         <td>{o.amount_flames / 1000000000}</td>
                         <td>{(o.price_sats / 100000000).toFixed(8)}</td>
+                        <td>
+                          {isMyOrder ? (
+                            <button onClick={() => handleCancelOrder(o.id)} style={{background: "transparent", color: "#ef4444", border: "1px solid #ef4444", borderRadius: "4px", padding: "4px 8px", cursor: "pointer", fontSize: "0.8rem"}}>
+                              Annuler
+                            </button>
+                          ) : (
+                            <span style={{color: "var(--text-muted)", fontSize: "0.8rem"}}>Anonyme</span>
+                          )}
+                        </td>
                       </tr>
-                    ))}
+                    )})}
                   </tbody>
                 </table>
               </div>
