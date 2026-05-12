@@ -362,11 +362,18 @@ pub struct Transaction {
 #[derive(Serialize, Deserialize, Clone)]
 struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub btc_pubkey: String, pub watt_address: String, pub expires_at: i64 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct SwapContract { pub buyer_btc_address: String, pub buyer_btc_pubkey: String, pub seller_watt_address: String, pub seller_btc_pubkey: String, pub watt_amount_flames: u64, pub btc_amount_sats: u64, pub htlc_secret: String, pub htlc_hash: String }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwapContract { 
+    pub buyer_btc_address: String, 
+    pub buyer_btc_pubkey: String, 
+    pub seller_watt_address: String, 
+    pub seller_btc_pubkey: String, 
+    pub watt_amount_flames: u64, 
+    pub btc_amount_sats: u64, 
+    pub htlc_secret: String, 
+    pub htlc_hash: String 
+}
 
-#[derive(Serialize, Deserialize, Clone)]
-struct BatchResult { pub success: bool, pub message: String, pub clearing_price_sats: u64, pub total_volume_flames: u64, pub swaps: Vec<SwapContract> }
 
 
 

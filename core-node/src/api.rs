@@ -57,18 +57,35 @@ pub async fn start_api_server(
     let peers_filter = warp::any().map(move || Arc::clone(&known_peers));
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
 
-    // 💡 LECTURE ON-CHAIN DES SWAPS : On lit l'historique au lieu d'une variable en RAM
+        // 💡 LECTURE ON-CHAIN DES SWAPS (Avec nettoyage automatique des Swaps terminés)
     let get_swaps = warp::path("swaps")
         .and(warp::get())
         .and(chain_filter.clone())
         .map(|chain_arc: Arc<Mutex<Blockchain>>| {
             let chain_lock = chain_arc.lock().unwrap();
             let mut all_swaps = Vec::new();
-            // On scanne les 100 derniers blocs pour trouver les contrats de Swap gravés On-Chain
+            let mut claimed_hashes = std::collections::HashSet::new();
+
+            // 1. On scanne la blockchain pour trouver tous les HTLC qui ont été réclamés
+            for block in &chain_lock.chain {
+                for tx in &block.transactions {
+                    if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
+                        let secret_bytes = hex::decode(secret).unwrap_or_default();
+                        let hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+                        claimed_hashes.insert(hash); // On note ce Swap comme "Terminé"
+                    }
+                }
+            }
+
+            // 2. On récupère les Swaps On-Chain, mais on ignore ceux qui sont terminés !
             for block in chain_lock.chain.iter().rev().take(100) {
                 for tx in &block.transactions {
                     if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
-                        all_swaps.extend(swaps.clone());
+                        for swap in swaps {
+                            if !claimed_hashes.contains(&swap.htlc_hash) {
+                                all_swaps.push(swap.clone());
+                            }
+                        }
                     }
                 }
             }
