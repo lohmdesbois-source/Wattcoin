@@ -184,9 +184,16 @@ fn start_peer_connection(
                         println!("====================================================================");
                         println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
                         
-                        mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) });
+                        
+                        mempool.lock().unwrap().retain(|t| { 
+                            !block.transactions.iter().any(|mined_tx| {
+                                if mined_tx.outputs.is_empty() || t.outputs.is_empty() { return false; }
+                                mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule
+                            }) 
+                        });
+                        
                         dex_pool.lock().unwrap().clear();
-						println!("🧹 [DEX] Nouveau bloc reçu : La session FBA est clôturée, Dark Pool vidé.");
+                        println!("🧹 [DEX] Nouveau bloc reçu : La session FBA est clôturée, Dark Pool vidé.");
 						
                         let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port.clone() };
                         let mut json_str = serde_json::to_string(&env).unwrap();
@@ -406,9 +413,16 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                                         println!("📝 Contenu : {} transactions incluses ({})", tx_count, tx_detail);
                                         println!("====================================================================");
                                         
-                                        mp_clone.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) });
-										dp_clone.lock().unwrap().clear();
-										println!("🧹 [DEX] Nouveau bloc Tor reçu : La session FBA est clôturée, Dark Pool vidé.");
+                                        
+                                        mp_clone.lock().unwrap().retain(|t| { 
+                                            !block.transactions.iter().any(|mined_tx| {
+                                                if mined_tx.outputs.is_empty() || t.outputs.is_empty() { return false; }
+                                                mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule
+                                            }) 
+                                        });
+                                        
+                                        dp_clone.lock().unwrap().clear();
+                                        println!("🧹 [DEX] Nouveau bloc Tor reçu : La session FBA est clôturée, Dark Pool vidé.");
 
                                         let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port_clone.clone() };
                                         let mut json_str = serde_json::to_string(&env).unwrap();

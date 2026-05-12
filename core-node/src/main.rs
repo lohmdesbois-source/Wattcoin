@@ -380,7 +380,11 @@ async fn main() {
                 
                 let mut mp = mempool.lock().unwrap();
                 mp.retain(|tx| {
-                    !candidate_block.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)
+                    !candidate_block.transactions.iter().any(|mined_tx| {
+                        // 💡 SÉCURITÉ : On ignore les TX sans outputs (comme le DexSettlement) pour éviter le crash !
+                        if mined_tx.outputs.is_empty() || tx.outputs.is_empty() { return false; }
+                        mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule
+                    })
                 });
             }
         }

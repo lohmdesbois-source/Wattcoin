@@ -110,6 +110,8 @@ function App() {
         setPendingSwaps(swaps);
       } catch (e) {}
     };
+	
+	updateData();
 
     let unlisten;
     const setupListener = async () => {
