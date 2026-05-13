@@ -15,6 +15,7 @@ const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
 const EMISSION_DECAY_SHIFT: u32 = 18;   // Ajusté pour ~21 ans
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
+pub const LOTTERY_TIME_BLOCK: u64 = 10;
 
 // 💡 NOUVEAU : Changement de Dataset tous les 20 blocs pour tuer les ASICs !
 pub const EPOCH_BLOCKS: u64 = 51; 
@@ -106,6 +107,55 @@ impl Blockchain {
             expected
         }
     }
+	
+	// 💡 Calcul de la Supply Totale
+    pub fn get_total_supply(&self) -> u64 {
+        let mut supply = 0;
+        let mut current_base = INITIAL_REWARD;
+        for _ in 1..self.chain.len() {
+            supply += current_base;
+            current_base = Self::get_next_base_reward(current_base);
+        }
+        supply
+    }
+
+    // 💡 Calcul du Jackpot en cours (Taxe 1% + Tickets des 10 derniers blocs)
+    pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
+        let mut tickets = Vec::new();
+        let mut pot = 0u64;
+        if target_height < 10 { return (0, tickets); }
+        let start = target_height - 10;
+        
+        for i in start..target_height {
+            if (i as usize) < self.chain.len() {
+                let block = &self.chain[i as usize];
+                for tx in &block.transactions {
+                    // Ajout de la taxe des mineurs au pot
+                    if tx.tx_type == TransactionType::Coinbase && tx.outputs.len() > 1 {
+                        if tx.outputs[1].stealth_address == "LOTTERY_RESERVE" {
+                            pot += tx.outputs[1].aes_vault.parse::<u64>().unwrap_or(0);
+                        }
+                    }
+                    // Ajout des tickets au pot
+                    if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
+                        if *target_block == target_height {
+                            tickets.push((tx.dilithium_signature.clone(), player_pubkey.clone()));
+                            pot += 10_000_000_000; // 10 WATT par ticket
+                        }
+                    }
+                }
+            }
+        }
+        tickets.sort_by(|a, b| a.0.cmp(&b.0)); // Tri déterministe pour le consensus
+        (pot, tickets)
+    }
+
+    pub fn get_current_jackpot(&self) -> u64 {
+        let current_height = self.chain.len() as u64;
+        let target_height = current_height + (10 - (current_height % 10)); // Prochain tirage
+        let (pot, _) = self.get_jackpot_info(target_height);
+        pot
+    }
 
     pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint) {
         let current_height = self.chain.len() as u64;
@@ -173,28 +223,37 @@ impl Blockchain {
         // Note : expected_subsidy intègre DÉJÀ la vérification du TAIL_EMISSION
         // grâce à notre fonction get_next_base_reward() !
         
-        // 💡 FIX RUST : Déclaration MUTABLE et on n'ajoute total_fees qu'UNE SEULE FOIS.
-        let mut calculated_reward = expected_subsidy + total_fees;
-        
-        // Sécurité absolue : la récompense totale ne doit jamais être sous la Tail Emission
-        if calculated_reward < TAIL_EMISSION { 
-            calculated_reward = TAIL_EMISSION; 
+        let lottery_tax = total_fees / 100; // 1% de taxe
+        let miner_fees = total_fees - lottery_tax;
+        let mut calculated_reward = expected_subsidy + miner_fees;
+        if calculated_reward < TAIL_EMISSION { calculated_reward = TAIL_EMISSION; }
+
+        println!("📉 Émission monétaire : {:.9} Watts", (expected_subsidy as f64) / (FLAME as f64));
+        println!("📉 Le mineur gagne : {:.9} Watts (Taxe Loterie: {} Flames)", (calculated_reward as f64) / (FLAME as f64), lottery_tax);
+
+        let mut coinbase_outputs = vec![
+            crate::transaction::TransactionOutput {
+                stealth_address: format!("COINBASE_{}", miner_address), 
+                kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
+                aes_vault: calculated_reward.to_string(), 
+                lattice_commitment: crate::lattice::LWECommitment::commit(calculated_reward, [0, 0, 0, 0]),
+            }
+        ];
+
+        // 💡 On envoie la taxe dans la réserve transparente !
+        if lottery_tax > 0 {
+            coinbase_outputs.push(crate::transaction::TransactionOutput {
+                stealth_address: "LOTTERY_RESERVE".to_string(), 
+                kyber_capsule: format!("TAX_CAPSULE_{}", current_height),
+                aes_vault: lottery_tax.to_string(), 
+                lattice_commitment: crate::lattice::LWECommitment::commit(lottery_tax, [0, 0, 0, 0]),
+            });
         }
-        
-        println!("📉 Émission monétaire : {:.6} Watts", (expected_subsidy as f64) / (FLAME as f64));
-        println!("📉 Le mineur, avec les frais ({} Flames) gagne en tout : {:.6} Watts", total_fees, (calculated_reward as f64) / (FLAME as f64));
 
         let coinbase_tx = Transaction {
             tx_type: TransactionType::Coinbase,
             inputs: vec![],
-            outputs: vec![
-                crate::transaction::TransactionOutput {
-                    stealth_address: format!("COINBASE_{}", miner_address), 
-                    kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
-                    aes_vault: calculated_reward.to_string(), 
-                    lattice_commitment: crate::lattice::LWECommitment::commit(calculated_reward, [0, 0, 0, 0]),
-                }
-            ],
+            outputs: coinbase_outputs,
             fee: 0,
             dilithium_signature: "COINBASE_SIG".to_string(),
         };
@@ -475,6 +534,32 @@ impl Blockchain {
 			return Err(format!("Inflation illégale ! Attendu: {}, Reçu: {}", 
 				expected_subsidy + total_block_fees, actual_reward));
 		}
+		
+		// 🎰 VÉRIFICATION DU JACKPOT L1
+        if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
+            let (pot, tickets) = self.get_jackpot_info(current_height);
+            if !tickets.is_empty() {
+                let prev_hash_bytes = hex::decode(&block.header.previous_hash).unwrap_or(vec![0; 32]);
+                let mut seed_arr = [0u8; 8];
+                seed_arr.copy_from_slice(&prev_hash_bytes[0..8]);
+                let seed_num = u64::from_le_bytes(seed_arr);
+                let winner_idx = (seed_num % (tickets.len() as u64)) as usize;
+                let winner = &tickets[winner_idx];
+
+                let mut found_payout = false;
+                for tx in &block.transactions {
+                    if let TransactionType::LotteryPayout { target_block, winner_pubkey } = &tx.tx_type {
+                        if *target_block != current_height { return Err("Mauvais bloc cible pour le payout".to_string()); }
+                        if winner_pubkey != &winner.1 { return Err("Mauvais gagnant désigné par le mineur !".to_string()); }
+                        let out = &tx.outputs[0];
+                        if out.stealth_address != format!("JACKPOT_{}", winner.1) { return Err("Mauvais destinataire Jackpot !".to_string()); }
+                        if out.aes_vault != pot.to_string() { return Err("Mauvais montant Jackpot !".to_string()); }
+                        found_payout = true;
+                    }
+                }
+                if !found_payout { return Err("Le bloc DOIT contenir le paiement du Jackpot !".to_string()); }
+            }
+        }
 
 		// Si tout est OK, on met à jour l'état
 		for ki in block_key_images { self.spent_key_images.insert(ki); }

@@ -224,13 +224,31 @@ pub async fn start_api_server(
                 "version": "Wattcoin V2.2.0 (On-Chain DEX)"
             }))
         });
+		
+	
+    let get_supply = warp::path("supply")
+        .and(warp::get())
+        .and(chain_filter.clone())
+        .map(|chain_arc: Arc<Mutex<Blockchain>>| {
+            let supply = chain_arc.lock().unwrap().get_total_supply();
+            warp::reply::json(&supply)
+        });
+
+    let get_jackpot = warp::path("jackpot")
+        .and(warp::get())
+        .and(chain_filter.clone())
+        .map(|chain_arc: Arc<Mutex<Blockchain>>| {
+            let pot = chain_arc.lock().unwrap().get_current_jackpot();
+            warp::reply::json(&pot)
+        });
+    
     
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "DELETE"]); // 💡 Ajout de DELETE ici
 
-    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(cancel_order).or(info_route).or(get_swaps)
+    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(cancel_order).or(info_route).or(get_swaps).or(get_supply).or(get_jackpot)
         .with(cors);
     
     warp::serve(routes).run((host_ip, port)).await;

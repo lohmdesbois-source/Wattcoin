@@ -9,7 +9,7 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::collections::{HashSet, HashMap}; 
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXDataset, RandomXVM};
-use blockchain::{Blockchain, EPOCH_BLOCKS}; // 💡 On importe la constante
+use blockchain::{Blockchain, EPOCH_BLOCKS, LOTTERY_TIME_BLOCK}; // 💡 On importe la constante
 use transaction::{Transaction, TransactionType};
 use api::SharedPool; 
 use rand::RngCore;
@@ -163,6 +163,8 @@ async fn main() {
         loop {
             // 💡 0. LE MOTEUR DEX (FBA) ON-CHAIN : Exécuté par le mineur avant de forger
             let mut dex_settlement_tx = None;
+			let next_index = shared_chain.lock().unwrap().chain.len() as u64;
+            let mut extra_txs = Vec::new();
             {
                 let mut p = dex_pool.lock().unwrap();
                 let mut buys: Vec<_> = p.iter().filter(|o| o.order_type == "buy").cloned().collect();
@@ -232,12 +234,43 @@ async fn main() {
                     });
                 }
             }
+			
+			// 🎰 2. LE TIRAGE DU JACKPOT L1
+            if next_index % LOTTERY_TIME_BLOCK == 0 && next_index > 0 {
+                let chain = shared_chain.lock().unwrap();
+                let (pot, tickets) = chain.get_jackpot_info(next_index);
+                if !tickets.is_empty() {
+                    let prev_hash_bytes = hex::decode(&chain.chain.last().unwrap().header.hash).unwrap_or(vec![0; 32]);
+                    let mut seed_arr = [0u8; 8];
+                    seed_arr.copy_from_slice(&prev_hash_bytes[0..8]);
+                    let seed_num = u64::from_le_bytes(seed_arr);
+                    let winner_idx = (seed_num % (tickets.len() as u64)) as usize;
+                    let winner = &tickets[winner_idx];
+
+                    println!("🎰 [LOTO L1] Le ticket {} remporte le Jackpot de {} Flames !", winner.0, pot);
+                    
+                    extra_txs.push(Transaction {
+                        tx_type: TransactionType::LotteryPayout { target_block: next_index, winner_pubkey: winner.1.clone() },
+                        inputs: vec![],
+                        outputs: vec![crate::transaction::TransactionOutput {
+                            stealth_address: format!("JACKPOT_{}", winner.1),
+                            kyber_capsule: format!("L1_JACKPOT_DRAW_{}", next_index),
+                            aes_vault: pot.to_string(), // 💡 Montant en clair pour vérification
+                            lattice_commitment: crate::lattice::LWECommitment::commit(pot, [0, 0, 0, 0]),
+                        }],
+                        fee: 0,
+                        dilithium_signature: "JACKPOT_ON_CHAIN".to_string(),
+                    });
+                }
+            }
 
             let (mut candidate_block, target) = {
                 let mut chain = shared_chain.lock().unwrap();
                 let mut pending_txs = mempool.lock().unwrap().clone();
                 
-                // 💡 On injecte le résultat du DEX directement dans le bloc !
+                // 💡 On injecte TOUTES les transactions additionnelles du mineur (DEX + Jackpot)
+                pending_txs.extend(extra_txs);
+                
                 if let Some(dex_tx) = dex_settlement_tx {
                     pending_txs.push(dex_tx);
                 }

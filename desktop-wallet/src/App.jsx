@@ -629,7 +629,6 @@ function App() {
                                             secret: s.htlc_secret, hash: s.htlc_hash, wattAddress: walletData.watt_address, amount: s.watt_amount_flames / 1000000000
                                         });
                                         toast.success(res, { id: toastId, duration: 5000 });
-                                        toast.success("⚡ N'oubliez pas de lancer votre mineur pour valider la réception !");
                                         setActionnedSwaps(prev => new Set(prev).add(s.htlc_hash));
                                     } catch(e) { toast.error(e.toString(), { id: toastId }); }
                                     finally { setIsProcessing(false); }

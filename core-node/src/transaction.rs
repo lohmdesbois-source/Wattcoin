@@ -24,7 +24,9 @@ pub enum TransactionType {
     HTLCLock { hash: String, timeout_block: u64 }, 
     HTLCClaim { secret: String },                  
     HTLCRefund { hash: String },                   
-    DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> }, // 💡 NOUVEAU : LE DEX ON-CHAIN
+    DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> }, // 💡 LE DEX ON-CHAIN
+	HTLCLottery { target_block: u64, player_pubkey: String }, // 🎟️ Le ticket
+    LotteryPayout { target_block: u64, winner_pubkey: String }, // 🎰 Le gain
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,8 +64,18 @@ pub struct Transaction {
 impl Transaction {
     pub fn is_valid(&self) -> bool {
         // 💡 Les transactions DexSettlement sont générées par les mineurs, pas besoin de ZKP
-        if self.tx_type == TransactionType::Coinbase || self.dilithium_signature == "PRUNED" || matches!(self.tx_type, TransactionType::DexSettlement { .. }) { 
+        if self.tx_type == TransactionType::Coinbase 
+            || self.dilithium_signature == "PRUNED" 
+            || matches!(self.tx_type, TransactionType::DexSettlement { .. })
+            || matches!(self.tx_type, TransactionType::LotteryPayout { .. }) // Le mineur le génère sans signature
+        { 
             return true; 
+        }
+
+        // 💡 Sécurité du Ticket de Loterie
+        if let TransactionType::HTLCLottery { .. } = &self.tx_type {
+            if self.outputs.is_empty() || self.outputs[0].stealth_address != "LOTTERY_RESERVE" { return false; }
+            if self.outputs[0].aes_vault != "10000000000" { return false; } // Le ticket DOIT coûter 10 WATT
         }
 
         // =================================================================
