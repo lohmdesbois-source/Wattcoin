@@ -9,10 +9,11 @@ use crate::WattError;
 
 const FLAME: u64 = 1_000_000_000;
 const MATURITY_BLOCKS: u64 = 3; 
-const EXPECTED_BLOCK_TIME: u64 = 600; 
-const INITIAL_REWARD: f64 = 50.0 * (FLAME as f64);    
-const DECAY_FACTOR: f64 = 0.999999;  
-const TAIL_EMISSION: u64 = 1 * FLAME; 
+const EXPECTED_BLOCK_TIME: u64 = 600;    
+// 18.000.000 / (144 blocs/jour * 365 jours * 20 ans) = ~1.7 Watts/bloc
+const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
+const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
+const EMISSION_DECAY_SHIFT: u32 = 18;   // Ajusté pour ~21 ans
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
 
 // 💡 NOUVEAU : Changement de Dataset tous les 20 blocs pour tuer les ASICs !
@@ -92,6 +93,19 @@ impl Blockchain {
         fs::write(filename, json).expect("Impossible d'écrire sur le disque !");
         println!("💾 Blockchain sauvegardée en toute sécurité dans '{}'.", filename);
     }
+	
+	/// 💡 OPTIMISATION PRO (O(1)) : Calcule la récompense directement 
+    /// à partir de la récompense de base du bloc précédent.
+    pub fn get_next_base_reward(prev_base_reward: u64) -> u64 {
+        let decay = prev_base_reward >> EMISSION_DECAY_SHIFT;
+        let expected = prev_base_reward.saturating_sub(decay);
+        
+        if expected < TAIL_EMISSION {
+            TAIL_EMISSION
+        } else {
+            expected
+        }
+    }
 
     pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint) {
         let current_height = self.chain.len() as u64;
@@ -136,12 +150,39 @@ impl Blockchain {
         if current_height > 1 { println!("⚙️  Dernier bloc miné en {}s", time_taken); }
         println!("🎯 Difficulté cible : {}.{:02}x", diff_int, diff_dec);
 
-        let mut calculated_reward = (INITIAL_REWARD * DECAY_FACTOR.powf(current_height as f64)) as u64;
-        if calculated_reward < TAIL_EMISSION { calculated_reward = TAIL_EMISSION; }
+        // 💡 OPTIMISATION O(1) : Calcul de la récompense "Smooth"
+        let expected_subsidy = if current_height == 0 {
+            INITIAL_REWARD
+        } else {
+            // On retrouve la récompense de base du bloc précédent
+            let prev_block = self.chain.last().unwrap();
+            let mut prev_fees = 0;
+            for tx in &prev_block.transactions {
+                if tx.tx_type != TransactionType::Coinbase {
+                    prev_fees += tx.fee;
+                }
+            }
+            
+            let prev_total_reward: u64 = prev_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(INITIAL_REWARD);
+            let prev_base_reward = prev_total_reward.saturating_sub(prev_fees);
+            
+            // Appel de la fonction O(1) !
+            Self::get_next_base_reward(prev_base_reward)
+        };
+
+        // Note : expected_subsidy intègre DÉJÀ la vérification du TAIL_EMISSION
+        // grâce à notre fonction get_next_base_reward() !
         
-        println!("📉 Émission monétaire : {:.6} Watts", (calculated_reward as f64) / (FLAME as f64));
-        calculated_reward += total_fees; 
-        println!("📉 Le mineur, avec le tips : {} Flames gagne en tout : {:.6} Watts", total_fees, (calculated_reward as f64) / (FLAME as f64));
+        // 💡 FIX RUST : Déclaration MUTABLE et on n'ajoute total_fees qu'UNE SEULE FOIS.
+        let mut calculated_reward = expected_subsidy + total_fees;
+        
+        // Sécurité absolue : la récompense totale ne doit jamais être sous la Tail Emission
+        if calculated_reward < TAIL_EMISSION { 
+            calculated_reward = TAIL_EMISSION; 
+        }
+        
+        println!("📉 Émission monétaire : {:.6} Watts", (expected_subsidy as f64) / (FLAME as f64));
+        println!("📉 Le mineur, avec les frais ({} Flames) gagne en tout : {:.6} Watts", total_fees, (calculated_reward as f64) / (FLAME as f64));
 
         let coinbase_tx = Transaction {
             tx_type: TransactionType::Coinbase,
@@ -371,8 +412,23 @@ impl Blockchain {
 
 		// Calcul de la récompense théorique attendue (basée sur ta formule decay)
 		let current_height = block.header.index;
-		let mut expected_subsidy = (INITIAL_REWARD * DECAY_FACTOR.powf(current_height as f64)) as u64;
-		if expected_subsidy < TAIL_EMISSION { expected_subsidy = TAIL_EMISSION; }
+    
+		// 💡 Validation stricte de la récompense attendue en O(1)
+        let expected_subsidy = if current_height == 0 {
+            INITIAL_REWARD
+        } else {
+            let prev_block = self.chain.last().unwrap();
+            let mut prev_fees = 0;
+            for tx in &prev_block.transactions {
+                if tx.tx_type != TransactionType::Coinbase {
+                    prev_fees += tx.fee;
+                }
+            }
+            let prev_total_reward: u64 = prev_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(INITIAL_REWARD);
+            let prev_base_reward = prev_total_reward.saturating_sub(prev_fees);
+            
+            Self::get_next_base_reward(prev_base_reward)
+        };
 
 		// Premier passage : On calcule les frais totaux et on valide les TX standards
 		for tx in &block.transactions {
@@ -416,7 +472,8 @@ impl Blockchain {
 		// Extraction du montant réel miné (stocké dans l'AES Vault de la Coinbase)
 		let actual_reward: u64 = coinbase_tx.outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
 		if actual_reward > (expected_subsidy + total_block_fees) {
-			return Err(format!("Inflation illégale ! Max attendu: {}", expected_subsidy + total_block_fees));
+			return Err(format!("Inflation illégale ! Attendu: {}, Reçu: {}", 
+				expected_subsidy + total_block_fees, actual_reward));
 		}
 
 		// Si tout est OK, on met à jour l'état
