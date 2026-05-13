@@ -185,10 +185,10 @@ fn start_peer_connection(
                         println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
                         
                         
+                        
                         mempool.lock().unwrap().retain(|t| { 
                             !block.transactions.iter().any(|mined_tx| {
-                                if mined_tx.outputs.is_empty() || t.outputs.is_empty() { return false; }
-                                mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule
+                                mined_tx.dilithium_signature == t.dilithium_signature
                             }) 
                         });
                         
@@ -414,10 +414,10 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                                         println!("====================================================================");
                                         
                                         
+                                        
                                         mp_clone.lock().unwrap().retain(|t| { 
                                             !block.transactions.iter().any(|mined_tx| {
-                                                if mined_tx.outputs.is_empty() || t.outputs.is_empty() { return false; }
-                                                mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule
+                                                mined_tx.dilithium_signature == t.dilithium_signature
                                             }) 
                                         });
                                         

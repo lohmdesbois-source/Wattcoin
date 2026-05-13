@@ -57,7 +57,7 @@ pub async fn start_api_server(
     let peers_filter = warp::any().map(move || Arc::clone(&known_peers));
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
 
-        // 💡 LECTURE ON-CHAIN DES SWAPS (Avec nettoyage automatique des Swaps terminés)
+    // 💡 LECTURE ON-CHAIN DES SWAPS : On lit l'historique des blocs !
     let get_swaps = warp::path("swaps")
         .and(warp::get())
         .and(chain_filter.clone())
@@ -66,18 +66,21 @@ pub async fn start_api_server(
             let mut all_swaps = Vec::new();
             let mut claimed_hashes = std::collections::HashSet::new();
 
-            // 1. On scanne la blockchain pour trouver tous les HTLC qui ont été réclamés
+            // 1. On scanne pour trouver tous les HTLC qui ont déjà été réclamés/remboursés
             for block in &chain_lock.chain {
                 for tx in &block.transactions {
                     if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
                         let secret_bytes = hex::decode(secret).unwrap_or_default();
                         let hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-                        claimed_hashes.insert(hash); // On note ce Swap comme "Terminé"
+                        claimed_hashes.insert(hash);
+                    }
+                    if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
+                        claimed_hashes.insert(hash.clone());
                     }
                 }
             }
 
-            // 2. On récupère les Swaps On-Chain, mais on ignore ceux qui sont terminés !
+            // 2. On récupère les Swaps du DEX, en ignorant ceux qui sont terminés !
             for block in chain_lock.chain.iter().rev().take(100) {
                 for tx in &block.transactions {
                     if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {

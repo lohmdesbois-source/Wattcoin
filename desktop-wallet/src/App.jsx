@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Toaster, toast } from "react-hot-toast";
-import { Copy, Check, Lock, Unlock, Settings, ScrollText, ArrowRightLeft, Shield, Send, Zap, Bitcoin, Trash2, Download } from "lucide-react";
+import { Copy, Check, Lock, Unlock, Settings, ScrollText, ArrowRightLeft, Shield, Send, Zap, Bitcoin, Trash2, Download, EyeOff } from "lucide-react";
 import "./App.css";
 
 function App() {
@@ -18,16 +18,12 @@ function App() {
   const [globalWattPriceSats, setGlobalWattPriceSats] = useState(0);
   
   const [activeCoinModal, setActiveCoinModal] = useState(null); 
-  const [activeContractAddress, setActiveContractAddress] = useState(null);
-  
-  const [swapProgress, setSwapProgress] = useState(0);
   const [showSeed, setShowSeed] = useState(false);
   const [copied, setCopied] = useState("");
   
   const [orderType, setOrderType] = useState("buy");
   const [orderAmount, setOrderAmount] = useState("");
   const [orderTotalBtc, setOrderTotalBtc] = useState("");
-  const [countdown, setCountdown] = useState(120); 
   const [darkPool, setDarkPool] = useState([]);
   const [pendingSwaps, setPendingSwaps] = useState([]);
   
@@ -37,6 +33,9 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [txHistory, setTxHistory] = useState([]);
   const [syncMessage, setSyncMessage] = useState("Établissement du tunnel Tor...");
+
+  // 💡 NOUVEAU : Mémoire des swaps "verrouillés/cliqués" pour protéger le bouton cacher
+  const [actionnedSwaps, setActionnedSwaps] = useState(new Set());
 
   const handleCopy = (e, text, type) => {
     e.stopPropagation(); 
@@ -106,12 +105,28 @@ function App() {
       }
 
       try {
-        const swaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
-        setPendingSwaps(swaps);
+        const apiSwaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
+        
+        // 🛡️ SAUVEGARDE LOCALE : On ne fait pas aveuglément confiance à l'API pour l'affichage !
+        const cachedStr = localStorage.getItem('my_swaps');
+        const cachedSwaps = cachedStr ? JSON.parse(cachedStr) : [];
+        
+        const combined = [...apiSwaps];
+        cachedSwaps.forEach(cached => {
+            // Si le swap est dans notre cache local mais que l'API l'a supprimé, 
+            // on le garde à l'écran pour pouvoir finir nos actions (réclamer BTC ou Refund) !
+            if (!combined.find(s => s.htlc_hash === cached.htlc_hash)) {
+                combined.push(cached);
+            }
+        });
+        
+        localStorage.setItem('my_swaps', JSON.stringify(combined));
+        setPendingSwaps(combined);
+
       } catch (e) {}
     };
-	
-	updateData();
+    
+    updateData();
 
     let unlisten;
     const setupListener = async () => {
@@ -124,8 +139,6 @@ function App() {
     };
     setupListener();
 
-    // 💡 Le Timer ne fait plus de matching, il met juste à jour l'affichage du Darkpool
-    // en attendant que le mineur fasse son travail dans le prochain bloc.
     const timerDex = setInterval(async () => {
       if (view === "dex") {
         try { 
@@ -163,7 +176,7 @@ function App() {
 
   const handleSubmitOrder = async () => {
     if (!orderAmount || !orderTotalBtc) return;
-    if (isProcessing) return; // 💡 ANTI DOUBLE CLIC
+    if (isProcessing) return; 
     
     const amountWATT = parseFloat(orderAmount);
     const totalBTC = parseFloat(orderTotalBtc);
@@ -174,7 +187,7 @@ function App() {
     
     const unitPriceBtc = totalBTC / amountWATT;
     const loadingToast = toast.loading("Envoi de l'ordre via Tor...");
-    setIsProcessing(true); // 💡 ON BLOQUE LE BOUTON
+    setIsProcessing(true);
 
     try {
       await invoke("submit_order", {
@@ -188,7 +201,7 @@ function App() {
     } catch (e) { 
       toast.error(e, { id: loadingToast }); 
     } finally {
-      setIsProcessing(false); // 💡 ON DÉBLOQUE LE BOUTON
+      setIsProcessing(false);
     }
   };
   
@@ -235,60 +248,14 @@ function App() {
     }
   };
 
-  // Pour le personne qui envoie les BTC
-  const handleFundSwap = async (swap) => {
-    // 🛡️ VÉRIFICATION DE SÉCURITÉ CÔTÉ CLIENT
-    const expectedPriceBtc = swap.btc_amount_sats / swap.watt_amount_flames;
-    // Ici, tu devrais idéalement stocker l'ordre original d'Alice dans le LocalStorage
-    // pour le comparer. Mais à minima, demande une confirmation avec le prix RÉEL du contrat.
+  // --- ACTIONS DU SWAP ---
 
-    const userConfirmed = window.confirm(
-        `🚨 VÉRIFICATION DE SÉCURITÉ 🚨\n\n` +
-        `Le Nœud Relais propose l'échange suivant :\n` +
-        `- Vous envoyez : ${(swap.btc_amount_sats / 100000000).toFixed(8)} BTC\n` +
-        `- Vous recevrez : ${swap.watt_amount_flames / 1000000000} WATT\n` +
-        `Prix unitaire : ${expectedPriceBtc.toFixed(8)} BTC/WATT\n\n` +
-        `Est-ce bien le prix que vous aviez demandé ?`
-    );
-
-    if (!userConfirmed) {
-        toast.error("Échange annulé pour des raisons de sécurité.");
-        return;
-    }
-
-    const loadingToast = toast.loading("Calcul du script HTLC Bitcoin...");
-    try {
-      const address = await invoke("create_btc_htlc", {
-        buyerPubkeyHex: swap.buyer_btc_pubkey,
-        sellerPubkeyHex: swap.seller_btc_pubkey,
-        secretHex: swap.htlc_secret,
-        locktime: 144
-      });
-      setActiveContractAddress(address);
-      toast.success("Contrat P2WSH généré !", { id: loadingToast });
-    } catch (error) {
-      toast.error("Erreur L1: " + error, { id: loadingToast });
-    }
-  };
-
-  // Pour le personne qui envoie les WATT
   const handleBobLockWatt = async (swap) => {
-    // 🛡️ VÉRIFICATION DE SÉCURITÉ CÔTÉ CLIENT
     const expectedPriceBtc = swap.btc_amount_sats / swap.watt_amount_flames;
-
     const userConfirmed = window.confirm(
-        `🚨 VÉRIFICATION DE SÉCURITÉ 🚨\n\n` +
-        `Le Nœud Relais propose l'échange suivant :\n` +
-        `- Vous bloquez : ${swap.watt_amount_flames / 1000000000} WATT\n` +
-        `- Vous recevrez : ${(swap.btc_amount_sats / 100000000).toFixed(8)} BTC\n` +
-        `Prix unitaire : ${expectedPriceBtc.toFixed(8)} BTC/WATT\n\n` +
-        `Si ce prix ne correspond pas à votre ordre initial, ANNULEZ.`
+        `🚨 VÉRIFICATION DE SÉCURITÉ 🚨\n\nLe Nœud Relais propose l'échange suivant :\n- Vous bloquez : ${swap.watt_amount_flames / 1000000000} WATT\n- Vous recevrez : ${(swap.btc_amount_sats / 100000000).toFixed(8)} BTC\nPrix unitaire : ${expectedPriceBtc.toFixed(8)} BTC/WATT\n\nSi ce prix ne correspond pas à votre ordre initial, ANNULEZ.`
     );
-
-    if (!userConfirmed) {
-        toast.error("Échange annulé pour des raisons de sécurité.");
-        return;
-    }
+    if (!userConfirmed) return;
 
     if (isProcessing) return;
     setIsProcessing(true);
@@ -296,24 +263,46 @@ function App() {
 
     try {
       const response = await invoke("send_wattcoin", {
-        recipientKyberHex: swap.seller_watt_address,
-        amount: swap.watt_amount_flames / 1000000000,
-        senderDilithiumSecretHex: walletData.dilithium_secret_hex,
-        senderDilithiumPublicHex: walletData.dilithium_public_hex,
-        senderKyberSecretHex: walletData.kyber_secret_hex,
-        senderKyberPublicHex: walletData.watt_address,
-        htlcHashHex: swap.htlc_hash,     
-        htlcTimeout: 144                 
+        recipientKyberHex: swap.seller_watt_address, amount: swap.watt_amount_flames / 1000000000,
+        senderDilithiumSecretHex: walletData.dilithium_secret_hex, senderDilithiumPublicHex: walletData.dilithium_public_hex,
+        senderKyberSecretHex: walletData.kyber_secret_hex, senderKyberPublicHex: walletData.watt_address,
+        htlcHashHex: swap.htlc_hash, htlcTimeout: 144                 
       });
-      
       toast.success(response, { id: loadingToast, duration: 5000 });
+      setActionnedSwaps(prev => new Set(prev).add(swap.htlc_hash));
       setWattBalance(prev => prev - (swap.watt_amount_flames / 1000000000));
-      
-    } catch (error) {
-      toast.error(error, { id: loadingToast });
-    } finally {
-      setIsProcessing(false);
-    }
+    } catch (error) { toast.error(error, { id: loadingToast }); } 
+    finally { setIsProcessing(false); }
+  };
+
+  const handleRefundWatt = async (swap) => {
+    if (isProcessing) return;
+    setIsProcessing(true);
+    const loadingToast = toast.loading("Demande de remboursement envoyée (Timelock check)...");
+
+    try {
+      const response = await invoke("refund_wattcoin_swap", {
+        hash: swap.htlc_hash, 
+        wattAddress: walletData.watt_address, 
+        amount: swap.watt_amount_flames / 1000000000
+      });
+      toast.success(response, { id: loadingToast, duration: 5000 });
+      toast.success("N'oubliez pas de miner un bloc pour récupérer vos WATT.");
+      setActionnedSwaps(prev => new Set(prev).add(swap.htlc_hash));
+    } catch (error) { toast.error(error.toString(), { id: loadingToast }); } 
+    finally { setIsProcessing(false); }
+  };
+
+  const removeSwapFromCache = (hash) => {
+      if (!actionnedSwaps.has(hash)) {
+          toast.error("🚨 Action requise ! Effectuez une transaction (Réclamation ou Refund) avant d'effacer ce contrat.");
+          return;
+      }
+      const cached = JSON.parse(localStorage.getItem('my_swaps') || '[]');
+      const updated = cached.filter(s => s.htlc_hash !== hash);
+      localStorage.setItem('my_swaps', JSON.stringify(updated));
+      setPendingSwaps(updated);
+      toast.success("Swap nettoyé de l'interface !");
   };
 
   // ================= UI COMPONENTS =================
@@ -547,7 +536,6 @@ function App() {
                   <thead><tr><th>Type</th><th>Quantité WATT</th><th>Prix BTC</th><th>Action</th></tr></thead>
                   <tbody>
                     {darkPool.map((o) => {
-                      // Vérifie si cet ordre t'appartient
                       const isMyOrder = walletData && o.watt_address === walletData.watt_address;
                       return (
                       <tr key={o.id} className={o.order_type === "buy" ? "row-buy" : "row-sell"}>
@@ -589,11 +577,12 @@ function App() {
                   <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "40px" }}>Aucun contrat en attente de votre signature.</p>
                 ) : (
                   <table className="pool-table">
-                    <thead><tr><th>Votre Rôle</th><th>Hash HTLC</th><th>WATT</th><th>BTC</th><th>Action Requise</th></tr></thead>
+                    <thead><tr><th>Votre Rôle</th><th>Hash HTLC</th><th>WATT</th><th>BTC</th><th>Actions Requises (Dans l'ordre)</th></tr></thead>
                     <tbody>
                       {pendingSwaps.map((s, i) => {
                         const isAlice = s.buyer_btc_address === walletData.btc_address;
                         const isBob = s.seller_watt_address === walletData.watt_address;
+                        const hasActioned = actionnedSwaps.has(s.htlc_hash);
 
                         return (
                         <tr key={i}>
@@ -609,33 +598,92 @@ function App() {
                           </td>
                           <td>
                             {isAlice && (
-                              <button className="btn-primary" style={{ padding: "8px 15px", fontSize: "0.9rem" }} onClick={() => handleFundSwap(s)}>
-                                1. Initialiser BTC
-                              </button>
-                            )}
-                            {isBob && (
                               <div style={{ display: "flex", gap: "10px", flexDirection: "column" }}>
-                                <button className="btn-secondary" style={{ padding: "8px 15px", fontSize: "0.9rem" }} disabled={isProcessing} onClick={() => handleBobLockWatt(s)}>
-                                  {isProcessing ? "⏳ Verrouillage..." : "1. Verrouiller WATT"}
-                                </button>
-                                <button className="btn-primary" style={{ padding: "8px 15px", fontSize: "0.9rem", background: "linear-gradient(135deg, #F7931A, #d97706)" }} disabled={isProcessing} onClick={async () => {
+                                <button className="btn-secondary" disabled={isProcessing} style={{ padding: "8px 15px", fontSize: "0.85rem" }} onClick={async () => {
+                                    const expectedPriceBtc = s.btc_amount_sats / s.watt_amount_flames;
+                                    const userConfirmed = window.confirm(`🚨 VÉRIFICATION DE SÉCURITÉ 🚨\n\nLe Nœud Relais propose l'échange suivant :\n- Vous envoyez : ${(s.btc_amount_sats / 100000000).toFixed(8)} BTC\n- Vous recevrez : ${s.watt_amount_flames / 1000000000} WATT\nPrix unitaire : ${expectedPriceBtc.toFixed(8)} BTC/WATT\n\nEst-ce bien le prix que vous aviez demandé ?`);
+                                    if (!userConfirmed) { toast.error("Échange annulé."); return; }
+
+                                    setIsProcessing(true);
+                                    const toastId = toast.loading("Création & Envoi au contrat BTC...");
                                     try {
-                                      setIsProcessing(true);
-                                      const toastId = toast.loading("Génération du script...");
-                                      const contractAddress = await invoke("create_btc_htlc", {
-                                        buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey, secretHex: s.htlc_secret, locktime: 144 
-                                      });
-                                      toast.loading("Réclamation des BTC sur le Testnet...", { id: toastId });
-                                      const res = await invoke("claim_btc_swap", {
-                                        masterSeedHex: walletData.master_seed_hex, htlcAddress: contractAddress, secretHex: s.htlc_secret,
-                                        buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey 
-                                      });
-                                      toast.success(res, { id: toastId, duration: 6000 });
-                                    } catch (e) { toast.error(e.toString()); }
+                                        const addr = await invoke("create_btc_htlc", {
+                                            buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey, secretHex: s.htlc_secret, locktime: 144
+                                        });
+                                        await invoke("send_btc_to_htlc", {
+                                            masterSeedHex: walletData.master_seed_hex, htlcAddress: addr, amountBtc: s.btc_amount_sats / 100000000
+                                        });
+                                        toast.success("BTC envoyés au contrat !", { id: toastId, duration: 5000 });
+                                        setActionnedSwaps(prev => new Set(prev).add(s.htlc_hash));
+                                    } catch(e) { toast.error(e.toString(), { id: toastId }); }
                                     finally { setIsProcessing(false); }
                                 }}>
-                                  {isProcessing ? "⏳ Signature L1..." : "2. Réclamer BTC"}
+                                  1. Verrouiller BTC (L1)
                                 </button>
+
+                                <button className="btn-primary" disabled={isProcessing} style={{ padding: "8px 15px", fontSize: "0.85rem" }} onClick={async () => {
+                                    setIsProcessing(true);
+                                    const toastId = toast.loading("Réclamation des WATT...");
+                                    try {
+                                        const res = await invoke("claim_wattcoin_swap", {
+                                            secret: s.htlc_secret, hash: s.htlc_hash, wattAddress: walletData.watt_address, amount: s.watt_amount_flames / 1000000000
+                                        });
+                                        toast.success(res, { id: toastId, duration: 5000 });
+                                        toast.success("⚡ N'oubliez pas de lancer votre mineur pour valider la réception !");
+                                        setActionnedSwaps(prev => new Set(prev).add(s.htlc_hash));
+                                    } catch(e) { toast.error(e.toString(), { id: toastId }); }
+                                    finally { setIsProcessing(false); }
+                                }}>
+                                  4. Réclamer WATT
+                                </button>
+                                
+                                <button 
+                                  className="btn-danger" 
+                                  style={{opacity: hasActioned ? 1 : 0.4, cursor: hasActioned ? "pointer" : "not-allowed"}}
+                                  onClick={() => removeSwapFromCache(s.htlc_hash)}
+                                >
+                                  <EyeOff size={14}/> Cacher le Swap
+                                </button>
+                              </div>
+                            )}
+
+                            {isBob && (
+                              <div style={{ display: "flex", gap: "10px", flexDirection: "column" }}>
+                                <button className="btn-secondary" style={{ padding: "8px 15px", fontSize: "0.85rem" }} disabled={isProcessing} onClick={() => handleBobLockWatt(s)}>
+                                  {isProcessing ? "⏳ Attente..." : "2. Verrouiller WATT"}
+                                </button>
+
+                                <button className="btn-primary" disabled={isProcessing} style={{ padding: "8px 15px", fontSize: "0.85rem", background: "linear-gradient(135deg, #F7931A, #d97706)" }} onClick={async () => {
+                                    setIsProcessing(true);
+                                    const toastId = toast.loading("Réclamation des BTC...");
+                                    try {
+                                        const addr = await invoke("create_btc_htlc", {
+                                            buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey, secretHex: s.htlc_secret, locktime: 144
+                                        });
+                                        const res = await invoke("claim_btc_swap", {
+                                            masterSeedHex: walletData.master_seed_hex, htlcAddress: addr, secretHex: s.htlc_secret,
+                                            buyerPubkeyHex: s.buyer_btc_pubkey, sellerPubkeyHex: s.seller_btc_pubkey 
+                                        });
+                                        toast.success(res, { id: toastId, duration: 5000 });
+                                        setActionnedSwaps(prev => new Set(prev).add(s.htlc_hash));
+                                    } catch(e) { toast.error(e.toString(), { id: toastId }); }
+                                    finally { setIsProcessing(false); }
+                                }}>
+                                  3. Réclamer BTC (L1)
+                                </button>
+
+                                <div style={{display: "flex", gap: "5px"}}>
+                                  <button className="btn-danger" style={{flex: 1}} disabled={isProcessing} onClick={() => handleRefundWatt(s)}>
+                                    5. Refund WATT
+                                  </button>
+                                  <button 
+                                      className="btn-danger" 
+                                      style={{flex: 1, opacity: hasActioned ? 1 : 0.4, cursor: hasActioned ? "pointer" : "not-allowed"}}
+                                      onClick={() => removeSwapFromCache(s.htlc_hash)}
+                                  >
+                                      Cacher
+                                  </button>
+                                </div>
                               </div>
                             )}
                           </td>
@@ -644,41 +692,6 @@ function App() {
                     </tbody>
                   </table>
                 )}
-
-                {activeContractAddress && (
-                  <div style={{ marginTop: "30px", padding: "25px", background: "rgba(247, 147, 26, 0.05)", border: "1px solid rgba(247, 147, 26, 0.3)", borderRadius: "12px" }}>
-                    <h3 style={{ color: "var(--btc-color)", textAlign: "center", margin: "0 0 15px 0" }}>🔐 Coffre HTLC Bitcoin (Pour Alice)</h3>
-                    <div className="address-box mono" style={{ justifyContent: "center", fontSize: "1rem", color: "#FFF" }}>
-                      {activeContractAddress}
-                    </div>
-
-                    <div style={{ textAlign: "center", marginTop: "25px", display: "flex", gap: "15px", justifyContent: "center" }}>
-            <button className="btn-primary" style={{background: "linear-gradient(135deg, #F7931A, #d97706)"}} disabled={swapProgress > 0 || isProcessing} onClick={async () => {
-                      try {
-                        setIsProcessing(true); setSwapProgress(1);
-                        const loadingT = toast.loading("Envoi des BTC au contrat...");
-                        await invoke("send_btc_to_htlc", { masterSeedHex: walletData.master_seed_hex, htlcAddress: activeContractAddress, amountBtc: pendingSwaps[0].btc_amount_sats / 100000000 });
-                        setSwapProgress(2);
-                        toast.success("BTC verrouillés ! Attente de la contrepartie.", { id: loadingT, duration: 5000 });
-                      } catch (error) { toast.error(error.toString()); setSwapProgress(0); }
-                      finally { setIsProcessing(false); } 
-                    }}>
-                      {isProcessing && swapProgress === 1 ? "⏳ Minage..." : "2. Envoyer BTC"}
-                    </button>
-                    <button className="btn-primary" disabled={swapProgress < 2 || swapProgress === 4} onClick={async () => {
-                      try {
-                        setSwapProgress(3);
-                        const load = toast.loading("Exécution du Swap...");
-                        await invoke("claim_wattcoin_swap", { secret: pendingSwaps[0].htlc_secret, hash: pendingSwaps[0].htlc_hash, wattAddress: walletData.watt_address, amount: pendingSwaps[0].watt_amount_flames / 1000000000 });
-                        setSwapProgress(4);
-                        toast.success("Fonds débloqués !", { id: load });
-                      } catch (e) { toast.error(e.toString()); setSwapProgress(2); }
-                    }}>
-                      3. Réclamer WATT
-                    </button>
-                  </div>
-                </div>
-              )}
               </div>
             </div>
           </main>
