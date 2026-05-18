@@ -108,18 +108,25 @@ impl Blockchain {
         }
     }
 	
-	// 💡 Calcul de la Supply Totale
+    // 💡 Calcul de la Supply Totale (Précision Absolue)
     pub fn get_total_supply(&self) -> u64 {
         let mut supply = 0;
-        let mut current_base = INITIAL_REWARD;
-        for _ in 1..self.chain.len() {
-            supply += current_base;
-            current_base = Self::get_next_base_reward(current_base);
+        for i in 1..self.chain.len() {
+            let prev_block = &self.chain[i - 1];
+            let mut prev_fees = 0;
+            for tx in &prev_block.transactions {
+                if tx.tx_type != TransactionType::Coinbase { prev_fees += tx.fee; }
+            }
+            let prev_total_reward: u64 = if i == 1 { INITIAL_REWARD } else {
+                prev_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(INITIAL_REWARD)
+            };
+            let prev_base_reward = prev_total_reward.saturating_sub(prev_fees);
+            supply += Self::get_next_base_reward(prev_base_reward);
         }
         supply
     }
 
-    // 💡 Calcul du Jackpot en cours (Taxe 1% + Tickets des 10 derniers blocs)
+    // 💡 Calcul du Jackpot en cours
     pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
         let mut tickets = Vec::new();
         let mut pot = 0u64;
@@ -130,23 +137,23 @@ impl Blockchain {
             if (i as usize) < self.chain.len() {
                 let block = &self.chain[i as usize];
                 for tx in &block.transactions {
-                    // Ajout de la taxe des mineurs au pot
                     if tx.tx_type == TransactionType::Coinbase && tx.outputs.len() > 1 {
                         if tx.outputs[1].stealth_address == "LOTTERY_RESERVE" {
                             pot += tx.outputs[1].aes_vault.parse::<u64>().unwrap_or(0);
                         }
                     }
-                    // Ajout des tickets au pot
                     if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
                         if *target_block == target_height {
-                            tickets.push((tx.dilithium_signature.clone(), player_pubkey.clone()));
-                            pot += 10_000_000_000; // 10 WATT par ticket
+                            // 💡 FIX CRITIQUE : On utilise la capsule (persistante) au lieu de la signature (qui est PRUNED)
+                            let ticket_id = if !tx.outputs.is_empty() { tx.outputs[0].kyber_capsule.clone() } else { tx.dilithium_signature.clone() };
+                            tickets.push((ticket_id, player_pubkey.clone()));
+                            pot += 10_000_000_000; 
                         }
                     }
                 }
             }
         }
-        tickets.sort_by(|a, b| a.0.cmp(&b.0)); // Tri déterministe pour le consensus
+        tickets.sort_by(|a, b| a.0.cmp(&b.0)); 
         (pot, tickets)
     }
 

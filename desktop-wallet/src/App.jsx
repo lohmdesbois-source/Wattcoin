@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Toaster, toast } from "react-hot-toast";
-import { Copy, Check, Lock, Unlock, Settings, ScrollText, ArrowRightLeft, Shield, Send, Zap, Bitcoin, Trash2, Download, EyeOff } from "lucide-react";
+import { Copy, Check, Lock, Unlock, Settings, ScrollText, ArrowRightLeft, Shield, Send, Zap, Bitcoin, Trash2, Download, EyeOff, Dices, QrCode } from "lucide-react";
 import "./App.css";
 
 function App() {
@@ -14,9 +14,13 @@ function App() {
   
   const [wattBalance, setWattBalance] = useState(0.0);
   const [btcBalance, setBtcBalance] = useState(0.0);
+  const [lnBalance, setLnBalance] = useState(0); // ⚡ Solde Lightning en Sats
   const [btcUsdPrice, setBtcUsdPrice] = useState(0.0); 
   const [globalWattPriceSats, setGlobalWattPriceSats] = useState(0);
   
+  const [totalSupply, setTotalSupply] = useState(0);
+  const [currentJackpot, setCurrentJackpot] = useState(0);
+
   const [activeCoinModal, setActiveCoinModal] = useState(null); 
   const [showSeed, setShowSeed] = useState(false);
   const [copied, setCopied] = useState("");
@@ -34,14 +38,19 @@ function App() {
   const [txHistory, setTxHistory] = useState([]);
   const [syncMessage, setSyncMessage] = useState("Établissement du tunnel Tor...");
 
-  // 💡 NOUVEAU : Mémoire des swaps "verrouillés/cliqués" pour protéger le bouton cacher
   const [actionnedSwaps, setActionnedSwaps] = useState(new Set());
+  
+  // ⚡ Lightning States
+  const [lnModalTab, setLnModalTab] = useState("pay"); // 'pay' ou 'receive'
+  const [lnInvoiceStr, setLnInvoiceStr] = useState("");
+  const [lnGenAmount, setLnGenAmount] = useState("");
+  const [lnGeneratedInvoice, setLnGeneratedInvoice] = useState("");
 
   const handleCopy = (e, text, type) => {
     e.stopPropagation(); 
     navigator.clipboard.writeText(text);
     setCopied(type);
-    toast.success("Adresse copiée !");
+    toast.success("Copié dans le presse-papier !");
     setTimeout(() => setCopied(""), 2000);
   };
 
@@ -74,12 +83,24 @@ function App() {
           const hist = await invoke("get_history", { keys: walletData });
           setTxHistory(hist);
 
+          try {
+            const supply = await invoke("get_total_supply");
+            setTotalSupply(supply);
+            const jackpot = await invoke("get_current_jackpot");
+            setCurrentJackpot(jackpot);
+          } catch(e) {}
+
           setView("dashboard");
           toast.success("Synchronisation terminée, coffre ouvert !");
 
           invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex })
             .then(balBTC => setBtcBalance(balBTC))
-            .catch(btcError => console.warn("Erreur BTC en arrière-plan :", btcError));
+            .catch(btcError => console.warn("Erreur BTC L1 :", btcError));
+
+          // ⚡ Initialisation Lightning
+          invoke("get_lightning_balance", { masterSeedHex: walletData.master_seed_hex })
+            .then(balSats => setLnBalance(balSats))
+            .catch(err => console.warn("Erreur Lightning :", err));
 
         } catch (e) {
           console.error("Erreur de sync initiale:", e);
@@ -92,37 +113,38 @@ function App() {
   }, [view, walletData]);
 
   useEffect(() => {
-    if (view !== "dex" && view !== "dashboard" && view !== "swaps" && view !== "history") return;
+    if (view !== "dex" && view !== "dashboard" && view !== "swaps" && view !== "history" && view !== "casino") return;
 
     const updateData = async () => {
       if (!walletData) return;
       try { const balWATT = await invoke("get_watt_balance", { keys: walletData }); setWattBalance(balWATT); } catch (e) {}
       try { const hist = await invoke("get_history", { keys: walletData }); setTxHistory(hist); } catch (e) {}
       try { const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex }); setBtcBalance(balBTC); } catch (e) {}
-      
+      try { const balLN = await invoke("get_lightning_balance", { masterSeedHex: walletData.master_seed_hex }); setLnBalance(balLN); } catch (e) {}
+
+      try {
+        const supply = await invoke("get_total_supply");
+        setTotalSupply(supply);
+        const jackpot = await invoke("get_current_jackpot");
+        setCurrentJackpot(jackpot);
+      } catch(e) {}
+
       if (view === "dex") {
         try { const pool = await invoke("get_dark_pool"); setDarkPool(pool); } catch (e) {}
       }
 
       try {
         const apiSwaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
-        
-        // 🛡️ SAUVEGARDE LOCALE : On ne fait pas aveuglément confiance à l'API pour l'affichage !
         const cachedStr = localStorage.getItem('my_swaps');
         const cachedSwaps = cachedStr ? JSON.parse(cachedStr) : [];
-        
         const combined = [...apiSwaps];
         cachedSwaps.forEach(cached => {
-            // Si le swap est dans notre cache local mais que l'API l'a supprimé, 
-            // on le garde à l'écran pour pouvoir finir nos actions (réclamer BTC ou Refund) !
             if (!combined.find(s => s.htlc_hash === cached.htlc_hash)) {
                 combined.push(cached);
             }
         });
-        
         localStorage.setItem('my_swaps', JSON.stringify(combined));
         setPendingSwaps(combined);
-
       } catch (e) {}
     };
     
@@ -141,12 +163,9 @@ function App() {
 
     const timerDex = setInterval(async () => {
       if (view === "dex") {
-        try { 
-          const pool = await invoke("get_dark_pool"); 
-          setDarkPool(pool); 
-        } catch (e) {}
+        try { const pool = await invoke("get_dark_pool"); setDarkPool(pool); } catch (e) {}
       }
-    }, 5000); // Rafraîchit la piscine toutes les 5 secondes
+    }, 5000);
 
     return () => { clearInterval(timerDex); if (unlisten) unlisten(); };
   }, [view, walletData]);
@@ -248,6 +267,41 @@ function App() {
     }
   };
 
+  // --- ACTIONS LIGHTNING ---
+  const handlePayLightningInvoice = async () => {
+    if (!lnInvoiceStr) return;
+    setIsProcessing(true);
+    const toastId = toast.loading("Routage du paiement Lightning...");
+    try {
+        const res = await invoke("pay_lightning_invoice", { 
+            masterSeedHex: walletData.master_seed_hex, // 💡 AJOUTÉ ICI
+            invoice: lnInvoiceStr 
+        });
+        toast.success(res, { id: toastId, duration: 5000 });
+        setLnInvoiceStr("");
+        setActiveCoinModal(null);
+    } catch(e) {
+        toast.error(e.toString(), { id: toastId });
+    } finally { setIsProcessing(false); }
+  };
+
+  const handleGenerateInvoice = async () => {
+    if (!lnGenAmount) return;
+    setIsProcessing(true);
+    const toastId = toast.loading("Génération de la facture BOLT11...");
+    try {
+        const invoice = await invoke("create_lightning_invoice", { 
+            masterSeedHex: walletData.master_seed_hex, // 💡 AJOUTÉ ICI
+            amountSats: parseInt(lnGenAmount), 
+            description: "Paiement depuis Wattcoin Wallet" 
+        });
+        setLnGeneratedInvoice(invoice);
+        toast.success("Facture prête !", { id: toastId });
+    } catch(e) {
+        toast.error(e.toString(), { id: toastId });
+    } finally { setIsProcessing(false); }
+  };
+
   // --- ACTIONS DU SWAP ---
 
   const handleBobLockWatt = async (swap) => {
@@ -314,6 +368,7 @@ function App() {
         <li className={activeTab === "dashboard" ? "active" : ""} onClick={() => setView("dashboard")}><Lock size={18}/> Portefeuilles</li>
         <li className={activeTab === "dex" ? "active" : ""} onClick={() => setView("dex")}><ArrowRightLeft size={18}/> DEX (FBA)</li>
         <li className={activeTab === "swaps" ? "active" : ""} onClick={() => setView("swaps")}><Shield size={18}/> Atomic Swaps</li>
+        <li className={activeTab === "casino" ? "active" : ""} onClick={() => setView("casino")}><Dices size={18}/> Casino L1</li>
         <li className={activeTab === "history" ? "active" : ""} onClick={() => setView("history")}><ScrollText size={18}/> Historique</li>
         <li className={activeTab === "settings" ? "active" : ""} onClick={() => setView("settings")}><Settings size={18}/> Paramètres</li>
         <li onClick={() => { setWalletData(null); setView("unlock"); toast.success("Coffre verrouillé"); }} style={{marginTop: "auto", color: "#ef4444"}}><Lock size={18}/> Verrouiller</li>
@@ -321,12 +376,20 @@ function App() {
     </nav>
   );
 
-  // ================= CALCULS DE VALEURS (DASHBOARD) =================
+  // ================= CALCULS DE VALEURS =================
   const wattBtcPrice = globalWattPriceSats / 100000000;
   const wattUsdPrice = wattBtcPrice * btcUsdPrice;
   const totalWattValueUsd = wattBalance * wattUsdPrice;
   const totalBtcValueUsd = btcBalance * btcUsdPrice;
-  const grandTotalUsd = totalWattValueUsd + totalBtcValueUsd;
+  const lnBtcValueUsd = (lnBalance / 100000000) * btcUsdPrice; // LN est en sats
+  const grandTotalUsd = totalWattValueUsd + totalBtcValueUsd + lnBtcValueUsd;
+  
+  // Formatage propre pour l'affichage
+  const displayTotalSupply = (totalSupply / 1000000000).toLocaleString(undefined, { minimumFractionDigits: 9, maximumFractionDigits: 9 });
+  const displayJackpot = (currentJackpot / 1000000000).toLocaleString(undefined, { minimumFractionDigits: 9, maximumFractionDigits: 9 });
+  const jackpotUsd = ((currentJackpot / 1000000000) * wattUsdPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  
+  const hasWonJackpot = txHistory.some(tx => tx.status.includes("Jackpot gagné"));
 
   // ================= MAIN RENDER =================
 
@@ -335,20 +398,9 @@ function App() {
       <Toaster 
         position="bottom-right" 
         toastOptions={{ 
-          // 💡 Configuration globale
           style: { background: '#1a1d24', color: '#fff', border: '1px solid #00F0FF', fontFamily: 'Inter' },
-          
-          // 💡 Temps d'affichage pour les SUCCÈS (5 secondes)
-          success: { 
-            duration: 5000,
-            iconTheme: { primary: '#00F0FF', secondary: '#000' } 
-          },
-          
-          // 💡 Temps d'affichage pour les ERREURS (8 secondes pour bien lire !)
-          error: {
-            duration: 8000,
-            style: { border: '1px solid #ef4444' } // Bordure rouge pour les erreurs
-          }
+          success: { duration: 5000, iconTheme: { primary: '#00F0FF', secondary: '#000' } },
+          error: { duration: 8000, style: { border: '1px solid #ef4444' } }
         }} 
       />
 
@@ -392,13 +444,36 @@ function App() {
       {view === "dashboard" && (
         <div className="dashboard-layout"><Sidebar activeTab="dashboard" />
           <main className="main-content">
-            <header style={{ marginBottom: "40px" }}>
-              <p style={{ color: "var(--text-muted)", textTransform: "uppercase", fontSize: "0.8rem", letterSpacing: "1px", marginBottom: "5px" }}>Valeur totale du coffre</p>
-              <h1 style={{ fontSize: "3.5rem", fontWeight: "900", color: "#FFF" }}>
-                ${grandTotalUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 
-                <span style={{ fontSize: "1.2rem", color: "var(--text-muted)", marginLeft: "10px" }}>USD</span>
-              </h1>
-            </header>
+            
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: "40px" }}>
+                <header>
+                  <p style={{ color: "var(--text-muted)", textTransform: "uppercase", fontSize: "0.8rem", letterSpacing: "1px", marginBottom: "5px" }}>Valeur totale du coffre</p>
+                  <h1 style={{ fontSize: "3.5rem", fontWeight: "900", color: "#FFF" }}>
+                    ${grandTotalUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 
+                    <span style={{ fontSize: "1.2rem", color: "var(--text-muted)", marginLeft: "10px" }}>USD</span>
+                  </h1>
+                </header>
+
+                <div className="glass-panel" style={{ padding: "15px 20px", border: "1px solid rgba(255,255,255,0.1)", textAlign: "right", display: "flex", flexDirection: "column", gap: "10px", minWidth: "260px" }}>
+                    <div>
+                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "1px" }}>Supply Totale</div>
+                        <div className="mono" style={{ fontSize: "1.15rem", fontWeight: "bold", color: "var(--primary)", marginTop: "4px" }}>
+                            {displayTotalSupply} <span style={{fontSize: "0.8rem"}}>WATT</span>
+                        </div>
+                    </div>
+                    <div style={{ borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: "10px" }}>
+                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "1px", display: "flex", alignItems: "center", justifyContent: "flex-end", gap: "6px" }}>
+                            <Dices size={14} /> Jackpot L1
+                        </div>
+                        <div className="mono" style={{ fontSize: "1.15rem", fontWeight: "bold", color: "#f59e0b", marginTop: "4px" }}>
+                            {displayJackpot} <span style={{fontSize: "0.8rem"}}>WATT</span>
+                        </div>
+                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "2px" }}>
+                            ≈ ${jackpotUsd} USD
+                        </div>
+                    </div>
+                </div>
+            </div>
 
             <div className="networks-stack">
               
@@ -449,42 +524,185 @@ function App() {
                   ≈ ${totalBtcValueUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} USD
                 </div>
               </div>
+
+              {/* ⚡ NOUVEAU : LA CARTE LIGHTNING NETWORK */}
+              <div className="network-card interactive-card" style={{ borderTopColor: "rgba(253, 224, 71, 0.5)", background: "linear-gradient(to bottom right, rgba(0,0,0,0.4), rgba(253, 224, 71, 0.05))" }} onClick={() => setActiveCoinModal('LN')}>
+                <div className="network-header">
+                  <div style={{ display: "flex", flexDirection: "column" }}>
+                    <h2 style={{ display: "flex", alignItems: "center", gap: "8px", color: "#fef08a" }}><Zap color="#fef08a" fill="#fef08a"/> Bitcoin Lightning</h2>
+                    <div style={{ color: "rgba(253, 224, 71, 0.7)", fontSize: "0.85rem", marginTop: "4px", fontWeight: "600" }}>
+                      Layer 2 • Instantané
+                    </div>
+                  </div>
+                  <span className="badge" style={{ background: "rgba(253, 224, 71, 0.1)", color: "#fef08a", border: "1px solid rgba(253, 224, 71, 0.3)" }}>⚡ LDK Node</span>
+                </div>
+                
+                <div style={{ marginTop: "20px", fontSize: "2.5rem", fontWeight: "900", color: "#fef08a" }}>
+                  {lnBalance.toLocaleString()} <span style={{ fontSize: "1.2rem", color: "rgba(253, 224, 71, 0.7)" }}>SATS</span>
+                </div>
+                <div style={{ fontSize: "1.1rem", color: "var(--text-muted)", marginTop: "5px" }}>
+                  ≈ ${lnBtcValueUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} USD
+                </div>
+              </div>
               
             </div>
 
+            {/* 💡 MODALES DE PAIEMENT UNIFIÉES */}
             {activeCoinModal && (
               <div className="modal-overlay" onClick={() => setActiveCoinModal(null)}>
                 <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-                  <div className="modal-header">
-                    <h2 style={{display: "flex", alignItems: "center", gap: "8px"}}><Send color={activeCoinModal === 'WATT' ? 'var(--primary)' : 'var(--btc-color)'} /> Envoyer {activeCoinModal}</h2>
-                    <button className="close-btn" onClick={() => setActiveCoinModal(null)}>✖</button>
-                  </div>
-                  <div className="send-form" style={{ marginTop: "10px" }}>
-                    <div style={{ fontSize: "0.9rem", color: "var(--text-muted)", marginBottom: "15px", textAlign: "right" }}>
-                      Solde : <span style={{ color: "var(--text-main)", fontWeight: "bold" }}>
-                        {activeCoinModal === 'WATT' ? wattBalance.toFixed(9) : btcBalance.toFixed(8)}
-                      </span> {activeCoinModal}
-                    </div>
-                    <input type="text" placeholder={`Adresse ${activeCoinModal} du destinataire`} value={sendAddress} onChange={(e) => setSendAddress(e.target.value)} style={{ width: "100%", marginBottom: "15px" }} />
-                    <input type="number" placeholder={`Montant en ${activeCoinModal}`} value={sendAmount} onChange={(e) => setSendAmount(e.target.value)} style={{ width: "100%", marginBottom: "25px" }} />
-                    <button 
-                      className="btn-primary" 
-                      disabled={isProcessing} 
-                      onClick={handleSendTransaction} 
-                      style={{ width: "100%", padding: "12px", fontSize: "1.1rem", opacity: isProcessing ? 0.7 : 1, cursor: isProcessing ? "not-allowed" : "pointer", background: activeCoinModal === 'BTC' ? 'linear-gradient(135deg, #F7931A, #d97706)' : '' }}
-                    >
-                      {isProcessing ? "⏳ Chiffrement..." : "Signer & Envoyer"}
-                    </button>
-                    
-                    {isProcessing && activeCoinModal === "WATT" && (
-                      <div style={{ marginTop: "15px", color: "var(--primary)", textAlign: "center", fontSize: "0.9rem", fontWeight: "bold" }}>
-                        ⚡ Création de la preuve ZKP Lattice en cours...
-                      </div>
-                    )}
-                  </div>
+                  
+                  {/* MODALE POUR WATT ET BTC L1 */}
+                  {activeCoinModal !== 'LN' ? (
+                      <>
+                        <div className="modal-header">
+                          <h2 style={{display: "flex", alignItems: "center", gap: "8px"}}><Send color={activeCoinModal === 'WATT' ? 'var(--primary)' : 'var(--btc-color)'} /> Envoyer {activeCoinModal}</h2>
+                          <button className="close-btn" onClick={() => setActiveCoinModal(null)}>✖</button>
+                        </div>
+                        <div className="send-form" style={{ marginTop: "10px" }}>
+                          <div style={{ fontSize: "0.9rem", color: "var(--text-muted)", marginBottom: "15px", textAlign: "right" }}>
+                            Solde : <span style={{ color: "var(--text-main)", fontWeight: "bold" }}>
+                              {activeCoinModal === 'WATT' ? wattBalance.toFixed(9) : btcBalance.toFixed(8)}
+                            </span> {activeCoinModal}
+                          </div>
+                          <input type="text" placeholder={`Adresse ${activeCoinModal} du destinataire`} value={sendAddress} onChange={(e) => setSendAddress(e.target.value)} style={{ width: "100%", marginBottom: "15px" }} />
+                          <input type="number" placeholder={`Montant en ${activeCoinModal}`} value={sendAmount} onChange={(e) => setSendAmount(e.target.value)} style={{ width: "100%", marginBottom: "25px" }} />
+                          <button 
+                            className="btn-primary" 
+                            disabled={isProcessing} 
+                            onClick={handleSendTransaction} 
+                            style={{ width: "100%", padding: "12px", fontSize: "1.1rem", opacity: isProcessing ? 0.7 : 1, cursor: isProcessing ? "not-allowed" : "pointer", background: activeCoinModal === 'BTC' ? 'linear-gradient(135deg, #F7931A, #d97706)' : '' }}
+                          >
+                            {isProcessing ? "⏳ Chiffrement..." : "Signer & Envoyer"}
+                          </button>
+                          
+                          {isProcessing && activeCoinModal === "WATT" && (
+                            <div style={{ marginTop: "15px", color: "var(--primary)", textAlign: "center", fontSize: "0.9rem", fontWeight: "bold" }}>
+                              ⚡ Création de la preuve ZKP Lattice en cours...
+                            </div>
+                          )}
+                        </div>
+                      </>
+                  ) : (
+                      /* ⚡ MODALE SPÉCIFIQUE LIGHTNING */
+                      <>
+                        <div className="modal-header">
+                          <h2 style={{display: "flex", alignItems: "center", gap: "8px", color: "#fef08a"}}><Zap color="#fef08a" fill="#fef08a"/> Lightning L2</h2>
+                          <button className="close-btn" onClick={() => setActiveCoinModal(null)}>✖</button>
+                        </div>
+                        
+                        <div className="form-tabs" style={{marginTop: "20px", marginBottom: "20px"}}>
+                          <div className={`tab-btn ${lnModalTab === "pay" ? "active" : ""}`} style={{borderColor: lnModalTab === "pay" ? "#fef08a" : "", color: lnModalTab === "pay" ? "#fef08a" : ""}} onClick={() => setLnModalTab("pay")}>Envoyer</div>
+                          <div className={`tab-btn ${lnModalTab === "receive" ? "active" : ""}`} style={{borderColor: lnModalTab === "receive" ? "#fef08a" : "", color: lnModalTab === "receive" ? "#fef08a" : ""}} onClick={() => setLnModalTab("receive")}>Recevoir</div>
+                        </div>
+
+                        {lnModalTab === "pay" ? (
+                            <div className="send-form">
+                                <div style={{ fontSize: "0.9rem", color: "var(--text-muted)", marginBottom: "15px", textAlign: "right" }}>
+                                    Capacité : <span style={{ color: "#fef08a", fontWeight: "bold" }}>{lnBalance.toLocaleString()}</span> SATS
+                                </div>
+                                <textarea 
+                                    placeholder="Collez une facture Lightning (lnbcrt...)" 
+                                    value={lnInvoiceStr} 
+                                    onChange={(e) => setLnInvoiceStr(e.target.value)} 
+                                    style={{ width: "100%", marginBottom: "20px", height: "80px", resize: "none", background: "rgba(0,0,0,0.5)", border: "1px solid #444", color: "#fff", padding: "10px", borderRadius: "8px" }} 
+                                />
+                                <button 
+                                    className="btn-primary" 
+                                    disabled={isProcessing || !lnInvoiceStr} 
+                                    onClick={handlePayLightningInvoice} 
+                                    style={{ width: "100%", padding: "12px", fontSize: "1.1rem", background: "linear-gradient(135deg, #ca8a04, #a16207)" }}
+                                >
+                                    {isProcessing ? "⏳ Routage..." : "Payer la facture"}
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="send-form">
+                                <input 
+                                    type="number" 
+                                    placeholder="Montant à recevoir (en Sats)" 
+                                    value={lnGenAmount} 
+                                    onChange={(e) => setLnGenAmount(e.target.value)} 
+                                    style={{ width: "100%", marginBottom: "15px" }} 
+                                />
+                                <button 
+                                    className="btn-secondary" 
+                                    disabled={isProcessing || !lnGenAmount} 
+                                    onClick={handleGenerateInvoice} 
+                                    style={{ width: "100%", padding: "10px", marginBottom: "20px", border: "1px solid #fef08a", color: "#fef08a" }}
+                                >
+                                    {isProcessing ? "⏳ Génération..." : "Créer la facture"}
+                                </button>
+
+                                {lnGeneratedInvoice && (
+                                    <div style={{ background: "rgba(254, 240, 138, 0.1)", padding: "15px", borderRadius: "8px", border: "1px dashed rgba(254, 240, 138, 0.3)", textAlign: "center" }}>
+                                        <QrCode size={120} color="#fef08a" style={{ margin: "0 auto 15px auto", display: "block" }} />
+                                        <p className="mono" style={{ fontSize: "0.75rem", wordBreak: "break-all", color: "#aaa", marginBottom: "10px" }}>{lnGeneratedInvoice}</p>
+                                        <button onClick={(e) => handleCopy(e, lnGeneratedInvoice, 'INV')} style={{ background: "transparent", border: "none", color: "#fef08a", cursor: "pointer", fontWeight: "bold" }}>
+                                            {copied === 'INV' ? <Check size={16} style={{display: "inline", verticalAlign: "middle"}}/> : <Copy size={16} style={{display: "inline", verticalAlign: "middle"}}/>} Copier BOLT11
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                      </>
+                  )}
                 </div>
               </div>
             )}
+          </main>
+        </div>
+      )}
+
+      {view === "casino" && (
+        <div className="dashboard-layout"><Sidebar activeTab="casino" />
+          <main className="main-content">
+            <header>
+              <h1 style={{ display: "flex", alignItems: "center", gap: "15px" }}><Dices /> Cyber-Jackpot L1</h1>
+              <p style={{ color: "var(--text-muted)" }}>La loterie inviolable ancrée dans le consensus. Tirage tous les 10 blocs.</p>
+            </header>
+
+            <div className="glass-panel" style={{ padding: "50px", maxWidth: "700px", marginTop: "40px", margin: "40px auto", textAlign: "center", border: "1px solid var(--primary)", boxShadow: "0 0 40px rgba(0, 240, 255, 0.1)" }}>
+              
+              {hasWonJackpot && (
+                <div style={{ background: "rgba(16, 185, 129, 0.2)", color: "#10b981", padding: "15px", borderRadius: "8px", border: "1px solid #10b981", marginBottom: "30px", fontWeight: "bold", display: "flex", alignItems: "center", justifyContent: "center", gap: "10px" }}>
+                  🎉 FÉLICITATIONS ! Vous avez remporté le Jackpot ! Les fonds sont dans votre coffre.
+                </div>
+              )}
+
+              <h2 style={{ fontSize: "1.2rem", textTransform: "uppercase", letterSpacing: "2px", color: "var(--text-muted)" }}>À gagner au prochain bloc</h2>
+              <div style={{ fontSize: "4rem", fontWeight: "900", color: "var(--primary)", marginTop: "20px", textShadow: "0 0 20px rgba(0, 240, 255, 0.4)" }}>
+                  {displayJackpot} <span style={{fontSize: "1.5rem"}}>WATT</span>
+              </div>
+              <div style={{ fontSize: "1.2rem", color: "var(--text-muted)", marginBottom: "20px" }}>
+                  ≈ ${jackpotUsd} USD
+              </div>
+              <p style={{ color: "#aaa", marginBottom: "40px", fontSize: "0.9rem" }}>La cagnotte est alimentée par une taxe de 1% sur tous les frais du réseau, plus les tickets des joueurs.</p>
+              
+              <button 
+                className="btn-primary" 
+                style={{ width: "100%", padding: "18px", fontSize: "1.2rem", fontWeight: "bold", background: "linear-gradient(135deg, var(--primary), #0088ff)" }}
+                disabled={isProcessing}
+                onClick={async () => {
+                  if (wattBalance < 10) { toast.error("Fonds insuffisants ! Il vous faut 10 WATT."); return; }
+                  setIsProcessing(true);
+                  const toastId = toast.loading("Verrouillage du ticket dans le contrat...");
+                  try {
+                    const res = await invoke("buy_lottery_ticket", {
+                      senderDilithiumSecretHex: walletData.dilithium_secret_hex, senderDilithiumPublicHex: walletData.dilithium_public_hex,
+                      senderKyberSecretHex: walletData.kyber_secret_hex, senderKyberPublicHex: walletData.watt_address
+                    });
+                    toast.success(res, { id: toastId, duration: 6000 });
+                    setWattBalance(prev => prev - 10);
+                    setCurrentJackpot(prev => prev + 10000000000); 
+                  } catch (error) { toast.error(error.toString(), { id: toastId }); }
+                  finally { setIsProcessing(false); }
+                }}
+              >
+                {isProcessing ? "⏳ Frappe du ticket..." : "🎟️ Acheter un ticket (10 WATT)"}
+              </button>
+              <p style={{ marginTop: "20px", fontSize: "0.8rem", color: "var(--text-muted)" }}>Si vous gagnez, les fonds apparaîtront automatiquement sur ce portefeuille.</p>
+            </div>
           </main>
         </div>
       )}
@@ -629,6 +847,7 @@ function App() {
                                             secret: s.htlc_secret, hash: s.htlc_hash, wattAddress: walletData.watt_address, amount: s.watt_amount_flames / 1000000000
                                         });
                                         toast.success(res, { id: toastId, duration: 5000 });
+                                        //toast.success("⚡ N'oubliez pas de lancer votre mineur pour valider la réception !");
                                         setActionnedSwaps(prev => new Set(prev).add(s.htlc_hash));
                                     } catch(e) { toast.error(e.toString(), { id: toastId }); }
                                     finally { setIsProcessing(false); }
@@ -720,7 +939,7 @@ function App() {
                         <div className="mono" style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: "5px" }}>{tx.date} • {tx.id}</div>
                       </div>
                       <div style={{ textAlign: "right" }}>
-                        <div style={{ color: "var(--primary)", fontWeight: "bold", fontSize: "1.2rem" }}>+{tx.amount.toFixed(4)} {tx.coin}</div>
+                        <div style={{ color: "var(--primary)", fontWeight: "bold", fontSize: "1.2rem" }}>+{tx.amount.toFixed(9)} {tx.coin}</div>
                         <div style={{ color: tx.status.includes("Dépensé") ? "#ef4444" : "var(--text-muted)", fontSize: "0.85rem", fontWeight: "bold", marginTop: "5px" }}>{tx.status}</div>
                       </div>
                     </div>

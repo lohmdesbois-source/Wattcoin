@@ -44,4 +44,6 @@ pqcrypto-traits = "0.3"
 arti-client = { version = "0.22.0", features = ["tokio", "rustls", "onion-service-client", "full"] }
 once_cell = "1.19.0"
 tor-rtcompat = "0.22.0"
+ldk-node = "0.6.2"
+lightning-invoice = "0.26.0"
 

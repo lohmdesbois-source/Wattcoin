@@ -18,6 +18,11 @@ use arti_client::{TorClient, TorClientConfig, StreamPrefs};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tor_rtcompat::PreferredRuntime;
+use ldk_node::Builder;
+use ldk_node::bitcoin::Network as LdkNetwork;
+
+// 💡 Notre Node L2 persistant en mémoire vive
+static LDK_NODE: Lazy<AsyncMutex<Option<std::sync::Arc<ldk_node::Node>>>> = Lazy::new(|| AsyncMutex::new(None));
 
 const ONION_NODE: &str = "jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64yd.onion:8100";
 const VAULT_FILE: &str = ".wattcoin_vault";
@@ -307,6 +312,8 @@ pub enum TransactionType {
     HTLCClaim { secret: String },
     HTLCRefund { hash: String },
     DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> },
+    HTLCLottery { target_block: u64, player_pubkey: String }, 
+    LotteryPayout { target_block: u64, winner_pubkey: String },
 }
 
 #[derive(Serialize)]
@@ -350,6 +357,216 @@ async fn get_network_info() -> Result<serde_json::Value, String> {
         println!("❌ [JSON ERROR INFO] {} | Data: {}", e, res_str);
         e.to_string()
     })
+}
+
+// 💡 NOUVEAU: Fetch de la Supply depuis le Nœud Core
+#[tauri::command]
+async fn get_total_supply() -> Result<u64, String> {
+    let res_str = tor_fetch("GET", "/supply", None).await?;
+    let supply: u64 = serde_json::from_str(&res_str).unwrap_or(0);
+    Ok(supply)
+}
+
+// 💡 NOUVEAU: Fetch du Jackpot depuis le Nœud Core
+#[tauri::command]
+async fn get_current_jackpot() -> Result<u64, String> {
+    let res_str = tor_fetch("GET", "/jackpot", None).await?;
+    let pot: u64 = serde_json::from_str(&res_str).unwrap_or(0);
+    Ok(pot)
+}
+
+// 💡 NOUVEAU: Achat d'un ticket de loterie
+#[tauri::command]
+async fn buy_lottery_ticket(
+    sender_dilithium_secret_hex: String, sender_dilithium_public_hex: String, 
+    sender_kyber_secret_hex: String, sender_kyber_public_hex: String
+) -> Result<String, String> {
+    use pqcrypto_kyber::kyber768; use pqcrypto_dilithium::dilithium3; use rand::Rng; use rand::seq::SliceRandom;
+    
+    let ticket_price = 10_000_000_000u64; // 10 WATT (10 Milliards de Flames)
+    let fee: u64 = 1000; // Frais de réseau 
+    let required_total = ticket_price + fee;
+
+    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
+    
+    let mut spent_capsules = std::collections::HashSet::new();
+    if let Ok(spends) = std::fs::read_to_string(".wattcoin_spends") { 
+        for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); } 
+    }
+
+    let sk_bytes = hex::decode(&sender_kyber_secret_hex).unwrap_or_default();
+    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
+    
+    let mut selected_utxos = Vec::new();
+    let mut current_input_sum = 0u64;
+
+    for tx in all_txs {
+        for out in tx.outputs {
+            if spent_capsules.contains(&out.kyber_capsule) { continue; }
+            let mut is_mine = false; let mut val = 0;
+            if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) || out.stealth_address == format!("JACKPOT_{}", sender_kyber_public_hex) {
+                val = out.aes_vault.parse::<u64>().unwrap_or(0); is_mine = true;
+            } else if out.stealth_address.starts_with("pq_watt_") {
+                if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
+                    if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
+                        let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
+                        if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
+                            if vault_bytes.len() > 12 {
+                                let nonce = Nonce::from_slice(&vault_bytes[0..12]);
+                                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes()));
+                                if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
+                                    if let Ok(payload_str) = String::from_utf8(plaintext) {
+                                        let parts: Vec<&str> = payload_str.split('|').collect();
+                                        if parts.len() == 2 { if let Ok(amt) = parts[0].parse::<u64>() { val = amt; is_mine = true; } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if is_mine && val > 0 {
+                selected_utxos.push((val, out.kyber_capsule.clone(), out.lattice_commitment.clone()));
+                current_input_sum += val;
+                if current_input_sum >= required_total { break; }
+            }
+        }
+        if current_input_sum >= required_total { break; }
+    }
+
+    if current_input_sum < required_total { return Err("❌ Fonds insuffisants pour acheter un ticket (10 WATT requis)".to_string()); }
+
+    let change_amount = current_input_sum - required_total;
+    let mut outputs = Vec::new();
+
+    // 💡 OUTPUT 1 : LE TICKET (10 WATT en clair vers LOTTERY_RESERVE)
+    let mut bf_ticket = [0u32; LATTICE_DIM];
+    for val in bf_ticket.iter_mut() { *val = rand::thread_rng().gen_range(0..LATTICE_Q); }
+    
+    let mut ticket_capsule = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut ticket_capsule);
+
+    outputs.push(TransactionOutput {
+        stealth_address: "LOTTERY_RESERVE".to_string(),
+        kyber_capsule: hex::encode(ticket_capsule),
+        aes_vault: ticket_price.to_string(), // 💡 Montant en clair exigé par le consensus
+        lattice_commitment: LWECommitment::commit(ticket_price, bf_ticket),
+    });
+
+    // 💡 OUTPUT 2 : LE CHANGE (Masqué)
+    if change_amount > 0 {
+        let my_pk_bytes = hex::decode(&sender_kyber_public_hex).unwrap();
+        let my_pk = kyber768::PublicKey::from_bytes(&my_pk_bytes).unwrap();
+        let (my_shared_secret, kyber_capsule_2) = kyber768::encapsulate(&my_pk);
+
+        let mut otp_2 = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp_2);
+        let payload_2 = format!("{}|{}", change_amount, hex::encode(otp_2));
+        let aes_key_2 = Key::<Aes256Gcm>::from_slice(my_shared_secret.as_bytes());
+        let mut nonce_bytes_2 = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes_2);
+        let encrypted_data_2 = Aes256Gcm::new(aes_key_2).encrypt(Nonce::from_slice(&nonce_bytes_2), payload_2.as_bytes()).unwrap();
+        let mut final_vault_2 = nonce_bytes_2.to_vec(); final_vault_2.extend_from_slice(&encrypted_data_2);
+
+        let sum_inputs_t0 = selected_utxos.iter().map(|u| u.2.t_vector[0] as u64).sum::<u64>() % (LATTICE_Q as u64);
+        let fee_t0 = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
+        let expected_outputs_sum = (sum_inputs_t0 + (LATTICE_Q as u64) - fee_t0) % (LATTICE_Q as u64);
+        
+        let ticket_t0 = outputs[0].lattice_commitment.t_vector[0] as u64;
+        let perfect_change_t0 = (expected_outputs_sum + (LATTICE_Q as u64) - ticket_t0) % (LATTICE_Q as u64);
+        
+        let mut t_vector_2 = vec![0u32; LATTICE_DIM];
+        t_vector_2[0] = perfect_change_t0 as u32;
+        for i in 1..LATTICE_DIM { t_vector_2[i] = rand::thread_rng().gen_range(0..LATTICE_Q); }
+
+        outputs.push(TransactionOutput {
+            stealth_address: format!("pq_watt_{}", hex::encode(&otp_2[0..8])), 
+            kyber_capsule: hex::encode(kyber_capsule_2.as_bytes()),
+            aes_vault: hex::encode(final_vault_2), 
+            lattice_commitment: LWECommitment { a_matrix_seed: [0u8; 32], t_vector: t_vector_2 },
+        });
+    }
+
+    let tx_data_to_sign = format!("{:?}{}", outputs, fee);
+    let mut final_inputs = Vec::new();
+    let sk_bytes = hex::decode(&sender_dilithium_secret_hex).unwrap();
+    let dilithium_secret = dilithium3::SecretKey::from_bytes(&sk_bytes).unwrap();
+    let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
+
+    let decoy_res = tor_fetch("GET", "/get_decoys/10", None).await.unwrap_or_default();
+    let real_decoys: Vec<String> = serde_json::from_str(&decoy_res).unwrap_or_default();
+
+    for utxo in &selected_utxos {
+        let mut pq_ring: Vec<String> = real_decoys.clone();
+        while pq_ring.len() < 10 { let (fake_pk, _) = dilithium3::keypair(); pq_ring.push(hex::encode(fake_pk.as_bytes())); }
+        pq_ring.push(sender_dilithium_public_hex.clone()); pq_ring.shuffle(&mut rand::thread_rng());
+
+        let my_real_index = pq_ring.iter().position(|r| r == &sender_dilithium_public_hex).unwrap();
+        let n = pq_ring.len();
+        let mut z_responses = vec![vec![0u32; LATTICE_DIM]; n]; let mut p_keys = vec![vec![0u32; LATTICE_DIM]; n]; 
+        let mut challenges_c = vec![vec![0u8; 32]; n];
+        
+        let mut s_vector = [0u32; LATTICE_DIM]; let mut my_p = vec![0u32; LATTICE_DIM];
+        for j in 0..LATTICE_DIM {
+            let offset = j * 4; s_vector[j] = u32::from_le_bytes(sk_bytes[offset..offset+4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+            my_p[j] = ((s_vector[j] as u64 * ((j as u32 + 1) * 1337) as u64) % LATTICE_Q as u64) as u32; 
+        }
+        p_keys[my_real_index] = my_p;
+
+        let mut alpha = vec![0u32; LATTICE_DIM];
+        for j in 0..LATTICE_DIM { alpha[j] = rand::thread_rng().gen_range(0..LATTICE_Q); }
+        let mut current_index = my_real_index;
+        
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(tx_data_to_sign.as_bytes()); hasher.update(pq_ring[my_real_index].as_bytes()); 
+        for j in 0..LATTICE_DIM { hasher.update(&(((alpha[j] as u64 * ((j as u32 + 1) * 1337) as u64) % LATTICE_Q as u64) as u32).to_le_bytes()); }
+        let mut next_c = hasher.finalize().as_bytes().to_vec();
+        challenges_c[(current_index + 1) % n] = next_c.clone();
+
+        for _ in 1..n {
+            current_index = (current_index + 1) % n; let pk_hex = &pq_ring[current_index];
+            for j in 0..LATTICE_DIM { p_keys[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q); z_responses[current_index][j] = rand::thread_rng().gen_range(0..LATTICE_Q); }
+            let c_i = u32::from_le_bytes(next_c[0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+            let mut r_i = vec![0u32; LATTICE_DIM];
+            for j in 0..LATTICE_DIM { r_i[j] = ((((z_responses[current_index][j] as u64 * ((j as u32 + 1) * 1337) as u64) % LATTICE_Q as u64) + ((c_i as u64 * p_keys[current_index][j] as u64) % LATTICE_Q as u64)) % LATTICE_Q as u64) as u32; }
+            let mut hasher_sim = blake3::Hasher::new();
+            hasher_sim.update(tx_data_to_sign.as_bytes()); hasher_sim.update(pk_hex.as_bytes()); 
+            for val in r_i { hasher_sim.update(&val.to_le_bytes()); }
+            next_c = hasher_sim.finalize().as_bytes().to_vec(); challenges_c[(current_index + 1) % n] = next_c.clone();
+        }
+
+        let my_c = u32::from_le_bytes(challenges_c[my_real_index][0..4].try_into().unwrap_or([0; 4])) % LATTICE_Q;
+        for j in 0..LATTICE_DIM {
+            let cs_product = (my_c as u64 * s_vector[j] as u64) % LATTICE_Q as u64;
+            if alpha[j] as u64 >= cs_product { z_responses[my_real_index][j] = (alpha[j] as u64 - cs_product) as u32; } 
+            else { z_responses[my_real_index][j] = (LATTICE_Q as u64 + alpha[j] as u64 - cs_product) as u32; }
+        }
+
+        final_inputs.push(TransactionInput {
+            pq_ring_inputs: pq_ring, commitment: utxo.2.clone(),
+            pq_ring_signature: PQLatticeRingSignature { key_image: hex::encode(blake3::hash(format!("{}{}", hex::encode(&sk_bytes), utxo.1).as_bytes()).as_bytes()), c0: hex::encode(&challenges_c[0]), z_responses, p_keys },
+        });
+    }
+
+    // 💡 On obtient la hauteur actuelle via l'info du réseau pour déterminer le target_block
+    let info_str = tor_fetch("GET", "/info", None).await?;
+    let info: serde_json::Value = serde_json::from_str(&info_str).map_err(|_| "Erreur INFO".to_string())?;
+    let current_blocks = info["blocks"].as_u64().unwrap_or(0);
+    let target_block = current_blocks + (10 - (current_blocks % 10)); // Le prochain multiple de 10
+
+    let tx_pq = Transaction {
+        tx_type: TransactionType::HTLCLottery { target_block, player_pubkey: sender_kyber_public_hex.clone() }, 
+        inputs: final_inputs, outputs, fee, dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
+    };
+
+    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
+    tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
+
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
+        for utxo in &selected_utxos { let _ = writeln!(file, "{}", utxo.1); }
+    }
+    
+    Ok(format!("🎟️ TICKET VALIDÉ ! Le tirage aura lieu au bloc {}.", target_block))
 }
 
 #[tauri::command]
@@ -503,7 +720,7 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
             if spent_capsules.contains(&out.kyber_capsule) { continue; }
             if is_lock_tx && index == 0 { continue; }
 
-            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
+            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     balance_flames += amt;
                 }
@@ -563,15 +780,16 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             let is_spent = spent_capsules.contains(&out.kyber_capsule);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
-            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
+            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
+                    let label = if out.stealth_address.starts_with("JACKPOT") { "Jackpot gagné ! 🎰" } else { "Minage ⛏️" };
                     history.push(HistoryItem {
                         id: format!("Bloc N°{}", i ), 
                         tx_type: "receive".to_string(),
                         amount: amt as f64 / 1_000_000_000.0,
                         coin: "WATT".to_string(),
                         date: "Récemment".to_string(),
-                        status: format!("Minage ({})", status_text),
+                        status: format!("{} ({})", label, status_text),
                     });
                 }
             } 
@@ -635,7 +853,7 @@ async fn send_wattcoin(
     let res_str = tor_fetch("GET", "/all_transactions", None).await?;
     let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
     
-    let mut spent_capsules = HashSet::new();
+    let mut spent_capsules = std::collections::HashSet::new();
     if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
@@ -653,7 +871,7 @@ async fn send_wattcoin(
             let mut is_mine = false;
             let mut val = 0;
 
-            if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) {
+            if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) || out.stealth_address == format!("JACKPOT_{}", sender_kyber_public_hex) {
                 val = out.aes_vault.parse::<u64>().unwrap_or(0);
                 is_mine = true;
             } else if out.stealth_address.starts_with("pq_watt_") {
@@ -892,7 +1110,6 @@ async fn send_wattcoin(
     }
 }
 
-// 💡 NOUVELLE COMMANDE POUR LE REMBOURSEMENT HTLC
 #[tauri::command]
 async fn refund_wattcoin_swap(
     hash: String, watt_address: String, amount: f64
@@ -1460,6 +1677,33 @@ async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_he
     }
 }
 
+// ========================================================================
+// ⚡ BITCOIN LIGHTNING NETWORK (LDK - PHASE 3) - MOCKS POUR UI
+// ========================================================================
+
+#[tauri::command]
+async fn get_lightning_balance(master_seed_hex: String) -> Result<u64, String> {
+    let _ = master_seed_hex; // Gardé pour éviter le warning
+    Ok(50000) // 💡 Solde factice pour tester ton interface !
+}
+
+#[tauri::command]
+async fn create_lightning_invoice(master_seed_hex: String, amount_sats: u64, description: String) -> Result<String, String> {
+    let _ = master_seed_hex;
+    let _ = description;
+    Ok(format!("lnbcrt{}m1simulateur... (Facture générée pour {} Sats)", amount_sats / 100_000, amount_sats))
+}
+
+#[tauri::command]
+async fn pay_lightning_invoice(master_seed_hex: String, invoice: String) -> Result<String, String> {
+    let _ = master_seed_hex;
+    let _ = invoice;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await; // Simule le temps de routage cryptographique
+    Ok("⚡ Paiement Lightning réussi !".to_string())
+}
+
+// ============== LA FONCTION MAIN ==================
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1489,7 +1733,9 @@ fn main() {
             submit_order, get_dark_pool, get_watt_balance, get_btc_balance, cancel_order,
             send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, refund_wattcoin_swap,
             destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, 
-            save_miner_script
+            save_miner_script, get_total_supply, get_current_jackpot, buy_lottery_ticket,
+            // 💡 Les 3 commandes LDK sont là, et UNIQUEMENT des commandes valides :
+            get_lightning_balance, create_lightning_invoice, pay_lightning_invoice
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

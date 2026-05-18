@@ -160,12 +160,21 @@ pub async fn start_api_server(
     let get_all_txs = warp::get()
         .and(warp::path("all_transactions"))
         .and(chain_filter.clone())
-        .map(|chain_arc: Arc<Mutex<Blockchain>>| {
+        .and(mempool_filter.clone()) // 💡 On ajoute le Mempool ici !
+        .map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
             let chain_lock = chain_arc.lock().unwrap();
             let mut all_txs = Vec::new();
+            
+            // 1. On ajoute les transactions déjà minées
             for block in &chain_lock.chain {
                 for tx in &block.transactions { all_txs.push(tx.clone()); }
             }
+            
+            // 2. 💡 On ajoute les transactions en attente dans le Mempool
+            for tx in mempool.lock().unwrap().iter() {
+                all_txs.push(tx.clone());
+            }
+            
             warp::reply::json(&all_txs)
         });
         
@@ -221,7 +230,7 @@ pub async fn start_api_server(
                 "blocks": chain_lock.chain.len(), 
                 "connected_peers": peers.lock().unwrap().len(),
                 "last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed), 
-                "version": "Wattcoin V2.2.0 (On-Chain DEX)"
+                "version": "Wattcoin V2.1.6 (On-Chain DEX)"
             }))
         });
 		
@@ -237,8 +246,23 @@ pub async fn start_api_server(
     let get_jackpot = warp::path("jackpot")
         .and(warp::get())
         .and(chain_filter.clone())
-        .map(|chain_arc: Arc<Mutex<Blockchain>>| {
-            let pot = chain_arc.lock().unwrap().get_current_jackpot();
+        .and(mempool_filter.clone()) // 💡 On ajoute le Mempool ici !
+        .map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
+            let chain_lock = chain_arc.lock().unwrap();
+            let mut pot = chain_lock.get_current_jackpot(); // Jackpot de la chaîne validée
+            
+            let current_height = chain_lock.chain.len() as u64;
+            let target_height = current_height + (10 - (current_height % 10)); // Prochain tirage
+
+            // 💡 On additionne les tickets qui sont dans la salle d'attente (Mempool)
+            for tx in mempool.lock().unwrap().iter() {
+                if let crate::transaction::TransactionType::HTLCLottery { target_block, .. } = &tx.tx_type {
+                    if *target_block == target_height {
+                        pot += 10_000_000_000; // On ajoute 10 WATT par ticket non confirmé
+                    }
+                }
+            }
+            
             warp::reply::json(&pot)
         });
     
