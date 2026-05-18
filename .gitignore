@@ -29,6 +29,7 @@ Thumbs.db
 **/*.zip
 **/*.deb
 **/*.exe
+**/*.msi
 **/*.AppImage
 **/Wattcoin-Node-*/
 
