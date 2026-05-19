@@ -5,7 +5,8 @@ use rand::{Rng, RngCore};
 use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 use std::fs; 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use dirs::data_local_dir;
 use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
@@ -25,7 +26,7 @@ use ldk_node::bitcoin::Network as LdkNetwork;
 static LDK_NODE: Lazy<AsyncMutex<Option<std::sync::Arc<ldk_node::Node>>>> = Lazy::new(|| AsyncMutex::new(None));
 
 const ONION_NODE: &str = "jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64yd.onion:8100";
-const VAULT_FILE: &str = ".wattcoin_vault";
+//const VAULT_FILE: &str = ".wattcoin_vault";
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
 
@@ -60,6 +61,30 @@ impl From<WattError> for String {
 
 static TOR_CLIENT: Lazy<AsyncMutex<Option<TorClient<PreferredRuntime>>>> = Lazy::new(|| AsyncMutex::new(None));
 static TOR_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
+
+// Fonction multiplateforme pour trouver le bon dossier de sauvegarde
+fn get_wallet_dir() -> PathBuf {
+    let mut path = data_local_dir().expect("Impossible de trouver le dossier AppData/Local");
+    path.push("WattcoinWallet");
+    if !path.exists() {
+        fs::create_dir_all(&path).expect("Impossible de créer le dossier du wallet");
+    }
+    path
+}
+
+// Renvoie le chemin complet vers .wattcoin_vault
+fn get_vault_path() -> PathBuf {
+    let mut path = get_wallet_dir();
+    path.push(".wattcoin_vault");
+    path
+}
+
+// Renvoie le chemin complet vers .wattcoin_spends
+fn get_spends_path() -> PathBuf {
+    let mut path = get_wallet_dir();
+    path.push(".wattcoin_spends");
+    path
+}
 
 async fn start_arti_socks_proxy(tor_client: arti_client::TorClient<PreferredRuntime>) {
     if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:9150").await {
@@ -391,7 +416,7 @@ async fn buy_lottery_ticket(
     let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
     
     let mut spent_capsules = std::collections::HashSet::new();
-    if let Ok(spends) = std::fs::read_to_string(".wattcoin_spends") { 
+    if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); } 
     }
 
@@ -562,7 +587,7 @@ async fn buy_lottery_ticket(
     tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(get_spends_path()) {
         for utxo in &selected_utxos { let _ = writeln!(file, "{}", utxo.1); }
     }
     
@@ -644,7 +669,7 @@ async fn generate_pro_wallet(phrase_option: Option<String>) -> Result<WalletKeys
 }
 
 #[tauri::command] 
-fn vault_exists() -> bool { Path::new(VAULT_FILE).exists() }
+fn vault_exists() -> bool { get_vault_path().exists() }
 
 #[tauri::command]
 fn encrypt_vault(password: String, keys_json_string: String) -> Result<(), String> {
@@ -662,7 +687,7 @@ fn encrypt_vault(password: String, keys_json_string: String) -> Result<(), Strin
     final_data.extend_from_slice(&nonce_bytes); 
     final_data.extend_from_slice(&ciphertext);
     
-    fs::write(VAULT_FILE, final_data).map_err(WattError::from)?; 
+    fs::write(get_vault_path(), final_data).map_err(WattError::from)?;
     Ok(())
 }
 
@@ -671,7 +696,7 @@ async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
 
-    let file_data = fs::read(VAULT_FILE).map_err(|e| WattError::Io(e))?;
+    let file_data = fs::read(get_vault_path()).map_err(|e| WattError::Io(e))?;
     if file_data.len() < 28 { return Err(WattError::Vault("Fichier corrompu ou incomplet.".to_string()).into()); }
 
     let salt = &file_data[0..16];
@@ -709,7 +734,7 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
 
     let mut spent_capsules = HashSet::new();
-    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
+    if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
 
@@ -767,7 +792,7 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
 
     let mut spent_capsules = std::collections::HashSet::new();
-    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
+    if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
 
@@ -854,7 +879,7 @@ async fn send_wattcoin(
     let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
     
     let mut spent_capsules = std::collections::HashSet::new();
-    if let Ok(spends) = fs::read_to_string(".wattcoin_spends") {
+    if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
 
@@ -1097,7 +1122,7 @@ async fn send_wattcoin(
 
     use std::fs::OpenOptions;
     use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(".wattcoin_spends") {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(get_spends_path()) {
         for utxo in &selected_utxos {
             let _ = writeln!(file, "{}", utxo.1);
         }
@@ -1276,8 +1301,14 @@ async fn cancel_order(order_id: String) -> Result<String, String> {
 
 #[tauri::command]
 fn destroy_vault() -> Result<String, String> {
-    if Path::new(VAULT_FILE).exists() {
-        fs::remove_file(VAULT_FILE).map_err(|_| "⚠️ Impossible de supprimer le coffre.".to_string())?;
+    let vault_path = get_vault_path();
+    if vault_path.exists() {
+        fs::remove_file(vault_path).map_err(|_| "⚠️ Impossible de supprimer le coffre.".to_string())?;
+        
+        // 💡 Tant qu'on y est, on supprime aussi l'historique des dépenses !
+        let spends_path = get_spends_path();
+        if spends_path.exists() { let _ = fs::remove_file(spends_path); }
+        
         Ok("🗑️ Coffre-fort nucléarisé avec succès. Adieu !".to_string())
     } else {
         Ok("Le coffre était déjà vide.".to_string())
@@ -1684,7 +1715,7 @@ async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_he
 #[tauri::command]
 async fn get_lightning_balance(master_seed_hex: String) -> Result<u64, String> {
     let _ = master_seed_hex; // Gardé pour éviter le warning
-    Ok(50000) // 💡 Solde factice pour tester ton interface !
+    Ok(0) // 💡 Solde factice pour tester ton interface !
 }
 
 #[tauri::command]
