@@ -166,22 +166,24 @@ pub async fn start_api_server(
 			let chain_lock = chain_arc.lock().unwrap();
 			let mut all_txs = Vec::new();
 			
-			// Transactions confirmées avec leur hauteur de bloc
 			for block in &chain_lock.chain {
 				let height = block.header.index;
-				
+				let timestamp = block.header.timestamp;   // ← Timestamp Unix
+
 				for tx in &block.transactions {
 					all_txs.push(serde_json::json!({
 						"height": height,
+						"timestamp": timestamp,           // ← Nouveau
 						"transaction": tx
 					}));
 				}
 			}
 			
-			// Transactions en mempool (pas encore de hauteur)
+			// Mempool (pas de timestamp)
 			for tx in mempool.lock().unwrap().iter() {
 				all_txs.push(serde_json::json!({
 					"height": null,
+					"timestamp": null,
 					"transaction": tx
 				}));
 			}

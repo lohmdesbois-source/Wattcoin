@@ -26,6 +26,7 @@ const ONION_NODE: &str = "jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64
 //const VAULT_FILE: &str = ".wattcoin_vault";
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
+const MATURITY_BLOCKS: u64 = 3; // À passer à 100 en prod
 
 #[derive(Debug)]
 pub enum WattError {
@@ -166,13 +167,22 @@ async fn get_tor_client() -> Result<TorClient<PreferredRuntime>, String> {
     if let Some(client) = &*lock { return Ok(client.clone()); }
     
     println!("🧅 [TOR] Initialisation du blindage Arti...");
-    let config = TorClientConfig::default();
-    let client = TorClient::create_bootstrapped(config).await.map_err(|e| format!("Erreur Bootstrap: {}", e))?;
-    
-    start_arti_socks_proxy(client.clone()).await;
-    
-    *lock = Some(client.clone());
-    Ok(client)
+
+    for attempt in 1..=3 {
+        match TorClient::create_bootstrapped(TorClientConfig::default()).await {
+            Ok(client) => {
+                println!("✅ [TOR] Bootstrap réussi au bout de {} tentative(s)", attempt);
+                start_arti_socks_proxy(client.clone()).await;
+                *lock = Some(client.clone());
+                return Ok(client);
+            }
+            Err(e) => {
+                println!("⚠️ [TOR] Bootstrap échoué (tentative {}/3) : {}", attempt, e);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+    Err("Impossible de démarrer Tor après 3 tentatives".to_string())
 }
 
 async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result<String, String> {
@@ -189,7 +199,7 @@ async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result
     let mut stream = None;
     for i in 1..=3 {
         println!("⏳ [TOR] Percée du tunnel (Tentative {}/3)...", i);
-        match tokio::time::timeout(std::time::Duration::from_secs(20), tor_client.connect_with_prefs(ONION_NODE, &prefs)).await {
+		match tokio::time::timeout(std::time::Duration::from_secs(30), tor_client.connect_with_prefs(ONION_NODE, &prefs)).await {
             Ok(Ok(s)) => { 
                 println!("✅ [TOR] Tunnel établi !");
                 stream = Some(s); 
@@ -802,10 +812,10 @@ async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
 #[tauri::command]
 async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     let res_str = tor_fetch("GET", "/all_transactions", None).await?;
-    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|e| {
-        println!("❌ [JSON ERROR BALANCE] {}", e);
-        "Erreur JSON".to_string()
-    })?;
+    let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
+        .map_err(|_| "Erreur JSON enriched".to_string())?;
+
+    let current_height = get_current_block_height().await.unwrap_or(0); // nouvelle petite fonction
 
     let mut balance_flames: u64 = 0;
     use pqcrypto_kyber::kyber768;
@@ -818,18 +828,39 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
 
-    for tx in all_txs {
+    
+
+    for item in enriched {
+        let height = item["height"].as_u64().unwrap_or(0);
+        let tx: Transaction = match serde_json::from_value(item["transaction"].clone()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
         let is_lock_tx = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
 
         for (index, out) in tx.outputs.iter().enumerate() {
             if spent_capsules.contains(&out.kyber_capsule) { continue; }
             if is_lock_tx && index == 0 { continue; }
 
-            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
+            // === MATURITÉ ===
+            let mut is_mature = true;
+            if out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") {
+                if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+                    is_mature = false;
+                }
+            }
+
+            if !is_mature { continue; }
+
+            // ... reste du code de décryptage identique ...
+            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
+                || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     balance_flames += amt;
                 }
             } else if out.stealth_address.starts_with("pq_watt_") {
+                // (ton code de décryptage Kyber AES reste inchangé)
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
                         let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
@@ -838,7 +869,6 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
                                 let nonce = Nonce::from_slice(&vault_bytes[0..12]);
                                 let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
                                 let cipher = Aes256Gcm::new(aes_key);
-                                
                                 if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
                                     if let Ok(payload_str) = String::from_utf8(plaintext) {
                                         let parts: Vec<&str> = payload_str.split('|').collect();
@@ -859,10 +889,19 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     Ok(balance_flames as f64 / 1_000_000_000.0)
 }
 
+async fn get_current_block_height() -> Result<u64, String> {
+    let info_str = tor_fetch("GET", "/info", None).await?;
+    let info: serde_json::Value = serde_json::from_str(&info_str).map_err(|_| "err".to_string())?;
+    Ok(info["blocks"].as_u64().unwrap_or(0))
+}
+
 #[tauri::command]
 async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     let res_str = tor_fetch("GET", "/all_transactions", None).await?;
-    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
+    let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
+        .map_err(|_| "Erreur JSON history".to_string())?;
+
+    let current_height = get_current_block_height().await.unwrap_or(0);
 
     let mut history = Vec::new();
     use pqcrypto_kyber::kyber768;
@@ -873,10 +912,18 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
 
     let mut spent_capsules = std::collections::HashSet::new();
     if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
-        for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
+        for line in spends.lines() { 
+            spent_capsules.insert(line.trim().to_string()); 
+        }
     }
 
-    for (i, tx) in all_txs.iter().enumerate() {
+    for item in enriched {
+        let height = item["height"].as_u64().unwrap_or(0);
+        let tx: Transaction = match serde_json::from_value(item["transaction"].clone()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
         let is_lock = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
 
         for (out_idx, out) in tx.outputs.iter().enumerate() {
@@ -885,15 +932,31 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             let is_spent = spent_capsules.contains(&out.kyber_capsule);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
-            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
+            // === MATURITÉ ===
+            let mut is_mature = true;
+            if out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") {
+                if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+                    is_mature = false;
+                }
+            }
+            if !is_mature { continue; }
+
+            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
+                || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
+                
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
-                    let label = if out.stealth_address.starts_with("JACKPOT") { "Jackpot gagné ! 🎰" } else { "Minage ⛏️" };
+                    let label = if out.stealth_address.starts_with("JACKPOT") { 
+                        "Jackpot gagné ! 🎰" 
+                    } else { 
+                        "Récompense de minage ⛏️" 
+                    };
+                    
                     history.push(HistoryItem {
-                        id: format!("Bloc N°{}", i ), 
+                        id: format!("Bloc #{}", height),
                         tx_type: "receive".to_string(),
                         amount: amt as f64 / 1_000_000_000.0,
                         coin: "WATT".to_string(),
-                        date: "Récemment".to_string(),
+                        date: format!("Bloc {}", height),           // On améliorera avec vraie date plus tard
                         status: format!("{} ({})", label, status_text),
                     });
                 }
@@ -914,11 +977,11 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                                         if parts.len() == 2 {
                                             if let Ok(amt) = parts[0].parse::<u64>() {
                                                 history.push(HistoryItem {
-                                                    id: format!("{}...", &out.kyber_capsule[0..12]),
+                                                    id: format!("Bloc #{}", height),
                                                     tx_type: "receive".to_string(),
                                                     amount: amt as f64 / 1_000_000_000.0,
                                                     coin: "WATT".to_string(),
-                                                    date: "Récemment".to_string(),
+                                                    date: format!("Bloc {}", height),
                                                     status: format!("Transfert ({})", status_text),
                                                 });
                                             }
@@ -932,6 +995,7 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             }
         }
     }
+
     history.reverse();
     Ok(history)
 }
