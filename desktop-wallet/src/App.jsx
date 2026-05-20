@@ -116,11 +116,33 @@ function App() {
     if (view !== "dex" && view !== "dashboard" && view !== "swaps" && view !== "history" && view !== "casino") return;
 
     const updateData = async () => {
-      if (!walletData) return;
-      try { const balWATT = await invoke("get_watt_balance", { keys: walletData }); setWattBalance(balWATT); } catch (e) {}
-      try { const hist = await invoke("get_history", { keys: walletData }); setTxHistory(hist); } catch (e) {}
-      try { const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex }); setBtcBalance(balBTC); } catch (e) {}
-      try { const balLN = await invoke("get_lightning_balance", { masterSeedHex: walletData.master_seed_hex }); setLnBalance(balLN); } catch (e) {}
+		if (!walletData) return;
+		
+		// 1. Récupération parallèle de toutes les données fraîches
+		try {
+			const [balWATT, hist, balBTC, pool, apiSwaps] = await Promise.all([
+				invoke("get_watt_balance", { keys: walletData }),
+				invoke("get_history", { keys: walletData }),
+				invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex }),
+				invoke("get_dark_pool"),
+				invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address })
+			]);
+
+			setWattBalance(balWATT);
+			setTxHistory(hist);
+			setBtcBalance(balBTC);
+			setDarkPool(pool);
+
+			// 🛡️ SYNCHRO STRICTE : 
+			// On ne fusionne plus avec le localStorage. 
+			// On affiche UNIQUEMENT ce que le Nœud renvoie. 
+			// Si le nœud dit que le swap est fini, il disparaît instantanément.
+			setPendingSwaps(apiSwaps);
+			localStorage.setItem('my_swaps', JSON.stringify(apiSwaps));
+
+		} catch (e) {
+			console.error("Erreur de sync temps réel :", e);
+		}
 
       try {
         const supply = await invoke("get_total_supply");
@@ -143,9 +165,11 @@ function App() {
                 combined.push(cached);
             }
         });
-        localStorage.setItem('my_swaps', JSON.stringify(combined));
-        setPendingSwaps(combined);
-      } catch (e) {}
+        // 🛡️ NETTOYAGE AUTO : On ne garde que ce qui est VRAIMENT sur la blockchain
+        // On écrase le vieux cache avec les données fraîches reçues du nœud
+        localStorage.setItem('my_swaps', JSON.stringify(apiSwaps));
+        setPendingSwaps(apiSwaps);
+     } catch (e) { console.error(e); }
     };
     
     updateData();

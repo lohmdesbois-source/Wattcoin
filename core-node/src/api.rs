@@ -80,7 +80,7 @@ pub async fn start_api_server(
                 }
             }
 
-            // 2. On récupère les Swaps du DEX, en ignorant ceux qui sont terminés !
+            // 2. On récupère les Swaps du DEX, en ignorant ceux qui sont terminés
             for block in chain_lock.chain.iter().rev().take(100) {
                 for tx in &block.transactions {
                     if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
@@ -92,6 +92,7 @@ pub async fn start_api_server(
                     }
                 }
             }
+            // 💡 On renvoie juste la liste filtrée, c'est ce que ton Wallet attend
             warp::reply::json(&all_swaps)
         });
 

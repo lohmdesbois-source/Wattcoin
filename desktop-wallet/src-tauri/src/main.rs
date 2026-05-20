@@ -343,6 +343,7 @@ pub struct TransactionInput {
     pub pq_ring_inputs: Vec<String>,
     pub pq_ring_signature: PQLatticeRingSignature,
     pub commitment: LWECommitment,
+	pub source_height: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -583,8 +584,10 @@ async fn buy_lottery_ticket(
         }
 
         final_inputs.push(TransactionInput {
-            pq_ring_inputs: pq_ring, commitment: utxo.2.clone(),
-            pq_ring_signature: PQLatticeRingSignature { key_image: hex::encode(blake3::hash(format!("{}{}", hex::encode(&sk_bytes), utxo.1).as_bytes()).as_bytes()), c0: hex::encode(&challenges_c[0]), z_responses, p_keys },
+            pq_ring_inputs: pq_ring,
+            commitment: utxo.2.clone(),
+            pq_ring_signature: lattice_signature,
+            source_height: 0, // 💡 Le fameux champ de maturité !
         });
     }
 
@@ -1113,8 +1116,9 @@ async fn send_wattcoin(
 
         final_inputs.push(TransactionInput {
             pq_ring_inputs: pq_ring,
-            pq_ring_signature: lattice_signature,
             commitment: utxo.2.clone(),
+            pq_ring_signature: lattice_signature,
+            source_height: 0, // 💡 Le fameux champ de maturité !
         });
     }
 
@@ -1179,7 +1183,7 @@ async fn refund_wattcoin_swap(
 
     let key_image = hex::encode(blake3::hash(format!("REFUND_{}_{}", hash, utxo_id).as_bytes()).as_bytes());
     let dummy_signature = PQLatticeRingSignature { key_image, c0: String::new(), z_responses: vec![], p_keys: vec![] };
-    let refund_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment };
+    let refund_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment, source_height: 0, };
 
     use pqcrypto_kyber::kyber768;
     let recipient_bytes = hex::decode(&watt_address).unwrap();
@@ -1233,9 +1237,41 @@ async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<V
 }
 
 #[tauri::command]
+async fn check_btc_contract_exists(htlc_hash: &str) -> Result<bool, String> {
+    // 💡 On récupère le client Tor
+    let _tor = get_tor_client().await?; 
+    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9150").map_err(|_| "Proxy error".to_string())?;
+    let client = reqwest::Client::builder().proxy(proxy).build().map_err(|_| "HTTP client error".to_string())?;
+
+    // On scanne les explorers pour voir si l'adresse dérivée du hash contient des UTXOs
+    // (Dans un vrai système, le hash doit être lié à une adresse p2wsh)
+    let endpoints = [
+        "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api"
+    ];
+
+    for endpoint in endpoints {
+        // Ici on simplifie : on vérifie si une transaction existe pour ce hash ou adresse
+        let url = format!("{}/address/{}", endpoint, htlc_hash); 
+        if let Ok(res) = client.get(&url).send().await {
+            if res.status().is_success() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[tauri::command]
 async fn claim_wattcoin_swap(
     secret: String, hash: String, watt_address: String, amount: f64
 ) -> Result<String, String> {
+	// 💡 AJOUTE CECI AU DÉBUT DE ta fonction claim_wattcoin_swap
+	// Tu dois interroger l'explorer (comme tu le fais dans claim_btc_swap)
+	// pour voir si le contrat BTC existe bien et contient les fonds.
+	let btc_contract_exists = check_btc_contract_exists(&hash).await?; 
+	if !btc_contract_exists {
+		return Err("❌ Aucun contrat BTC correspondant n'a été trouvé !".to_string());
+	}
     let secret_bytes = hex::decode(&secret).unwrap_or_default();
     let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
     if calculated_hash != hash { return Err("❌ Le secret révélé par le DEX est un faux !".to_string()); }
@@ -1263,7 +1299,7 @@ async fn claim_wattcoin_swap(
 
     let key_image = hex::encode(blake3::hash(format!("CLAIM_{}_{}", secret, utxo_id).as_bytes()).as_bytes());
     let dummy_signature = PQLatticeRingSignature { key_image, c0: String::new(), z_responses: vec![], p_keys: vec![] };
-    let claim_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment };
+    let claim_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment, source_height: 0, };
 
     use pqcrypto_kyber::kyber768;
 
@@ -1778,7 +1814,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_network_info, generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
             submit_order, get_dark_pool, get_watt_balance, get_btc_balance, cancel_order,
-            send_wattcoin, create_btc_htlc, send_btc_to_htlc, claim_wattcoin_swap, refund_wattcoin_swap,
+            send_wattcoin, create_btc_htlc, send_btc_to_htlc, check_btc_contract_exists, claim_wattcoin_swap, refund_wattcoin_swap,
             destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, 
             save_miner_script, get_total_supply, get_current_jackpot, buy_lottery_ticket,
             // 💡 Les 3 commandes LDK sont là, et UNIQUEMENT des commandes valides :

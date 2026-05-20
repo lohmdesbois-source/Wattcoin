@@ -42,6 +42,7 @@ pub struct TransactionInput {
     pub pq_ring_inputs: Vec<String>,
     pub pq_ring_signature: PQLatticeRingSignature,
     pub commitment: LWECommitment,
+	pub source_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
