@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXVM};
 use rand::seq::SliceRandom;
 use crate::WattError;
+use crate::lattice::LATTICE_DIM; 
 
 const FLAME: u64 = 1_000_000_000;
 const MATURITY_BLOCKS: u64 = 3; 
@@ -127,34 +128,40 @@ impl Blockchain {
 
     // 💡 Calcul du Jackpot en cours
     pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
-        let mut tickets = Vec::new();
-        let mut pot = 0u64;
-        if target_height < 10 { return (0, tickets); }
-        let start = target_height - 10;
-        
-        for i in start..target_height {
-            if (i as usize) < self.chain.len() {
-                let block = &self.chain[i as usize];
-                for tx in &block.transactions {
-                    if tx.tx_type == TransactionType::Coinbase && tx.outputs.len() > 1 {
-                        if tx.outputs[1].stealth_address == "LOTTERY_RESERVE" {
-                            pot += tx.outputs[1].aes_vault.parse::<u64>().unwrap_or(0);
-                        }
-                    }
-                    if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
-                        if *target_block == target_height {
-                            // 💡 FIX CRITIQUE : On utilise la capsule (persistante) au lieu de la signature (qui est PRUNED)
-                            let ticket_id = if !tx.outputs.is_empty() { tx.outputs[0].kyber_capsule.clone() } else { tx.dilithium_signature.clone() };
-                            tickets.push((ticket_id, player_pubkey.clone()));
-                            pot += 10_000_000_000; 
-                        }
-                    }
-                }
-            }
-        }
-        tickets.sort_by(|a, b| a.0.cmp(&b.0)); 
-        (pot, tickets)
-    }
+		let mut tickets = Vec::new();
+		let mut pot = 0u64;
+
+		if target_height < LOTTERY_TIME_BLOCK { 
+			return (0, tickets); 
+		}
+
+		let start = target_height - LOTTERY_TIME_BLOCK;
+
+		for i in start..target_height {
+			if (i as usize) >= self.chain.len() { continue; }
+
+			let block = &self.chain[i as usize];
+			for tx in &block.transactions {
+				// Accumulation des taxes
+				if tx.tx_type != TransactionType::Coinbase {
+					pot += tx.fee; 
+				}
+
+				// Tickets
+				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
+					if *target_block == target_height && !tx.outputs.is_empty() {
+						let ticket_id = tx.outputs[0].kyber_capsule.clone(); // Capsule persistante
+						tickets.push((ticket_id, player_pubkey.clone()));
+						pot += 10_000_000_000; // 10 WATT par ticket
+					}
+				}
+			}
+		}
+
+		// On trie pour avoir un ordre déterministe
+		tickets.sort_by(|a, b| a.0.cmp(&b.0));
+		(pot, tickets)
+	}
 
     pub fn get_current_jackpot(&self) -> (u64, Vec<(u64, String)>) {
 		let mut total_pot = 0u64;
@@ -297,6 +304,39 @@ impl Blockchain {
                 aes_vault: lottery_tax.to_string(), 
                 lattice_commitment: crate::lattice::LWECommitment::commit(lottery_tax, [0, 0, 0, 0]),
             });
+        }
+		
+		// ===================== LOTERIE L1 =====================
+        if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
+            let (jackpot_amount, tickets) = self.get_jackpot_info(current_height);
+            
+            if !tickets.is_empty() {
+                let winner_ticket = &tickets[0];
+                let winner_pubkey = winner_ticket.1.clone();
+
+                println!("🎰 [LOTO L1] Le ticket {} remporte le Jackpot de {} Flames !", 
+                         winner_ticket.0, jackpot_amount);
+
+                let payout_output = crate::transaction::TransactionOutput {
+                    stealth_address: format!("JACKPOT_{}", winner_pubkey),
+                    kyber_capsule: format!("JACKPOT_PAYOUT_{}", current_height),
+                    aes_vault: jackpot_amount.to_string(),
+                    lattice_commitment: crate::lattice::LWECommitment::commit(jackpot_amount, [0; LATTICE_DIM]),
+                };
+
+                let lottery_payout_tx = Transaction {
+                    tx_type: TransactionType::LotteryPayout { 
+                        target_block: current_height, 
+                        winner_pubkey 
+                    },
+                    inputs: vec![],
+                    outputs: vec![payout_output],
+                    fee: 0,
+                    dilithium_signature: "LOTTERY_PAYOUT".to_string(),
+                };
+
+                valid_transactions.push(lottery_payout_tx);
+            }
         }
 
         let coinbase_tx = Transaction {
@@ -609,15 +649,12 @@ impl Blockchain {
 				expected_subsidy + total_block_fees, actual_reward));
 		}
 
-		// Vérification Jackpot (tu peux la garder telle quelle)
-		if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
-			// ... ton code jackpot existant ...
-		}
+		
 
-		// Tout est bon → on applique
-		for ki in block_key_images { 
-			self.spent_key_images.insert(ki); 
-		}
+        // Tout est bon → on applique
+        for ki in block_key_images { 
+            self.spent_key_images.insert(ki); 
+        }
 		self.chain.push(block);
 		self.prune_old_signatures();
 		self.update_target();

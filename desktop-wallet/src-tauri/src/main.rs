@@ -437,7 +437,7 @@ async fn buy_lottery_ticket(
     use rand::Rng; 
     use rand::seq::SliceRandom;
 
-    let ticket_price = 10_000_000_000u64;
+    let ticket_price: u64 = 10_000_000_000;
     let fee: u64 = 1000;
     let required_total = ticket_price + fee;
 
@@ -453,9 +453,10 @@ async fn buy_lottery_ticket(
     }
 
     let sk_bytes = hex::decode(&sender_kyber_secret_hex).unwrap_or_default();
-    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
+    let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes)
+        .map_err(|_| "Clé Kyber invalide".to_string())?;
 
-    let mut selected_utxos: Vec<(u64, String, LWECommitment, u64)> = Vec::new(); // (amount, capsule, commitment, source_height)
+    let mut selected_utxos: Vec<(u64, String, LWECommitment, u64)> = Vec::new();
     let mut current_input_sum = 0u64;
 
     for item in enriched {
@@ -510,7 +511,7 @@ async fn buy_lottery_ticket(
     }
 
     if current_input_sum < required_total { 
-        return Err("❌ Fonds insuffisants pour acheter un ticket (10 WATT requis)".to_string()); 
+        return Err(format!("❌ Fonds insuffisants. Besoin : {:.9} WATT", required_total as f64 / 1_000_000_000.0));
     }
 
     let change_amount = current_input_sum - required_total;
@@ -574,7 +575,7 @@ async fn buy_lottery_ticket(
     let real_decoys: Vec<String> = serde_json::from_str(&decoy_res).unwrap_or_default();
 
     for utxo in &selected_utxos {
-        let (_, _capsule, commitment, source_height) = utxo;
+        let (_, capsule, commitment, source_height) = utxo;
 
         let mut pq_ring: Vec<String> = real_decoys.clone();
         while pq_ring.len() < 10 { 
@@ -643,7 +644,7 @@ async fn buy_lottery_ticket(
         }
 
         let lattice_signature = PQLatticeRingSignature {
-            key_image: "TICKET_KEY_IMAGE".to_string(), // Tu peux améliorer plus tard
+            key_image: format!("ticket_{}", capsule),
             c0: hex::encode(&challenges_c[0]),
             z_responses,
             p_keys, 
@@ -815,7 +816,7 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
         .map_err(|_| "Erreur JSON enriched".to_string())?;
 
-    let current_height = get_current_block_height().await.unwrap_or(0); // nouvelle petite fonction
+    let current_height = get_current_block_height().await.unwrap_or(0);
 
     let mut balance_flames: u64 = 0;
     use pqcrypto_kyber::kyber768;
@@ -827,8 +828,6 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
     if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
         for line in spends.lines() { spent_capsules.insert(line.trim().to_string()); }
     }
-
-    
 
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
@@ -850,25 +849,24 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
                     is_mature = false;
                 }
             }
-
             if !is_mature { continue; }
 
-            // ... reste du code de décryptage identique ...
-            if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
-                || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
+            // Détection jackpot / payout
+            if out.stealth_address == format!("JACKPOT_{}", keys.watt_address) 
+                || out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     balance_flames += amt;
                 }
-            } else if out.stealth_address.starts_with("pq_watt_") {
-                // (ton code de décryptage Kyber AES reste inchangé)
+            } 
+            else if out.stealth_address.starts_with("pq_watt_") {
+                // Décryptage normal
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
                         let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
                         if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
                             if vault_bytes.len() > 12 {
                                 let nonce = Nonce::from_slice(&vault_bytes[0..12]);
-                                let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
-                                let cipher = Aes256Gcm::new(aes_key);
+                                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes()));
                                 if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
                                     if let Ok(payload_str) = String::from_utf8(plaintext) {
                                         let parts: Vec<&str> = payload_str.split('|').collect();
@@ -906,6 +904,7 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     let mut history = Vec::new();
     use pqcrypto_kyber::kyber768;
     use aes_gcm::{Aes256Gcm, Key, Nonce, aead::Aead};
+    use chrono::{DateTime, Utc, Local};
 
     let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
     let kyber_sk = kyber768::SecretKey::from_bytes(&sk_bytes).unwrap();
@@ -919,6 +918,8 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
 
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
+        let timestamp = item["timestamp"].as_i64().unwrap_or(0);
+
         let tx: Transaction = match serde_json::from_value(item["transaction"].clone()) {
             Ok(t) => t,
             Err(_) => continue,
@@ -927,19 +928,26 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
         let is_lock = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
 
         for (out_idx, out) in tx.outputs.iter().enumerate() {
-            if is_lock && out_idx == 0 { continue; } 
+            if is_lock && out_idx == 0 { continue; }
 
             let is_spent = spent_capsules.contains(&out.kyber_capsule);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
-            // === MATURITÉ ===
+            // Maturité
             let mut is_mature = true;
-            if out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") {
-                if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
-                    is_mature = false;
-                }
+            if (out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_")) 
+                && height > 0 
+                && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+                is_mature = false;
             }
             if !is_mature { continue; }
+
+            let date_str = if timestamp > 0 {
+                let dt: DateTime<Utc> = DateTime::from_timestamp(timestamp, 0).unwrap_or_default();
+                dt.with_timezone(&Local).format("%d/%m/%Y %H:%M").to_string()
+            } else {
+                "En attente".to_string()
+            };
 
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
                 || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
@@ -948,15 +956,15 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                     let label = if out.stealth_address.starts_with("JACKPOT") { 
                         "Jackpot gagné ! 🎰" 
                     } else { 
-                        "Récompense de minage ⛏️" 
+                        "Récompense minage ⛏️" 
                     };
                     
                     history.push(HistoryItem {
-                        id: format!("Bloc #{}", height),
+                        id: format!("#{}", height),
                         tx_type: "receive".to_string(),
                         amount: amt as f64 / 1_000_000_000.0,
                         coin: "WATT".to_string(),
-                        date: format!("Bloc {}", height),           // On améliorera avec vraie date plus tard
+                        date: date_str,
                         status: format!("{} ({})", label, status_text),
                     });
                 }
@@ -977,11 +985,11 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                                         if parts.len() == 2 {
                                             if let Ok(amt) = parts[0].parse::<u64>() {
                                                 history.push(HistoryItem {
-                                                    id: format!("Bloc #{}", height),
+                                                    id: format!("#{}", height),
                                                     tx_type: "receive".to_string(),
                                                     amount: amt as f64 / 1_000_000_000.0,
                                                     coin: "WATT".to_string(),
-                                                    date: format!("Bloc {}", height),
+                                                    date: date_str,
                                                     status: format!("Transfert ({})", status_text),
                                                 });
                                             }
