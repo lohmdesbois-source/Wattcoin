@@ -62,17 +62,33 @@ impl From<WattError> for String {
 static TOR_CLIENT: Lazy<AsyncMutex<Option<TorClient<PreferredRuntime>>>> = Lazy::new(|| AsyncMutex::new(None));
 static TOR_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
-// Fonction multiplateforme pour trouver le bon dossier de sauvegarde
 fn get_wallet_dir() -> PathBuf {
-    let mut path = data_local_dir().expect("Impossible de trouver le dossier AppData/Local");
-    path.push("WattcoinWallet");
-    if !path.exists() {
-        fs::create_dir_all(&path).expect("Impossible de créer le dossier du wallet");
+    #[cfg(debug_assertions)]
+    {
+        // 🧪 MODE TEST
+        const DEV_WALLET_NAME: &str = "wallet_wattcoin"; 
+        let mut path = std::env::current_dir().unwrap_or_default();
+        path.push(DEV_WALLET_NAME);
+        if !path.exists() {
+            std::fs::create_dir_all(&path).expect("Impossible de créer le dossier de test");
+        }
+        println!("🛠️ [DEV MODE] Wallet de test chargé dans : {:?}", path);
+        return path;
     }
-    path
+
+    #[cfg(not(debug_assertions))]
+    {
+        // 🏦 MODE PROD
+        let mut path = dirs::data_local_dir().expect("Impossible de trouver le dossier AppData/Local");
+        path.push("WattcoinWallet");
+        if !path.exists() {
+            std::fs::create_dir_all(&path).expect("Impossible de créer le dossier du wallet");
+        }
+        path
+    }
 }
 
-// Renvoie le chemin complet vers .wattcoin_vault
+// 👉 LA FONCTION QU'IL FAUT RAJOUTER ICI :
 fn get_vault_path() -> PathBuf {
     let mut path = get_wallet_dir();
     path.push(".wattcoin_vault");

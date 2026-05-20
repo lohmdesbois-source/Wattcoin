@@ -218,10 +218,31 @@ async fn main() {
                     } else { break; }
                 }
 
-                p.clear(); // Le mineur vide la piscine locale une fois le batch traité
+                // 💡 On récupère le timestamp actuel
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+                p.clear();
+                
+                // On remet les achats non remplis ET non expirés
+                for buy in buys {
+                    if buy.amount_flames > 0 && buy.expires_at > now { 
+                        p.push(buy); 
+                    }
+                }
+                // On remet les ventes non remplies ET non expirées
+                for sell in sells {
+                    if sell.amount_flames > 0 && sell.expires_at > now { 
+                        p.push(sell); 
+                    }
+                }
 
                 if total_volume_flames > 0 {
-                    println!("⚖️ [MINEUR DEX] Ordres croisés ! Volume: {} Flames, Prix: {} Sats", total_volume_flames, clearing_price_sats);
+                    println!("\n==========================================================");
+                    println!("⚖️ [DEX] ORDRES CROISÉS DANS LE DARK POOL !");
+                    println!("💲 Prix d'équilibre : {} Sats/WATT", clearing_price_sats);
+                    println!("🔄 Volume échangé  : {} WATT", total_volume_flames as f64 / 1_000_000_000.0);
+                    println!("==========================================================\n");
+                    
                     crate::api::LAST_PRICE_SATS.store(clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
                     
                     // 💡 On crée la transaction de Règlement qui sera minée
