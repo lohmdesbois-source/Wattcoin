@@ -159,25 +159,35 @@ pub async fn start_api_server(
         });
     
     let get_all_txs = warp::get()
-        .and(warp::path("all_transactions"))
-        .and(chain_filter.clone())
-        .and(mempool_filter.clone()) // 💡 On ajoute le Mempool ici !
-        .map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
-            let chain_lock = chain_arc.lock().unwrap();
-            let mut all_txs = Vec::new();
-            
-            // 1. On ajoute les transactions déjà minées
-            for block in &chain_lock.chain {
-                for tx in &block.transactions { all_txs.push(tx.clone()); }
-            }
-            
-            // 2. 💡 On ajoute les transactions en attente dans le Mempool
-            for tx in mempool.lock().unwrap().iter() {
-                all_txs.push(tx.clone());
-            }
-            
-            warp::reply::json(&all_txs)
-        });
+		.and(warp::path("all_transactions"))
+		.and(chain_filter.clone())
+		.and(mempool_filter.clone())
+		.map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
+			let chain_lock = chain_arc.lock().unwrap();
+			let mut all_txs = Vec::new();
+			
+			// Transactions confirmées avec leur hauteur de bloc
+			for block in &chain_lock.chain {
+				let height = block.header.index;
+				
+				for tx in &block.transactions {
+					all_txs.push(serde_json::json!({
+						"height": height,
+						"transaction": tx
+					}));
+				}
+			}
+			
+			// Transactions en mempool (pas encore de hauteur)
+			for tx in mempool.lock().unwrap().iter() {
+				all_txs.push(serde_json::json!({
+					"height": null,
+					"transaction": tx
+				}));
+			}
+			
+			warp::reply::json(&all_txs)
+		});
         
     let get_decoys = warp::get()
         .and(warp::path!("get_decoys" / usize))
