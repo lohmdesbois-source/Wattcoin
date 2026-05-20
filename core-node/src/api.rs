@@ -249,7 +249,9 @@ pub async fn start_api_server(
         .and(mempool_filter.clone()) // 💡 On ajoute le Mempool ici !
         .map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
             let chain_lock = chain_arc.lock().unwrap();
-            let mut pot = chain_lock.get_current_jackpot(); // Jackpot de la chaîne validée
+            
+            // 💡 LA CORRECTION EST ICI : On extrait 'pot' (le montant) et on ignore les tickets '_'
+            let (mut pot, _tickets) = chain_lock.get_current_jackpot(); 
             
             let current_height = chain_lock.chain.len() as u64;
             let target_height = current_height + (10 - (current_height % 10)); // Prochain tirage

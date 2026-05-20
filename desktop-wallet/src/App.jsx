@@ -152,13 +152,21 @@ function App() {
 
     let unlisten;
     const setupListener = async () => {
-      unlisten = await listen("network-update", () => {
-        invoke("get_network_info")
-            .then(data => { if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats); })
-            .catch(()=>{});
-        updateData();
-      });
-    };
+		unlisten = await listen("network-update", async () => {
+			// Ajoute ces deux appels ici pour forcer la mise à jour
+			try {
+				const supply = await invoke("get_total_supply");
+				setTotalSupply(supply);
+				const jackpot = await invoke("get_current_jackpot");
+				setCurrentJackpot(jackpot);
+			} catch(e) { console.error("Erreur maj API :", e); }
+
+			invoke("get_network_info")
+				.then(data => { if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats); })
+				.catch(()=>{});
+			updateData();
+		});
+	};
     setupListener();
 
     const timerDex = setInterval(async () => {

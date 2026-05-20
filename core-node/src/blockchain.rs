@@ -157,12 +157,29 @@ impl Blockchain {
         (pot, tickets)
     }
 
-    pub fn get_current_jackpot(&self) -> u64 {
-        let current_height = self.chain.len() as u64;
-        let target_height = current_height + (10 - (current_height % 10)); // Prochain tirage
-        let (pot, _) = self.get_jackpot_info(target_height);
-        pot
-    }
+    pub fn get_current_jackpot(&self) -> (u64, Vec<(u64, String)>) {
+		let mut total_pot = 0u64;
+		let tickets: Vec<(u64, String)> = Vec::new();
+		
+		// 1. On parcourt toute la chaîne pour calculer le total historique (Taxe)
+		for block in &self.chain {
+			for tx in &block.transactions {
+				// Additionne la taxe de 10 Flames par tx (si c'est bien ta règle)
+				if tx.tx_type != TransactionType::Coinbase {
+					total_pot += 10; 
+				}
+				// Soustrait les Jackpots déjà payés
+				if let TransactionType::LotteryPayout { .. } = tx.tx_type {
+					let payout = tx.outputs.iter().map(|o| o.aes_vault.parse::<u64>().unwrap_or(0)).sum::<u64>();
+					if total_pot >= payout { total_pot -= payout; }
+				}
+			}
+		}
+		
+		// 2. On récupère les tickets actifs pour le tirage (ceux qui n'ont pas encore été payés)
+		// C'est ici que tu dois lister les tickets valides sur la blockchain
+		(total_pot, tickets)
+	}
 
     pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint) {
         let current_height = self.chain.len() as u64;
@@ -565,8 +582,12 @@ impl Blockchain {
                     }
                 }
                 if !found_payout { return Err("Le bloc DOIT contenir le paiement du Jackpot !".to_string()); }
-            }
-        }
+            } else {
+				// 💡 Si aucun ticket, on ne fait RIEN. 
+				// Le pot reste accumulé dans la blockchain (la taxe des 10 Flames reste là)
+				println!("🎰 [LOTO L1] Aucun ticket ce bloc. Le pot de {} Flames est reporté !", pot);
+			}
+		}
 
 		// Si tout est OK, on met à jour l'état
 		for ki in block_key_images { self.spent_key_images.insert(ki); }
