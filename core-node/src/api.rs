@@ -158,37 +158,24 @@ pub async fn start_api_server(
             warp::reply::with_status(warp::reply::json(&"✅ TX acceptée par le réseau"), warp::http::StatusCode::OK)
         });
     
-    let get_all_txs = warp::get()
+    // Dans api.rs (remplace la route all_transactions actuelle)
+	let get_all_txs = warp::get()
 		.and(warp::path("all_transactions"))
 		.and(chain_filter.clone())
-		.and(mempool_filter.clone())
-		.map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
+		.map(|chain_arc: Arc<Mutex<Blockchain>>| {
 			let chain_lock = chain_arc.lock().unwrap();
-			let mut all_txs = Vec::new();
+			let mut enriched_txs = Vec::new();
 			
 			for block in &chain_lock.chain {
-				let height = block.header.index;
-				let timestamp = block.header.timestamp;   // ← Timestamp Unix
-
 				for tx in &block.transactions {
-					all_txs.push(serde_json::json!({
-						"height": height,
-						"timestamp": timestamp,           // ← Nouveau
+					enriched_txs.push(serde_json::json!({
+						"height": block.header.index,
+						"timestamp": block.header.timestamp,
 						"transaction": tx
 					}));
 				}
 			}
-			
-			// Mempool (pas de timestamp)
-			for tx in mempool.lock().unwrap().iter() {
-				all_txs.push(serde_json::json!({
-					"height": null,
-					"timestamp": null,
-					"transaction": tx
-				}));
-			}
-			
-			warp::reply::json(&all_txs)
+			warp::reply::json(&enriched_txs)
 		});
         
     let get_decoys = warp::get()

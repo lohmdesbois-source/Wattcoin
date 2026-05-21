@@ -127,43 +127,42 @@ impl Blockchain {
     }
 
     // 💡 Calcul du Jackpot en cours
-        // 💡 Calcul du Jackpot en cours (version propre)
     pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
-        let mut tickets = Vec::new();
-        let mut pot = 0u64;
+		let mut tickets = Vec::new();
+		let mut pot = 0u64;
 
-        if target_height < LOTTERY_TIME_BLOCK {
-            return (0, tickets);
-        }
+		if target_height < LOTTERY_TIME_BLOCK {
+			return (0, tickets);
+		}
 
-        let start = target_height - LOTTERY_TIME_BLOCK;
+		let start = target_height - LOTTERY_TIME_BLOCK;
 
-        for i in start..target_height {
-            if (i as usize) >= self.chain.len() { continue; }
+		for i in start..target_height {
+			if (i as usize) >= self.chain.len() { continue; }
 
-            let block = &self.chain[i as usize];
+			let block = &self.chain[i as usize];
 
-            for tx in &block.transactions {
-                // Taxes uniquement sur les tx normales
-                if tx.tx_type != TransactionType::Coinbase 
-                    && !matches!(tx.tx_type, TransactionType::LotteryPayout { .. }) {
-                    pot += tx.fee;
-                }
+			for tx in &block.transactions {
+				// 💡 CORRECTION : On n'ajoute que la taxe de 1% (frais / 100) calculée au consensus
+				if tx.tx_type != TransactionType::Coinbase 
+					&& !matches!(tx.tx_type, TransactionType::LotteryPayout { .. }) {
+					pot += tx.fee / 100; 
+				}
 
-                // Tickets
-                if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
-                    if *target_block == target_height && !tx.outputs.is_empty() {
-                        let ticket_id = tx.outputs[0].kyber_capsule.clone();
-                        tickets.push((ticket_id, player_pubkey.clone()));
-                        pot += 10_000_000_000; // 10 WATT par ticket
-                    }
-                }
-            }
-        }
+				// Tickets
+				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
+					if *target_block == target_height && !tx.outputs.is_empty() {
+						let ticket_id = tx.outputs[0].kyber_capsule.clone();
+						tickets.push((ticket_id, player_pubkey.clone()));
+						pot += 10_000_000_000; // 10 WATT par ticket
+					}
+				}
+			}
+		}
 
-        tickets.sort_by(|a, b| a.0.cmp(&b.0));
-        (pot, tickets)
-    }
+		tickets.sort_by(|a, b| a.0.cmp(&b.0));
+		(pot, tickets)
+	}
 
     pub fn get_current_jackpot(&self) -> (u64, Vec<(u64, String)>) {
 		let mut total_pot = 0u64;
