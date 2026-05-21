@@ -142,7 +142,7 @@ impl Blockchain {
 
 			let block = &self.chain[i as usize];
 			for tx in &block.transactions {
-				// Accumulation des taxes
+				// Accumulation des taxes (10 Flames par tx)
 				if tx.tx_type != TransactionType::Coinbase {
 					pot += tx.fee; 
 				}
@@ -150,15 +150,14 @@ impl Blockchain {
 				// Tickets
 				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
 					if *target_block == target_height && !tx.outputs.is_empty() {
-						let ticket_id = tx.outputs[0].kyber_capsule.clone(); // Capsule persistante
+						let ticket_id = tx.outputs[0].kyber_capsule.clone();
 						tickets.push((ticket_id, player_pubkey.clone()));
-						pot += 10_000_000_000; // 10 WATT par ticket
+						pot += 10_000_000_000; // 10 WATT
 					}
 				}
 			}
 		}
 
-		// On trie pour avoir un ordre déterministe
 		tickets.sort_by(|a, b| a.0.cmp(&b.0));
 		(pot, tickets)
 	}
@@ -327,7 +326,7 @@ impl Blockchain {
                 let lottery_payout_tx = Transaction {
                     tx_type: TransactionType::LotteryPayout { 
                         target_block: current_height, 
-                        winner_pubkey 
+                        winner_pubkey: winner_pubkey.clone()
                     },
                     inputs: vec![],
                     outputs: vec![payout_output],
