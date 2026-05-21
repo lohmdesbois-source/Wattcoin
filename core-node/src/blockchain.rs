@@ -218,6 +218,12 @@ impl Blockchain {
 				if immature {
 					continue; // On ignore cette TX pour le bloc en cours
 				}
+				
+				// Exception pour les payouts de loterie (ils n'ont pas de fee et ne doivent pas être ignorés)
+                if matches!(tx.tx_type, TransactionType::LotteryPayout { .. }) {
+                    valid_transactions.push(tx);
+                    continue;
+                }
 
                 // 🛡️ 2. VÉRIFICATION DOUBLE DÉPENSE
                 let mut double_spend = false;
@@ -306,7 +312,7 @@ impl Blockchain {
         }
 		
 		// ===================== LOTERIE L1 =====================
-        if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
+        if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > LOTTERY_TIME_BLOCK {
             let (jackpot_amount, tickets) = self.get_jackpot_info(current_height);
             
             if !tickets.is_empty() {
@@ -326,7 +332,7 @@ impl Blockchain {
                 let lottery_payout_tx = Transaction {
                     tx_type: TransactionType::LotteryPayout { 
                         target_block: current_height, 
-                        winner_pubkey: winner_pubkey.clone()
+                        winner_pubkey 
                     },
                     inputs: vec![],
                     outputs: vec![payout_output],
@@ -335,6 +341,7 @@ impl Blockchain {
                 };
 
                 valid_transactions.push(lottery_payout_tx);
+                println!("💸 LotteryPayout ajouté au template (montant : {} Flames)", jackpot_amount);
             }
         }
 
