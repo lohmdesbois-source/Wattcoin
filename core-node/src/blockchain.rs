@@ -10,7 +10,7 @@ use crate::lattice::LATTICE_DIM;
 
 const FLAME: u64 = 1_000_000_000;
 const MATURITY_BLOCKS: u64 = 3; 
-const EXPECTED_BLOCK_TIME: u64 = 600;    
+const EXPECTED_BLOCK_TIME: u64 = 60;    
 // 18.000.000 / (144 blocs/jour * 365 jours * 20 ans) = ~1.7 Watts/bloc
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
