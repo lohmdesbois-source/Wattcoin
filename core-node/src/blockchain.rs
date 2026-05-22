@@ -164,28 +164,13 @@ impl Blockchain {
 		(pot, tickets)
 	}
 
-    pub fn get_current_jackpot(&self) -> (u64, Vec<(u64, String)>) {
-		let mut total_pot = 0u64;
-		let tickets: Vec<(u64, String)> = Vec::new();
+    pub fn get_current_jackpot(&self) -> (u64, Vec<(String, String)>) {
+		let current_height = self.chain.len() as u64;
+		// Calcul du prochain palier 
+		let next_draw = current_height + (LOTTERY_TIME_BLOCK - (current_height % LOTTERY_TIME_BLOCK));
 		
-		// 1. On parcourt toute la chaîne pour calculer le total historique (Taxe)
-		for block in &self.chain {
-			for tx in &block.transactions {
-				// Additionne la taxe de 10 Flames par tx (si c'est bien ta règle)
-				if tx.tx_type != TransactionType::Coinbase {
-					total_pot += 10; 
-				}
-				// Soustrait les Jackpots déjà payés
-				if let TransactionType::LotteryPayout { .. } = tx.tx_type {
-					let payout = tx.outputs.iter().map(|o| o.aes_vault.parse::<u64>().unwrap_or(0)).sum::<u64>();
-					if total_pot >= payout { total_pot -= payout; }
-				}
-			}
-		}
-		
-		// 2. On récupère les tickets actifs pour le tirage (ceux qui n'ont pas encore été payés)
-		// C'est ici que tu dois lister les tickets valides sur la blockchain
-		(total_pot, tickets)
+		// On réutilise la vraie logique de calcul !
+		self.get_jackpot_info(next_draw)
 	}
 
     pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint) {

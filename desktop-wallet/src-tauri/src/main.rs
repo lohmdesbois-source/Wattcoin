@@ -844,11 +844,12 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
 
             // === MATURITÉ ===
             let mut is_mature = true;
-            if out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") {
-                if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
-                    is_mature = false;
-                }
-            }
+            // Seule la Coinbase est bloquée
+			if out.stealth_address.starts_with("COINBASE_") {
+				if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+					is_mature = false;
+				}
+			}
             if !is_mature { continue; }
 
             // Détection jackpot / payout
@@ -935,9 +936,7 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
 
             // Maturité
             let mut is_mature = true;
-            if (out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_")) 
-                && height > 0 
-                && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+            if (out.stealth_address.starts_with("COINBASE_") && height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
                 is_mature = false;
             }
             if !is_mature { continue; }
