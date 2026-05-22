@@ -131,35 +131,39 @@ impl Blockchain {
 		let mut tickets = Vec::new();
 		let mut pot = 0u64;
 
-		if target_height < LOTTERY_TIME_BLOCK {
-			return (0, tickets);
-		}
-
+		if target_height < LOTTERY_TIME_BLOCK { return (0, tickets); }
 		let start = target_height - LOTTERY_TIME_BLOCK;
 
 		for i in start..target_height {
 			if (i as usize) >= self.chain.len() { continue; }
-
 			let block = &self.chain[i as usize];
 
 			for tx in &block.transactions {
-				// 💡 CORRECTION : On n'ajoute que la taxe de 1% (frais / 100) calculée au consensus
-				if tx.tx_type != TransactionType::Coinbase 
-					&& !matches!(tx.tx_type, TransactionType::LotteryPayout { .. }) {
-					pot += tx.fee / 100; 
+				// 1. On lit les taxes minées par la Coinbase (L'argent est dans LOTTERY_RESERVE)
+				if tx.tx_type == TransactionType::Coinbase {
+					for out in &tx.outputs {
+						if out.stealth_address == "LOTTERY_RESERVE" {
+							pot += out.aes_vault.parse::<u64>().unwrap_or(0);
+						}
+					}
 				}
 
-				// Tickets
+				// 2. On lit les tickets achetés (L'argent est AUSSI dans LOTTERY_RESERVE)
 				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
 					if *target_block == target_height && !tx.outputs.is_empty() {
 						let ticket_id = tx.outputs[0].kyber_capsule.clone();
 						tickets.push((ticket_id, player_pubkey.clone()));
-						pot += 10_000_000_000; // 10 WATT par ticket
+						
+						// On lit le montant EXACT payé pour le ticket
+						for out in &tx.outputs {
+							if out.stealth_address == "LOTTERY_RESERVE" {
+								pot += out.aes_vault.parse::<u64>().unwrap_or(0);
+							}
+						}
 					}
 				}
 			}
 		}
-
 		tickets.sort_by(|a, b| a.0.cmp(&b.0));
 		(pot, tickets)
 	}

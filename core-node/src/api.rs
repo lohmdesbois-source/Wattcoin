@@ -250,7 +250,7 @@ pub async fn start_api_server(
         .map(|chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>| {
             let chain_lock = chain_arc.lock().unwrap();
             
-            // 💡 LA CORRECTION EST ICI : On extrait 'pot' (le montant) et on ignore les tickets '_'
+            // 💡 On extrait 'pot' (le montant) et on ignore les tickets '_'
             let (mut pot, _tickets) = chain_lock.get_current_jackpot(); 
             
             let current_height = chain_lock.chain.len() as u64;
