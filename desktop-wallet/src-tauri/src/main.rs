@@ -935,10 +935,10 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
             // Maturité
-            let mut is_mature = true;
-            if (out.stealth_address.starts_with("COINBASE_") && height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
-                is_mature = false;
-            }
+			let mut is_mature = true;
+			if out.stealth_address.starts_with("COINBASE_") && height > 0 && current_height.saturating_sub(height) < MATURITY_BLOCKS {
+				is_mature = false;
+			}
             if !is_mature { continue; }
 
             let date_str = if timestamp > 0 {

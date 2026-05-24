@@ -69,6 +69,8 @@ async fn main() {
     let peer_target = clean_args.get(3).cloned();
 
     println!("🔥 DÉMARRAGE DU NŒUD CYPHERPUNK...");
+	
+	
     
     let (p2p_bind_ip, api_bind_ip) = if is_live_mode {
         println!("🌍 MODE LIVE ACTIVÉ : Le Nœud est ouvert sur Internet (0.0.0.0)");
@@ -86,6 +88,43 @@ async fn main() {
     let shared_chain = Arc::new(Mutex::new(Blockchain::load_from_disk(&db_file).unwrap_or_else(|_| Blockchain::new())));
     let mempool: SharedMempool = Arc::new(Mutex::new(Vec::new()));
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
+	
+	// ====================================================================
+    // ⚛️ AFFICHAGE DU GENESIS ET GESTION DU LANCEMENT (MAINNET)
+    // ====================================================================
+    let (genesis_timestamp, genesis_hash) = {
+        let chain = shared_chain.lock().unwrap();
+        let genesis_block = &chain.chain[0];
+        (genesis_block.header.timestamp, genesis_block.header.hash.clone())
+    };
+
+    let genesis_date = chrono::DateTime::from_timestamp(genesis_timestamp, 0)
+        .unwrap_or_default()
+        .with_timezone(&chrono::Local)
+        .format("%d/%m/%Y %H:%M:%S")
+        .to_string();
+
+    println!("\n====================================================================");
+    println!("⚛️  BLOC GENESIS PRÊT (STARTING BLOCK)");
+    println!("====================================================================");
+    println!("📦 Index       : 0");
+    println!("🔗 Hash        : {}", genesis_hash);
+    println!("🕒 Date Prévue : {}", genesis_date);
+    println!("====================================================================\n");
+
+    let now_ts = chrono::Utc::now().timestamp();
+    if now_ts < genesis_timestamp {
+        let wait_seconds = genesis_timestamp - now_ts;
+        println!("⏳ [MAINNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
+        println!("⏳ Le nœud est en mode veille. Lancement automatique dans {} secondes...", wait_seconds);
+        println!("⏳ Laissez ce terminal ouvert. Les moteurs s'allumeront à l'heure H.\n");
+        
+        // 💡 Le nœud s'endort ici et se réveillera exactement à l'heure du Genesis !
+        tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds as u64)).await;
+        
+        println!("🚀 [MAINNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
+    }
+    // ====================================================================
 
     // 💡 L'initialisation se fera juste avant le minage
     
@@ -369,12 +408,12 @@ async fn main() {
                     for tx in candidate_block.transactions.iter().skip(1) { total_fees += tx.fee; }
 
                     println!("\n====================================================================");
-                    println!("🎉 EURÊKA ! NOUVEAU BLOC FORGÉ PAR LE MINEUR !");
+                    println!("🎉 NOUVEAU BLOC FORGÉ PAR LE MINEUR !");
                     println!("====================================================================");
                     println!("📦 Index du Bloc : {}", candidate_block.header.index);
-                    println!("🔗 Hash         : {}", candidate_block.header.hash);
+                    println!("🔗 Hash          : {}", candidate_block.header.hash);
                     println!("🕒 Date et Heure : {}", date_str);
-                    println!("📝 Transactions  : {} incluses (1 Coinbase + {} Publique/Swap)", nb_tx, nb_tx - 1);
+                    println!("📝 Transactions  : {} incluses (1 Coinbase + {} Publique/Swap/Lottery)", nb_tx, nb_tx - 1);
                     println!("💰 Frais perçus  : {} Flames", total_fees);
                     println!("====================================================================\n");
                     

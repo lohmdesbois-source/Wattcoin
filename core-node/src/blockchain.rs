@@ -17,8 +17,7 @@ const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
 const EMISSION_DECAY_SHIFT: u32 = 18;   // Ajusté pour ~21 ans
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
 pub const LOTTERY_TIME_BLOCK: u64 = 10;
-
-// 💡 NOUVEAU : Changement de Dataset tous les 20 blocs pour tuer les ASICs !
+// 💡 Changement de Dataset tous les 51 blocs pour tuer les ASICs !
 pub const EPOCH_BLOCKS: u64 = 51; 
 
 pub struct Blockchain {
@@ -664,7 +663,7 @@ impl Blockchain {
         let current_len = self.chain.len(); 
         if current_len < 2 { return; }
 
-        let window_size = 17; // 💡 Fenêtre glissante (Inspiré de Monero/Zcash)
+        let window_size = 17; // 💡 Fenêtre glissante (Inspiré de Monero/Zcash) prod 144 (24h)
         let start_idx = if current_len > window_size { current_len - window_size } else { 0 };
         
         let mut total_time = 0;

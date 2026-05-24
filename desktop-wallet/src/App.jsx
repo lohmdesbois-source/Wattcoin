@@ -115,91 +115,66 @@ function App() {
   useEffect(() => {
     if (view !== "dex" && view !== "dashboard" && view !== "swaps" && view !== "history" && view !== "casino") return;
 
+    let isRefreshing = false; // 💡 Le vigile qui empêche le spam
+
     const updateData = async () => {
-		if (!walletData) return;
-		
-		// 1. Récupération parallèle de toutes les données fraîches
-		try {
-			const [balWATT, hist, balBTC, pool, apiSwaps] = await Promise.all([
-				invoke("get_watt_balance", { keys: walletData }),
-				invoke("get_history", { keys: walletData }),
-				invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex }),
-				invoke("get_dark_pool"),
-				invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address })
-			]);
-
-			setWattBalance(balWATT);
-			setTxHistory(hist);
-			setBtcBalance(balBTC);
-			setDarkPool(pool);
-
-			// 🛡️ SYNCHRO STRICTE : 
-			// On ne fusionne plus avec le localStorage. 
-			// On affiche UNIQUEMENT ce que le Nœud renvoie. 
-			// Si le nœud dit que le swap est fini, il disparaît instantanément.
-			setPendingSwaps(apiSwaps);
-			localStorage.setItem('my_swaps', JSON.stringify(apiSwaps));
-
-		} catch (e) {
-			console.error("Erreur de sync temps réel :", e);
-		}
+      if (!walletData || isRefreshing) return;
+      isRefreshing = true;
 
       try {
+        // 💡 EXÉCUTION SÉQUENTIELLE : On laisse Tor respirer entre chaque appel
+        const balWATT = await invoke("get_watt_balance", { keys: walletData });
+        setWattBalance(balWATT);
+
+        const hist = await invoke("get_history", { keys: walletData });
+        setTxHistory(hist);
+
+        const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex });
+        setBtcBalance(balBTC);
+
+        const pool = await invoke("get_dark_pool");
+        setDarkPool(pool);
+
+        const apiSwaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
+        setPendingSwaps(apiSwaps);
+        localStorage.setItem('my_swaps', JSON.stringify(apiSwaps));
+
         const supply = await invoke("get_total_supply");
         setTotalSupply(supply);
+
         const jackpot = await invoke("get_current_jackpot");
         setCurrentJackpot(jackpot);
-      } catch(e) {}
 
-      if (view === "dex") {
-        try { const pool = await invoke("get_dark_pool"); setDarkPool(pool); } catch (e) {}
+        const info = await invoke("get_network_info");
+        if(info.last_price_sats) setGlobalWattPriceSats(info.last_price_sats);
+
+      } catch (e) {
+        console.error("Erreur de sync temps réel :", e);
+      } finally {
+        isRefreshing = false; // 💡 On libère le passage
       }
-
-      try {
-        const apiSwaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
-        const cachedStr = localStorage.getItem('my_swaps');
-        const cachedSwaps = cachedStr ? JSON.parse(cachedStr) : [];
-        const combined = [...apiSwaps];
-        cachedSwaps.forEach(cached => {
-            if (!combined.find(s => s.htlc_hash === cached.htlc_hash)) {
-                combined.push(cached);
-            }
-        });
-        // 🛡️ NETTOYAGE AUTO : On ne garde que ce qui est VRAIMENT sur la blockchain
-        // On écrase le vieux cache avec les données fraîches reçues du nœud
-        localStorage.setItem('my_swaps', JSON.stringify(apiSwaps));
-        setPendingSwaps(apiSwaps);
-     } catch (e) { console.error(e); }
     };
     
+    // On lance la première synchro à l'ouverture de la vue
     updateData();
 
-    let unlisten;
-    const setupListener = async () => {
-		unlisten = await listen("network-update", async () => {
-			// Ajoute ces deux appels ici pour forcer la mise à jour
-			try {
-				const supply = await invoke("get_total_supply");
-				setTotalSupply(supply);
-				const jackpot = await invoke("get_current_jackpot");
-				setCurrentJackpot(jackpot);
-			} catch(e) { console.error("Erreur maj API :", e); }
+    // 💡 CORRECTION DU MEMORY LEAK : On stocke la promesse directement
+    const unlistenPromise = listen("network-update", () => {
+      updateData();
+    });
 
-			invoke("get_network_info")
-				.then(data => { if(data.last_price_sats) setGlobalWattPriceSats(data.last_price_sats); })
-				.catch(()=>{});
-			updateData();
-		});
-	};
-    setupListener();
-
-    const timerDex = setInterval(async () => {
-      if (view === "dex") {
-        try { const pool = await invoke("get_dark_pool"); setDarkPool(pool); } catch (e) {}
+    // 💡 On passe le timer DEX à 10s pour ne pas saturer Tor inutilement
+    const timerDex = setInterval(() => {
+      if (view === "dex" && !isRefreshing) {
+        invoke("get_dark_pool").then(setDarkPool).catch(()=>{});
       }
-    }, 5000);
+    }, 10000);
 
-    return () => { clearInterval(timerDex); if (unlisten) unlisten(); };
+    // Nettoyage parfait quand on quitte le composant
+    return () => { 
+      clearInterval(timerDex); 
+      unlistenPromise.then(unlisten => unlisten()); 
+    };
   }, [view, walletData]);
 
   const handleUnlock = async () => {

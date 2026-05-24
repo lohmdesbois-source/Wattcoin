@@ -21,7 +21,7 @@ impl Block {
     pub fn genesis() -> Self {
         let header = BlockHeader {
             index: 0,
-            timestamp: 1713000000, 
+            timestamp: 1779612120, 
             previous_hash: String::from("0000000000000000000000000000000000000000000000000000000000000000"),
             hash: String::from("GENESIS_HASH_WATTCOIN_000000000000000000000000000000000000000000"),
             nonce: 0,
