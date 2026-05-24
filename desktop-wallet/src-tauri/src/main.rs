@@ -1395,10 +1395,11 @@ async fn check_btc_contract_exists(htlc_hash: &str) -> Result<bool, String> {
     let client = reqwest::Client::builder().proxy(proxy).build().map_err(|_| "HTTP client error".to_string())?;
 
     // On scanne les explorers pour voir si l'adresse dérivée du hash contient des UTXOs
-    // (Dans un vrai système, le hash doit être lié à une adresse p2wsh)
-    let endpoints = [
-        "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api"
-    ];
+    // ✅ Fiables et routés anonymement via Tor
+let endpoints = [
+    "https://mempool.space/testnet/api",
+    "https://blockstream.info/testnet/api"
+];
 
     for endpoint in endpoints {
         // Ici on simplifie : on vérifie si une transaction existe pour ce hash ou adresse
@@ -1604,10 +1605,11 @@ async fn get_btc_balance(master_seed_hex: String) -> Result<f64, String> {
         let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
             .map_err(|e| e.to_string())?;
 
-        let endpoints = [
-            "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
-            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
-        ];
+        // ✅ Fiables et routés anonymement via Tor
+		let endpoints = [
+			"https://mempool.space/testnet/api",
+			"https://blockstream.info/testnet/api"
+		];
 
         let mut synced = false;
         for endpoint in endpoints {
@@ -1658,10 +1660,12 @@ async fn send_btc_to_htlc(master_seed_hex: String, htlc_address: String, amount_
         let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
             .map_err(|e| format!("Erreur Init Wallet: {}", e))?;
 
-        let endpoints = [
-            "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
-            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
-        ];
+        // ✅ Fiables et routés anonymement via Tor
+		let endpoints = [
+			"https://mempool.space/testnet/api",
+			"https://blockstream.info/testnet/api"
+		];
+
 
         let mut active_blockchain = None;
         for endpoint in endpoints {
@@ -1728,10 +1732,12 @@ async fn send_btc_direct(master_seed_hex: String, recipient_address: String, amo
         let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
             .map_err(|e| format!("Erreur Init Wallet: {}", e))?;
 
-        let endpoints = [
-            "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
-            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
-        ];
+        // ✅ Fiables et routés anonymement via Tor
+		let endpoints = [
+			"https://mempool.space/testnet/api",
+			"https://blockstream.info/testnet/api"
+		];
+
 
         let mut active_blockchain = None;
         for endpoint in endpoints {
@@ -1831,10 +1837,12 @@ async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_he
     let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9150").map_err(|_| "Impossible de lier le proxy".to_string())?;
     let client = reqwest::Client::builder().proxy(proxy).build().map_err(|_| "Erreur HTTP".to_string())?;
 
-    let endpoints = [
-        "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion/testnet/api",
-        "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdxxj6vhok4niad.onion/testnet/api"
-    ];
+    // ✅ Fiables et routés anonymement via Tor
+		let endpoints = [
+			"https://mempool.space/testnet/api",
+			"https://blockstream.info/testnet/api"
+		];
+
 
     let mut utxos = None;
     let mut active_endpoint = String::new();

@@ -40,7 +40,7 @@ impl Blockchain {
         blockchain
     }
     
-    // 💡 NOUVEAU : Trouve la graine RandomX appropriée pour une hauteur de bloc donnée
+    // 💡 Trouve la graine RandomX appropriée pour une hauteur de bloc donnée
     pub fn get_epoch_seed(&self, height: u64) -> String {
         if height <= EPOCH_BLOCKS {
             return self.chain[0].header.hash.clone(); // Ère 0 : On utilise le Genesis
@@ -302,7 +302,8 @@ impl Blockchain {
         }
 		
 		// ===================== LOTERIE L1 =====================
-        if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > LOTTERY_TIME_BLOCK {
+        // ✅ On s'assure juste de ne pas tirer au bloc 0
+		if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
             let (jackpot_amount, tickets) = self.get_jackpot_info(current_height);
             
             if !tickets.is_empty() {
