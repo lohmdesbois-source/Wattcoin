@@ -1,32 +1,26 @@
-🛡️ PHASE 1 : La Forteresse Cryptographique (L1 Security) - [Priorité Actuelle]
-On a un bel emballage, il faut maintenant le remplir avec du béton armé.
+Roadmap
+[x] Moteur UTXO & HTLC
 
-Ring Signatures (Cercle de signatures) : Implémenter le vrai mélange mathématique pour cacher l'expéditeur parmi les leurres (les fameux decoys qu'on a rebranchés).
+[x] Intégration RandomX (Warm-Up asynchrone)
 
-Stealth Addresses strictes : S'assurer que le calcul Diffie-Hellman avec Kyber génère bien une adresse unique indéchiffrable par le reste du réseau.
+[x] Engagements Lattice/LWE
 
-Bulletproofs / ZK-SNARKs (Confidentialité des montants) : Actuellement, le montant est caché dans le coffre AES, mais le réseau a besoin de vérifier que tu ne crées pas d'argent à partir de rien (Lattice Commitments réels).
+[x] Logique DEX FBA On-Chain
 
+[x] P2P anonymisé (Tor/Arti)
 
+[ ] Layer 2 Intégré (Blocs 1s)
 
-🤝 PHASE 2 : Le DEX 100% Trustless (L1 Decentralization)
-Fini les bots d'injection, place au monde réel.
+[ ] Tests unitaires & intégration complets -> [Aide bienvenue]
 
-Retirer la génération automatique d'ordres.
+[ ] Audit externe de la signature Ring Lattice
 
-Lancer deux Wallets séparés sur la même machine.
+[ ] Lancement Mainnet Genesis
 
-Faire un vrai dépôt de liquidité, placer un ordre d'achat sur le Wallet A, un ordre de vente sur le Wallet B, et laisser le Nœud Relais jouer les entremetteurs.
+Contribution
+Nous accueillons tous les Cypherpunks et développeurs Rust. Le projet étant en phase de transition d'une preuve de concept vers un protocole open-source, les tests unitaires, la revue de code et l'optimisation réseau sont prioritaires.
 
-Vérifier le bon déroulement de l'Atomic Swap L1 (Bitcoin <-> Wattcoin) entre les deux entités.
+Licence
+Ce projet est sous licence GNU General Public License v3.0 (GPLv3). Voir le fichier LICENSE pour les détails.
 
-
-
-⚡ PHASE 3 : Le "Lightning" Wattcoin (L2 Scalability)
-Une fois que le L1 est inattaquable et que les swaps fonctionnent, on passe à la vitesse supérieure.
-
-Création de canaux de paiement (State Channels) hors-chaîne.
-
-Transactions instantanées et gratuites en contournant le minage RandomX.
-
-Fermeture du canal et règlement final sur la blockchain (L1).
+Disclaimer: Wattcoin est un logiciel expérimental. La cryptographie est complexe. Ne pas utiliser pour des valeurs financières significatives avant un audit complet.

@@ -63,10 +63,10 @@ static TOR_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 fn get_wallet_dir() -> PathBuf {
     #[cfg(debug_assertions)]
     {
-        // 🧪 MODE TEST
-        const DEV_WALLET_NAME: &str = "wallet_wattcoin"; 
-        let mut path = std::env::current_dir().unwrap_or_default();
-        path.push(DEV_WALLET_NAME);
+        // 🧪 MODE TEST : On utilise le dossier temporaire de l'OS 
+        // pour NE PAS déclencher le Hot-Reload (rafraîchissement) de Vite/Tauri !
+        let mut path = std::env::temp_dir();
+        path.push("wallet_wattcoin_dev");
         if !path.exists() {
             std::fs::create_dir_all(&path).expect("Impossible de créer le dossier de test");
         }
@@ -1713,6 +1713,12 @@ async fn send_btc_to_htlc(master_seed_hex: String, htlc_address: String, amount_
 #[tauri::command]
 async fn send_btc_direct(master_seed_hex: String, recipient_address: String, amount_btc: f64) -> Result<String, String> {
     let _tor = get_tor_client().await?; 
+	
+	// 💡 AJOUT DU CHECK DE SÉCURITÉ : Avant de dépenser, on vérifie l'existence/accessibilité
+    let contract_exists = check_btc_contract_exists(&recipient_address).await?;
+    if !contract_exists {
+        return Err("❌ Impossible d'atteindre l'adresse HTLC sur le réseau Bitcoin. Vérifiez la connexion ou réessayez.".to_string());
+    }
     
     let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
         use bdk::bitcoin::Network as BdkNetwork;
@@ -1858,7 +1864,7 @@ async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_he
         }
     }
 
-    let utxos = utxos.ok_or_else(|| "❌ Services cachés Bitcoin injoignables.".to_string())?;
+    let utxos = utxos.ok_or_else(|| "❌ Services Bitcoin injoignables. Le pare-feu Tor a peut-être été bloqué. Réessayez dans 10 secondes !".to_string())?;
     if utxos.as_array().unwrap_or(&vec![]).is_empty() { return Err("❌ Aucun Bitcoin trouvé dans le contrat !".to_string()); }
     
     let txid_str = utxos[0]["txid"].as_str().unwrap();
