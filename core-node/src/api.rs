@@ -4,7 +4,7 @@ use crate::transaction::Transaction;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering}; 
 use serde::{Serialize, Deserialize};
-use num_bigint::BigUint;
+
 
 pub type SharedPool = Arc<Mutex<Vec<Order>>>;
 
@@ -228,15 +228,18 @@ pub async fn start_api_server(
         .map(|chain_arc: Arc<Mutex<Blockchain>>, peers: crate::SharedPeers| {
             let chain_lock = chain_arc.lock().unwrap();
             
-            // 💡 1. Calcul de la difficulté exacte (Même logique que le mineur)
+            // 💡 1. FIX : Typage strict avec BigUint pour ne pas faire paniquer le compilateur
             let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
-            let initial_target = &max_target >> 12; // 12 = INITIAL_DIFFICULTY_SHIFT
-            let difficulty_x100 = (&initial_target * 100u64) / &chain_lock.target;
-            let diff_int = &difficulty_x100 / 100u64;
-            let diff_dec = &difficulty_x100 % 100u64;
-            let difficulty_decimal = format!("{}.{:02}", diff_int, diff_dec); // Format float pour le graphique
+            let initial_target = max_target >> 12_u32; // INITIAL_DIFFICULTY_SHIFT
+            let hundred = num_bigint::BigUint::from(100u32); // On force le 100 en BigUint
 
-            // 💡 2. Formatage du Target en Hexadécimal (rempli de zéros pour faire 64 caractères)
+            // On fait le calcul uniquement entre BigUints
+            let difficulty_x100 = (initial_target * &hundred) / &chain_lock.target;
+            let diff_int = &difficulty_x100 / &hundred;
+            let diff_dec = &difficulty_x100 % &hundred;
+            let difficulty_decimal = format!("{}.{:02}", diff_int, diff_dec);
+
+            // 💡 2. Formatage du Target en Hexadécimal
             let target_hex = format!("{:0>64}", chain_lock.target.to_str_radix(16));
 
             warp::reply::json(&serde_json::json!({
