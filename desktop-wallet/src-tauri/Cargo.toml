@@ -5,12 +5,7 @@ description = "Un Super Wallet Cypherpunk"
 authors = ["you"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "qryptis_wallet_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
@@ -26,13 +21,11 @@ bip39 = { version = "2.0.0", features = ["french"] }
 hex = "0.4.3"
 rand = "0.8.5"
 bitcoin = { version = "0.32.0", features = ["base64", "rand"] }
-
-# 🛡️ LES ARMES DE BLINDAGE DU COFFRE
 aes-gcm = "0.10.3"
-pbkdf2 = "0.12.2"  # 🐛 FIX : On passe à la version 0.12.2 !
+pbkdf2 = "0.12.2"
 sha2 = "0.10.6"
 blake3 = "1.5.0"
-reqwest = { version = "0.12", features = ["json", "socks"] }# 📻 Le Walkie-Tal
+reqwest = { version = "0.12", features = ["json", "socks"] }
 curve25519-dalek = "4.1.2"
 bdk = { version = "0.29.0", features = ["compiler", "use-esplora-reqwest", "reqwest-default-tls"] }
 tokio = { version = "1", features = ["full"] }
@@ -40,7 +33,6 @@ monero = "0.21.0"
 pqcrypto-kyber = "0.8"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
-# Ajout de "on-demand-vpn" (pour la gestion réseau) et "full" pour les services proxy
 arti-client = { version = "0.22.0", features = ["tokio", "rustls", "onion-service-client", "full"] }
 once_cell = "1.19.0"
 tor-rtcompat = "0.22.0"
@@ -49,4 +41,3 @@ lightning-invoice = "0.26.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 dirs = "6.0.0"
 chrono = { version = "0.4", features = ["serde"] }
-
