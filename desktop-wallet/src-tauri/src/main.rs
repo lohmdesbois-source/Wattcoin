@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
 
+
 use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as _, SecretKey as _};
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, SignedMessage};
 
@@ -1950,6 +1951,11 @@ async fn pay_lightning_invoice(master_seed_hex: String, invoice: String) -> Resu
     Ok("⚡ Paiement Lightning réussi !".to_string())
 }
 
+#[tauri::command]
+fn get_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 // ============== LA FONCTION MAIN ==================
 
 fn main() {
@@ -1982,8 +1988,7 @@ fn main() {
             send_wattcoin, create_btc_htlc, send_btc_to_htlc, check_btc_contract_exists, claim_wattcoin_swap, refund_wattcoin_swap,
             destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, 
             save_miner_script, get_total_supply, get_current_jackpot, buy_lottery_ticket,
-            // 💡 Les 3 commandes LDK sont là, et UNIQUEMENT des commandes valides :
-            get_lightning_balance, create_lightning_invoice, pay_lightning_invoice
+            get_lightning_balance, create_lightning_invoice, pay_lightning_invoice, get_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

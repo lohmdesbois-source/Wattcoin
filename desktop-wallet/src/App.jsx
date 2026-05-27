@@ -40,6 +40,9 @@ function App() {
 
   const [actionnedSwaps, setActionnedSwaps] = useState(new Set());
   
+  const [appVersion, setAppVersion] = useState("");
+  
+  
   // ⚡ Lightning States
   const [lnModalTab, setLnModalTab] = useState("pay"); // 'pay' ou 'receive'
   const [lnInvoiceStr, setLnInvoiceStr] = useState("");
@@ -60,6 +63,13 @@ function App() {
       if (exists) { setView("unlock"); } else { setView("onboarding"); }
     }
     checkVault();
+
+    // Récupération de la version et MAJ du titre de la fenêtre !
+    invoke("get_version")
+      .then(ver => {
+          setAppVersion(ver);
+      })
+      .catch(e => console.warn("Impossible de lire la version", e));
 
     fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
       .then(res => res.json())
@@ -370,7 +380,22 @@ function App() {
 
   const Sidebar = ({ activeTab }) => (
     <nav className="sidebar">
-      <h2 className="logo">WATTCOIN</h2>
+		<div className="sidebar-logo">
+		  <div className="logo-container">
+			<Zap size={26} color="var(--primary)" fill="var(--primary)" />
+			<h2 className="logo">WATTCOIN</h2>
+		  </div>
+		  
+		  <span className="mono" style={{ 
+			fontSize: "0.73rem", 
+			color: "var(--text-muted)", 
+			marginTop: "7px",
+			letterSpacing: "1.5px"
+		  }}>
+			v{appVersion}
+		  </span>
+		</div>
+
       <ul className="nav-links">
         <li className={activeTab === "dashboard" ? "active" : ""} onClick={() => setView("dashboard")}><Lock size={18}/> Portefeuilles</li>
         <li className={activeTab === "dex" ? "active" : ""} onClick={() => setView("dex")}><ArrowRightLeft size={18}/> DEX (FBA)</li>
@@ -382,7 +407,7 @@ function App() {
       </ul>
     </nav>
   );
-
+  
   // ================= CALCULS DE VALEURS =================
   const wattBtcPrice = globalWattPriceSats / 100000000;
   const wattUsdPrice = wattBtcPrice * btcUsdPrice;
