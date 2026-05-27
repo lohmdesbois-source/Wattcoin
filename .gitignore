@@ -31,7 +31,9 @@ Thumbs.db
 **/*.exe
 **/*.msi
 **/*.AppImage
-**/Wattcoin-Node-*/
+**/wattcoin-node-*/
 
-# Dossier de distribution (temporaire)
-/dist/
+
+# Ne jamais uploader les fichiers de hash/checksum
+*.sha256
+*.asc
