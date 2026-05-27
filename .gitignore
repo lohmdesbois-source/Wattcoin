@@ -32,6 +32,7 @@ Thumbs.db
 **/*.msi
 **/*.AppImage
 **/wattcoin-node-*/
+**/wattcoin-wallet-*/
 
 
 # Ne jamais uploader les fichiers de hash/checksum
