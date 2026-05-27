@@ -246,7 +246,7 @@ pub async fn start_api_server(
                 "blocks": chain_lock.chain.len(), 
                 "connected_peers": peers.lock().unwrap().len(),
                 "last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed), 
-                "version": "Wattcoin V2.1.6 (On-Chain DEX)",
+                "version": "Wattcoin V2.1.8 (On-Chain DEX, L1 Game)",
                 "difficulty_decimal": difficulty_decimal,
                 "target_hex": target_hex
             }))

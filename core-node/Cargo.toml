@@ -1,6 +1,6 @@
 [package]
 name = "wattcoin_core"
-version = "2.1.4"
+version = "2.1.7"
 edition = "2024"
 
 [dependencies]
