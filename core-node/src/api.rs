@@ -246,7 +246,7 @@ pub async fn start_api_server(
                 "blocks": chain_lock.chain.len(), 
                 "connected_peers": peers.lock().unwrap().len(),
                 "last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed), 
-                "version": "Wattcoin V2.1.8 (On-Chain DEX, L1 Game)",
+                "version": "Wattcoin V2.1.8",
                 "difficulty_decimal": difficulty_decimal,
                 "target_hex": target_hex
             }))
@@ -285,6 +285,70 @@ pub async fn start_api_server(
             
             warp::reply::json(&pot)
         });
+		
+	// ==================== ROUTE DIFFICULTY HISTORY (version corrigée + puissante) ====================
+	let get_difficulty_history = warp::path("difficulty")
+		.and(warp::path("history"))
+		.and(warp::get())
+		.and(warp::query::<std::collections::HashMap<String, String>>())
+		.and(chain_filter.clone())
+		.map(|params: std::collections::HashMap<String, String>, chain_arc: Arc<Mutex<Blockchain>>| {
+			let chain_lock = chain_arc.lock().unwrap();
+
+			// Paramètres supportés :
+			// ?limit=80
+			// ?hours=24
+			// ?days=7
+			let mut limit = params.get("limit")
+				.and_then(|v| v.parse::<usize>().ok())
+				.unwrap_or(80);
+
+			let hours = params.get("hours")
+				.and_then(|v| v.parse::<i64>().ok());
+
+			let days = params.get("days")
+				.and_then(|v| v.parse::<i64>().ok());
+
+			let max_limit = 500;
+			limit = limit.min(max_limit);
+
+			let mut history = Vec::new();
+
+			// Calcul de la difficulté (comme dans /info)
+			let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
+			let initial_target = max_target >> 12_u32;
+			let hundred = num_bigint::BigUint::from(100u32);
+
+			let now = chrono::Utc::now().timestamp();
+
+			for block in chain_lock.chain.iter().rev() {
+				// Filtre par période si demandé
+				if let Some(h) = hours {
+					if now - block.header.timestamp > h * 3600 { break; }
+				}
+				if let Some(d) = days {
+					if now - block.header.timestamp > d * 86400 { break; }
+				}
+
+				let difficulty_x100 = (&initial_target * &hundred) / &chain_lock.target;
+				let diff_int = &difficulty_x100 / &hundred;
+				let diff_dec = &difficulty_x100 % &hundred;
+
+				history.push(serde_json::json!({
+					"height": block.header.index,
+					"difficulty_decimal": format!("{}.{:02}", diff_int, diff_dec),
+					"timestamp": block.header.timestamp
+				}));
+
+				if history.len() >= limit { break; }
+			}
+
+			// On remet dans l’ordre chronologique (du plus ancien au plus récent)
+			history.reverse();
+
+			warp::reply::json(&history)
+		});
+	// =====================================================================
     
     
     let cors = warp::cors()
@@ -293,6 +357,7 @@ pub async fn start_api_server(
         .allow_methods(vec!["GET", "POST", "DELETE"]); // 💡 Ajout de DELETE ici
 
     let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(cancel_order).or(info_route).or(get_swaps).or(get_supply).or(get_jackpot)
+			.or(get_difficulty_history)
         .with(cors);
     
     warp::serve(routes).run((host_ip, port)).await;
