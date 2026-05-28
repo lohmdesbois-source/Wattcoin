@@ -63,7 +63,7 @@ impl Blockchain {
         }
 
         let data = fs::read_to_string(path)?;
-        let chain: Vec<Block> = serde_json::from_str(&data)?;
+        let mut chain: Vec<Block> = serde_json::from_str(&data)?;
 		
 		// 💡 Migration automatique des anciennes chaînes (target_hex manquant)
 		let mut migrated = false;

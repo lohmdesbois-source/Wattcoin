@@ -286,7 +286,7 @@ pub async fn start_api_server(
             warp::reply::json(&pot)
         });
 		
-	// ==================== ROUTE DIFFICULTY HISTORY (version finale + propre) ====================
+	// ==================== ROUTE DIFFICULTY HISTORY (version finale) ====================
 	let get_difficulty_history = warp::path("difficulty")
 		.and(warp::path("history"))
 		.and(warp::get())
@@ -300,7 +300,7 @@ pub async fn start_api_server(
 				.unwrap_or(120);
 
 			let hours = params.get("hours").and_then(|v| v.parse::<i64>().ok());
-			let days  = params.get("days").and_then(|v| v.parse::<i64>().ok());
+			let days = params.get("days").and_then(|v| v.parse::<i64>().ok());
 
 			let max_limit = 500;
 			limit = limit.min(max_limit);
@@ -309,7 +309,7 @@ pub async fn start_api_server(
 			let now = chrono::Utc::now().timestamp();
 
 			let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
-			let initial_target = max_target >> 12_u32;
+			let initial_target = max_target.clone() >> 12_u32;   // ← CLONE ici
 			let hundred = num_bigint::BigUint::from(100u32);
 
 			for block in chain_lock.chain.iter().rev() {
@@ -320,7 +320,6 @@ pub async fn start_api_server(
 					if now - block.header.timestamp > d * 86400 { break; }
 				}
 
-				// Calcul précis depuis le target_hex stocké dans le bloc
 				let target_big = num_bigint::BigUint::parse_bytes(block.header.target_hex.as_bytes(), 16)
 					.unwrap_or_else(|| max_target.clone());
 
