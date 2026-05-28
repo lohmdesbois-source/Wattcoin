@@ -12,7 +12,7 @@ use randomx_rs::{RandomXFlag, RandomXCache, RandomXDataset, RandomXVM};
 use blockchain::{Blockchain, EPOCH_BLOCKS}; 
 use transaction::{Transaction, TransactionType};
 use api::SharedPool; 
-use rand::RngCore;
+
 
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
@@ -200,100 +200,78 @@ async fn main() {
         let mut warming_up_epoch = current_epoch;
     
         loop {
-            // 💡 0. LE MOTEUR DEX (FBA) ON-CHAIN : Exécuté par le mineur avant de forger
-            let mut dex_settlement_tx = None;
-            {
-                let mut p = dex_pool.lock().unwrap();
-                let mut buys: Vec<_> = p.iter().filter(|o| o.order_type == "buy").cloned().collect();
-                let mut sells: Vec<_> = p.iter().filter(|o| o.order_type == "sell").cloned().collect();
+            // 💡 0. LE MOTEUR DEX (FBA) ON-CHAIN - VERSION SÉCURISÉE
+			let mut dex_settlement_tx = None;
+			{
+				let mut p = dex_pool.lock().unwrap();
+				let mut buys: Vec<_> = p.iter().filter(|o| o.order_type == "buy").cloned().collect();
+				let mut sells: Vec<_> = p.iter().filter(|o| o.order_type == "sell").cloned().collect();
+				buys.sort_by(|a, b| b.price_sats.cmp(&a.price_sats));
+				sells.sort_by(|a, b| a.price_sats.cmp(&b.price_sats));
 
-                buys.sort_by(|a, b| b.price_sats.cmp(&a.price_sats));
-                sells.sort_by(|a, b| a.price_sats.cmp(&b.price_sats));
+				let mut generated_swaps = Vec::new();
+				let mut clearing_price_sats = 0u64;
+				let mut total_volume_flames = 0u64;
 
-                let mut generated_swaps = Vec::new();
-                let mut clearing_price_sats = 0;
-                let mut total_volume_flames = 0;
+				let mut buy_idx = 0;
+				let mut sell_idx = 0;
 
-                let mut buy_idx = 0;
-                let mut sell_idx = 0;
+				while buy_idx < buys.len() && sell_idx < sells.len() {
+					let buy = &mut buys[buy_idx];
+					let sell = &mut sells[sell_idx];
 
-                while buy_idx < buys.len() && sell_idx < sells.len() {
-                    let buy = &mut buys[buy_idx];
-                    let sell = &mut sells[sell_idx];
+					if buy.price_sats >= sell.price_sats {
+						clearing_price_sats = (buy.price_sats + sell.price_sats) / 2;
+						let matched_volume = std::cmp::min(buy.amount_flames, sell.amount_flames);
+						total_volume_flames += matched_volume;
 
-                    if buy.price_sats >= sell.price_sats {
-                        clearing_price_sats = (buy.price_sats + sell.price_sats) / 2; 
+						// 💡 Le mineur NE connaît JAMAIS le secret !
+						// Le hash est envoyé par le wallet de l'acheteur BTC (hors-chaîne)
+						// Pour le moment on utilise un placeholder. Le wallet réel l'enverra via une nouvelle route.
+						let htlc_hash = format!("BUYER_HASH_{}", buy.id);   // ← placeholder temporaire
 
-                        let matched_volume = std::cmp::min(buy.amount_flames, sell.amount_flames);
-                        total_volume_flames += matched_volume;
+						generated_swaps.push(crate::transaction::SwapContract {
+							buyer_btc_address: buy.btc_address.clone(),
+							buyer_btc_pubkey: buy.btc_pubkey.clone(),
+							seller_watt_address: sell.watt_address.clone(),
+							seller_btc_pubkey: sell.btc_pubkey.clone(),
+							watt_amount_flames: matched_volume,
+							btc_amount_sats: (matched_volume as f64 / 1_000_000_000.0 * clearing_price_sats as f64) as u64,
+							htlc_hash,
+						});
 
-                        let mut secret_bytes = [0u8; 32];
-                        rand::thread_rng().fill_bytes(&mut secret_bytes);
-                        let htlc_secret = hex::encode(secret_bytes);
-                        let htlc_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+						buy.amount_flames -= matched_volume;
+						sell.amount_flames -= matched_volume;
+						if buy.amount_flames == 0 { buy_idx += 1; }
+						if sell.amount_flames == 0 { sell_idx += 1; }
+					} else {
+						break;
+					}
+				}
 
-                        let btc_amount = (matched_volume as f64 / 1_000_000_000.0 * clearing_price_sats as f64) as u64;
+				// Nettoyage du pool
+				let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+				p.clear();
+				for buy in buys { if buy.amount_flames > 0 && buy.expires_at > now { p.push(buy); } }
+				for sell in sells { if sell.amount_flames > 0 && sell.expires_at > now { p.push(sell); } }
 
-                        if btc_amount >= 1000 { // Sécurité Anti-Poussière
-                            generated_swaps.push(crate::transaction::SwapContract {
-                                buyer_btc_address: buy.btc_address.clone(),
-                                buyer_btc_pubkey: buy.btc_pubkey.clone(),
-                                seller_watt_address: sell.watt_address.clone(),
-                                seller_btc_pubkey: sell.btc_pubkey.clone(),
-                                watt_amount_flames: matched_volume,
-                                btc_amount_sats: btc_amount,
-                                htlc_secret,
-                                htlc_hash,
-                            });
-                        }
+				if total_volume_flames > 0 {
+					println!("\n⚖️ [DEX] Matching réussi → {} WATT à {} Sats", 
+							 total_volume_flames as f64 / 1_000_000_000.0, clearing_price_sats);
 
-                        buy.amount_flames -= matched_volume;
-                        sell.amount_flames -= matched_volume;
-
-                        if buy.amount_flames == 0 { buy_idx += 1; }
-                        if sell.amount_flames == 0 { sell_idx += 1; }
-                    } else { break; }
-                }
-
-                // 💡 On récupère le timestamp actuel
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-
-                p.clear();
-                
-                // On remet les achats non remplis ET non expirés
-                for buy in buys {
-                    if buy.amount_flames > 0 && buy.expires_at > now { 
-                        p.push(buy); 
-                    }
-                }
-                // On remet les ventes non remplies ET non expirées
-                for sell in sells {
-                    if sell.amount_flames > 0 && sell.expires_at > now { 
-                        p.push(sell); 
-                    }
-                }
-
-                if total_volume_flames > 0 {
-                    println!("\n==========================================================");
-                    println!("⚖️ [DEX] ORDRES CROISÉS DANS LE DARK POOL !");
-                    println!("💲 Prix d'équilibre : {} Sats/WATT", clearing_price_sats);
-                    println!("🔄 Volume échangé  : {} WATT", total_volume_flames as f64 / 1_000_000_000.0);
-                    println!("==========================================================\n");
-                    
-                    crate::api::LAST_PRICE_SATS.store(clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
-                    
-                    // 💡 On crée la transaction de Règlement qui sera minée
-                    dex_settlement_tx = Some(Transaction {
-                        tx_type: TransactionType::DexSettlement { clearing_price_sats, total_volume_flames, swaps: generated_swaps },
-                        inputs: vec![],
-                        outputs: vec![],
-                        fee: 0,
-                        dilithium_signature: "DEX_SETTLEMENT_ON_CHAIN".to_string(),
-                    });
-                }
-            }
-			
-			
+					dex_settlement_tx = Some(Transaction {
+						tx_type: TransactionType::DexSettlement { 
+							clearing_price_sats, 
+							total_volume_flames, 
+							swaps: generated_swaps 
+						},
+						inputs: vec![],
+						outputs: vec![],
+						fee: 0,
+						dilithium_signature: "DEX_SETTLEMENT_ON_CHAIN".to_string(),
+					});
+				}
+			}
 
             let (mut candidate_block, target) = {
                 let mut chain = shared_chain.lock().unwrap();

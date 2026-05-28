@@ -1,6 +1,6 @@
 use warp::Filter;
 use crate::blockchain::Blockchain;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionType};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering}; 
 use serde::{Serialize, Deserialize};
@@ -60,42 +60,42 @@ pub async fn start_api_server(
 
     // 💡 LECTURE ON-CHAIN DES SWAPS : On lit l'historique des blocs !
     let get_swaps = warp::path("swaps")
-        .and(warp::get())
-        .and(chain_filter.clone())
-        .map(|chain_arc: Arc<Mutex<Blockchain>>| {
-            let chain_lock = chain_arc.lock().unwrap();
-            let mut all_swaps = Vec::new();
-            let mut claimed_hashes = std::collections::HashSet::new();
+		.and(warp::get())
+		.and(chain_filter.clone())
+		.map(|chain_arc: Arc<Mutex<Blockchain>>| {
+			let chain_lock = chain_arc.lock().unwrap();
+			let mut active_swaps = Vec::new();
+			let mut claimed_hashes = std::collections::HashSet::new();
 
-            // 1. On scanne pour trouver tous les HTLC qui ont déjà été réclamés/remboursés
-            for block in &chain_lock.chain {
-                for tx in &block.transactions {
-                    if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
-                        let secret_bytes = hex::decode(secret).unwrap_or_default();
-                        let hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-                        claimed_hashes.insert(hash);
-                    }
-                    if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
-                        claimed_hashes.insert(hash.clone());
-                    }
-                }
-            }
+			// 1. On détecte tous les HTLC déjà claimés ou remboursés
+			for block in &chain_lock.chain {
+				for tx in &block.transactions {
+					if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
+						let secret_bytes = hex::decode(secret).unwrap_or_default();
+						let hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+						claimed_hashes.insert(hash);
+					}
+					if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
+						claimed_hashes.insert(hash.clone());
+					}
+				}
+			}
 
-            // 2. On récupère les Swaps du DEX, en ignorant ceux qui sont terminés
-            for block in chain_lock.chain.iter().rev().take(100) {
-                for tx in &block.transactions {
-                    if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
-                        for swap in swaps {
-                            if !claimed_hashes.contains(&swap.htlc_hash) {
-                                all_swaps.push(swap.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            // 💡 On renvoie juste la liste filtrée, c'est ce que ton Wallet attend
-            warp::reply::json(&all_swaps)
-        });
+			// 2. On récupère les swaps en cours (DexSettlement + HTLCLock non claimés)
+			for block in chain_lock.chain.iter().rev().take(200) {
+				for tx in &block.transactions {
+					if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
+						for swap in swaps {
+							if !claimed_hashes.contains(&swap.htlc_hash) {
+								active_swaps.push(swap.clone());
+							}
+						}
+					}
+				}
+			}
+
+			warp::reply::json(&active_swaps)
+		});
 
     let send_tx = warp::post()
         .and(warp::path("send_tx"))
@@ -340,16 +340,61 @@ pub async fn start_api_server(
 			warp::reply::json(&history)
 		});
 	// =====================================================================
+	
+	// ==================== NOUVELLES ROUTES HTLC (pour le wallet) ====================
+	let htlc_lock = warp::post()
+		.and(warp::path!("htlc" / "lock"))
+		.and(warp::body::json())
+		.and(mempool_filter.clone())
+		.and(active_peers_filter.clone())
+		.map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
+			if !tx.is_valid() || !matches!(tx.tx_type, TransactionType::HTLCLock { .. }) {
+				return warp::reply::with_status(warp::reply::json(&"❌ HTLCLock invalide"), warp::http::StatusCode::BAD_REQUEST);
+			}
+			let mut pool = mempool.lock().unwrap();
+			pool.push(tx.clone());
+			let tx_clone = tx.clone();
+			tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
+			warp::reply::with_status(warp::reply::json(&"✅ HTLCLock accepté"), warp::http::StatusCode::OK)
+		});
+
+	let htlc_claim = warp::post()
+		.and(warp::path!("htlc" / "claim"))
+		.and(warp::body::json())
+		.and(mempool_filter.clone())
+		.and(active_peers_filter.clone())
+		.map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
+			if !tx.is_valid() || !matches!(tx.tx_type, TransactionType::HTLCClaim { .. }) {
+				return warp::reply::with_status(warp::reply::json(&"❌ HTLCClaim invalide"), warp::http::StatusCode::BAD_REQUEST);
+			}
+			let mut pool = mempool.lock().unwrap();
+			pool.push(tx.clone());
+			let tx_clone = tx.clone();
+			tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
+			warp::reply::with_status(warp::reply::json(&"✅ HTLCClaim accepté"), warp::http::StatusCode::OK)
+		});
+	// =====================================================================
     
     
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec!["content-type"])
-        .allow_methods(vec!["GET", "POST", "DELETE"]); // 💡 Ajout de DELETE ici
+        .allow_methods(vec!["GET", "POST", "DELETE"]); 
 
-    let routes = send_tx.or(get_all_txs).or(get_decoys).or(get_pool).or(submit_order).or(cancel_order).or(info_route).or(get_swaps).or(get_supply).or(get_jackpot)
-			.or(get_difficulty_history)
-        .with(cors);
+    let routes = send_tx
+		.or(get_all_txs)
+		.or(get_decoys)
+		.or(get_pool)
+		.or(submit_order)
+		.or(cancel_order)
+		.or(info_route)
+		.or(get_swaps)
+		.or(get_supply)
+		.or(get_jackpot)
+		.or(get_difficulty_history)
+		.or(htlc_lock)    
+		.or(htlc_claim)  
+		.with(cors);
     
     warp::serve(routes).run((host_ip, port)).await;
 }

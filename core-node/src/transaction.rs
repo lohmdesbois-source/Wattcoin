@@ -1,10 +1,10 @@
 use serde::{Serialize, Deserialize};
 use crate::lattice::LWECommitment;
 
-const LATTICE_Q: u32 = 8380417; 
-const LATTICE_DIM: usize = 4;   
+const LATTICE_Q: u32 = 8380417;
+const LATTICE_DIM: usize = 4;
 
-// Le contrat est maintenant au cœur de la blockchain !
+// ==================== SWAP CONTRACT (sécurisé) ====================
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapContract {
     pub buyer_btc_address: String,
@@ -13,20 +13,24 @@ pub struct SwapContract {
     pub seller_btc_pubkey: String,
     pub watt_amount_flames: u64,
     pub btc_amount_sats: u64,
-    pub htlc_secret: String,
-    pub htlc_hash: String,
+    pub htlc_hash: String,           // ← SEULEMENT le hash (jamais le secret)
+    // secret n'est plus jamais stocké on-chain
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransactionType {
     Coinbase,
     Standard,
-    HTLCLock { hash: String, timeout_block: u64 }, 
-    HTLCClaim { secret: String },                  
-    HTLCRefund { hash: String },                   
-    DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> }, // 💡 LE DEX ON-CHAIN
-	HTLCLottery { target_block: u64, player_pubkey: String }, // 🎟️ Le ticket
-    LotteryPayout { target_block: u64, winner_pubkey: String }, // 🎰 Le gain
+    HTLCLock { hash: String, timeout_block: u64 },
+    HTLCClaim { secret: String },
+    HTLCRefund { hash: String },
+    DexSettlement { 
+        clearing_price_sats: u64, 
+        total_volume_flames: u64, 
+        swaps: Vec<SwapContract> 
+    },
+    HTLCLottery { target_block: u64, player_pubkey: String },
+    LotteryPayout { target_block: u64, winner_pubkey: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,22 +59,19 @@ pub struct TransactionOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    pub tx_type: TransactionType, 
-    pub inputs: Vec<TransactionInput>,  
-    pub outputs: Vec<TransactionOutput>, 
-    pub fee: u64,                     
-    pub dilithium_signature: String,  
+    pub tx_type: TransactionType,
+    pub inputs: Vec<TransactionInput>,
+    pub outputs: Vec<TransactionOutput>,
+    pub fee: u64,
+    pub dilithium_signature: String,
 }
 
 impl Transaction {
     pub fn is_valid(&self) -> bool {
-        // 💡 Les transactions DexSettlement sont générées par les mineurs, pas besoin de ZKP
-        if self.tx_type == TransactionType::Coinbase 
-            || self.dilithium_signature == "PRUNED" 
-            || matches!(self.tx_type, TransactionType::DexSettlement { .. })
-            || matches!(self.tx_type, TransactionType::LotteryPayout { .. }) // Le mineur le génère sans signature
-        { 
-            return true; 
+        // Coinbase, DexSettlement, LotteryPayout → toujours valides (générés par mineur)
+        if matches!(self.tx_type, TransactionType::Coinbase | TransactionType::DexSettlement { .. } | TransactionType::LotteryPayout { .. }) 
+            || self.dilithium_signature == "PRUNED" {
+            return true;
         }
 
         // 💡 Sécurité du Ticket de Loterie
@@ -82,24 +83,20 @@ impl Transaction {
         // =================================================================
         // 🔐 1. LE TRIBUNAL DES CONTRATS INTELLIGENTS (HTLC)
         // =================================================================
+        // HTLC Claim : vérification cryptographique stricte
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-            if secret.is_empty() { return false; }
-            if self.inputs.is_empty() { return false; }
-
+            if secret.is_empty() || self.inputs.is_empty() { return false; }
             let secret_bytes = hex::decode(secret).unwrap_or_default();
             let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-
-            if calculated_hash != self.dilithium_signature { return false; }
-            return true; 
+            return calculated_hash == self.dilithium_signature; // le hash doit correspondre à la signature
         }
 
-        if let TransactionType::HTLCLock { hash, timeout_block: _ } = &self.tx_type {
+        if let TransactionType::HTLCLock { hash, .. } = &self.tx_type {
             if hash.len() != 64 { return false; }
         }
-        
+
         if let TransactionType::HTLCRefund { hash } = &self.tx_type {
             if hash.len() != 64 || self.inputs.is_empty() { return false; }
-            return true; 
         }
 
         // =================================================================
