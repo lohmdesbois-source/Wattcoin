@@ -64,6 +64,22 @@ impl Blockchain {
 
         let data = fs::read_to_string(path)?;
         let chain: Vec<Block> = serde_json::from_str(&data)?;
+		
+		// 💡 Migration automatique des anciennes chaînes (target_hex manquant)
+		let mut migrated = false;
+		for block in &mut chain {
+			if block.header.target_hex.is_empty() || block.header.target_hex == "0" {
+				// On recalcule avec le target de la blockchain au moment du load
+				let max_target = BigUint::from_bytes_be(&[0xFF; 32]);
+				let initial = max_target >> 12_u32;
+				block.header.target_hex = format!("{:0>64}", initial.to_str_radix(16));
+				migrated = true;
+			}
+		}
+		if migrated {
+			println!("🔄 Migration automatique : target_hex ajouté aux anciens blocs.");
+		}
+		
         println!("💾 HISTORIQUE CHARGÉ : {} blocs retrouvés.", chain.len());
         
         let max_target = BigUint::from_bytes_be(&[0xFF; 32]);
@@ -346,12 +362,13 @@ impl Blockchain {
         valid_transactions.insert(0, coinbase_tx);
 
         let new_header = BlockHeader {
-            index: current_height, 
-            timestamp: chrono::Utc::now().timestamp(),
-            previous_hash: previous_block.header.hash.clone(),
-            hash: String::new(),
-            nonce: 0,
-        };
+			index: current_height,
+			timestamp: chrono::Utc::now().timestamp(),
+			previous_hash: previous_block.header.hash.clone(),
+			hash: String::new(),
+			nonce: 0,
+			target_hex: format!("{:0>64}", self.target.to_str_radix(16)),   // ← on stocke le target du moment
+		};
 
         let block = Block { header: new_header, transactions: valid_transactions };
         (block, self.target.clone())
@@ -652,7 +669,13 @@ impl Blockchain {
         for ki in block_key_images { 
             self.spent_key_images.insert(ki); 
         }
-		self.chain.push(block);
+		
+		// On s'assure que le bloc reçu a bien son target_hex (compatibilité ancienne chaîne)
+		let mut final_block = block;
+		if final_block.header.target_hex.is_empty() {
+			final_block.header.target_hex = format!("{:0>64}", self.target.to_str_radix(16));
+		}
+		self.chain.push(final_block);
 		self.prune_old_signatures();
 		self.update_target();
 

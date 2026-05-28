@@ -286,7 +286,7 @@ pub async fn start_api_server(
             warp::reply::json(&pot)
         });
 		
-	// ==================== ROUTE DIFFICULTY HISTORY (version corrigée + puissante) ====================
+	// ==================== ROUTE DIFFICULTY HISTORY (version finale + propre) ====================
 	let get_difficulty_history = warp::path("difficulty")
 		.and(warp::path("history"))
 		.and(warp::get())
@@ -295,34 +295,24 @@ pub async fn start_api_server(
 		.map(|params: std::collections::HashMap<String, String>, chain_arc: Arc<Mutex<Blockchain>>| {
 			let chain_lock = chain_arc.lock().unwrap();
 
-			// Paramètres supportés :
-			// ?limit=80
-			// ?hours=24
-			// ?days=7
 			let mut limit = params.get("limit")
 				.and_then(|v| v.parse::<usize>().ok())
-				.unwrap_or(80);
+				.unwrap_or(120);
 
-			let hours = params.get("hours")
-				.and_then(|v| v.parse::<i64>().ok());
-
-			let days = params.get("days")
-				.and_then(|v| v.parse::<i64>().ok());
+			let hours = params.get("hours").and_then(|v| v.parse::<i64>().ok());
+			let days  = params.get("days").and_then(|v| v.parse::<i64>().ok());
 
 			let max_limit = 500;
 			limit = limit.min(max_limit);
 
 			let mut history = Vec::new();
+			let now = chrono::Utc::now().timestamp();
 
-			// Calcul de la difficulté (comme dans /info)
 			let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
 			let initial_target = max_target >> 12_u32;
 			let hundred = num_bigint::BigUint::from(100u32);
 
-			let now = chrono::Utc::now().timestamp();
-
 			for block in chain_lock.chain.iter().rev() {
-				// Filtre par période si demandé
 				if let Some(h) = hours {
 					if now - block.header.timestamp > h * 3600 { break; }
 				}
@@ -330,7 +320,11 @@ pub async fn start_api_server(
 					if now - block.header.timestamp > d * 86400 { break; }
 				}
 
-				let difficulty_x100 = (&initial_target * &hundred) / &chain_lock.target;
+				// Calcul précis depuis le target_hex stocké dans le bloc
+				let target_big = num_bigint::BigUint::parse_bytes(block.header.target_hex.as_bytes(), 16)
+					.unwrap_or_else(|| max_target.clone());
+
+				let difficulty_x100 = (&initial_target * &hundred) / &target_big;
 				let diff_int = &difficulty_x100 / &hundred;
 				let diff_dec = &difficulty_x100 % &hundred;
 
@@ -343,9 +337,7 @@ pub async fn start_api_server(
 				if history.len() >= limit { break; }
 			}
 
-			// On remet dans l’ordre chronologique (du plus ancien au plus récent)
 			history.reverse();
-
 			warp::reply::json(&history)
 		});
 	// =====================================================================
