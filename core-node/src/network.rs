@@ -216,14 +216,27 @@ fn start_peer_connection(
                 },
 
                 P2PMessage::BroadcastTransaction { tx: in_tx } => {
-                    if in_tx.is_valid() {
-                        let mut pool = mempool.lock().unwrap();
-                        if !pool.iter().any(|t| t.dilithium_signature == in_tx.dilithium_signature) {
-                            println!("📥 [MEMPOOL] Nouvelle transaction publique reçue !");
-                            pool.push(in_tx);
-                        }
-                    }
-                },
+					if in_tx.is_valid() {
+						let mut pool = mempool.lock().unwrap();
+						if !pool.iter().any(|t| t.dilithium_signature == in_tx.dilithium_signature) {
+							println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !");   // ← Message unique et beau
+
+							let tx_to_propagate = in_tx.clone();           // ← FIX du move
+							pool.push(in_tx);                              // original dans le mempool local
+
+							// Propagation aux autres nœuds
+							let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
+							let mut json_str = serde_json::to_string(&envelope).unwrap();
+							json_str.push('\n');
+							let ap = active_peers.lock().unwrap().clone();
+							for (peer_id, sender) in ap.iter() {
+								if peer_id != &actual_peer_id {
+									let _ = sender.try_send(json_str.clone());
+								}
+							}
+						}
+					}
+				},
 
                 P2PMessage::GetMempool => {
                     let pool = mempool.lock().unwrap().clone();
@@ -438,14 +451,26 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                                     if rand::thread_rng().gen_range(1..=10) <= 2 { mp_clone.lock().unwrap().push(in_tx); } 
                                 },
                                 P2PMessage::BroadcastTransaction { tx: in_tx } => {
-                                    if in_tx.is_valid() {
-                                        let mut pool = mp_clone.lock().unwrap();
-                                        if !pool.iter().any(|t| t.dilithium_signature == in_tx.dilithium_signature) {
-                                            println!("📥 [MEMPOOL] Nouvelle TX reçue via Tor !");
-                                            pool.push(in_tx);
-                                        }
-                                    }
-                                },
+									if in_tx.is_valid() {
+										let mut pool = mp_clone.lock().unwrap();
+										if !pool.iter().any(|t| t.dilithium_signature == in_tx.dilithium_signature) {
+											println!("📥 [MEMPOOL] Nouvelle TX reçue via Tor !");   // ← Le message que tu aimes
+
+											let tx_to_propagate = in_tx.clone();          // ← FIX du move
+											pool.push(in_tx);
+
+											let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
+											let mut json_str = serde_json::to_string(&envelope).unwrap();
+											json_str.push('\n');
+											let ap = ap_clone.lock().unwrap().clone();
+											for (peer_id, sender) in ap.iter() {
+												if peer_id != &actual_peer_id {
+													let _ = sender.try_send(json_str.clone());
+												}
+											}
+										}
+									}
+								},
                                 P2PMessage::GetMempool => {
                                     let pool = mp_clone.lock().unwrap().clone();
                                     send_message_to_channel(&tx, P2PMessage::MempoolSync { txs: pool }).await;

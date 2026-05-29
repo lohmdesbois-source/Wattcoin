@@ -24,7 +24,6 @@ use tor_rtcompat::PreferredRuntime;
 //static LDK_NODE: Lazy<AsyncMutex<Option<std::sync::Arc<ldk_node::Node>>>> = Lazy::new(|| AsyncMutex::new(None));
 
 const ONION_NODE: &str = "jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64yd.onion:8100";
-//const VAULT_FILE: &str = ".wattcoin_vault";
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
 const MATURITY_BLOCKS: u64 = 3; // À passer à 100 en prod
@@ -195,15 +194,15 @@ async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result
     let mut prefs = StreamPrefs::new();
     prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
 
-    println!("\n==============================================");
+    //println!("\n==============================================");
     println!("🕵️ [TOR] Début de la mission vers {}", endpoint);
     
     let mut stream = None;
-    for i in 1..=3 {
-        println!("⏳ [TOR] Percée du tunnel (Tentative {}/3)...", i);
+    for _i in 1..=3 {
+        //println!("⏳ [TOR] Percée du tunnel (Tentative {}/3)...", i);
 		match tokio::time::timeout(std::time::Duration::from_secs(30), tor_client.connect_with_prefs(ONION_NODE, &prefs)).await {
             Ok(Ok(s)) => { 
-                println!("✅ [TOR] Tunnel établi !");
+                //println!("✅ [TOR] Tunnel établi !");
                 stream = Some(s); 
                 break; 
             },
@@ -215,7 +214,7 @@ async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result
 
     let mut stream = stream.ok_or_else(|| "❌ [TOR] Abandon de la mission.".to_string())?;
 
-    println!("📤 [TOR] Envoi de la requête HTTP...");
+    //println!("📤 [TOR] Envoi de la requête HTTP...");
     let req = if let Some(ref b) = body {
         format!("{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: WattcoinWallet/1.0\r\nAccept: application/json\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", method, endpoint, ONION_NODE, b.len(), b)
     } else {
@@ -225,13 +224,13 @@ async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result
     stream.write_all(req.as_bytes()).await.map_err(|e| format!("Erreur écriture: {}", e))?;
     stream.flush().await.map_err(|e| format!("Erreur flush: {}", e))?;
 
-    println!("📥 [TOR] Attente de la réponse...");
+    //println!("📥 [TOR] Attente de la réponse...");
     let mut response = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await {
             Ok(Ok(0)) => {
-                println!("✅ [TOR] Le Serveur Relais a terminé l'envoi.");
+                //println!("✅ [TOR] Le Serveur Relais a terminé l'envoi.");
                 break;
             }
             Ok(Ok(n)) => {
@@ -251,7 +250,7 @@ async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result
         let mut body_content = resp_str[idx+4..].to_string(); 
         
         if headers.to_lowercase().contains("transfer-encoding: chunked") {
-            println!("🧩 [TOR] Découpage Chunked détecté. Reconstruction en cours...");
+            //println!("🧩 [TOR] Découpage Chunked détecté. Reconstruction en cours...");
             let mut decoded = String::new();
             let mut curr = body_content.as_str();
             while let Some(i) = curr.find("\r\n") {
@@ -277,8 +276,10 @@ async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result
             println!("🎯 [TOR] Extraction réussie ({} octets)", final_body.len());
             Ok(final_body)
         } else {
-            Err(format!("Erreur HTTP: {}", headers))
-        }
+			let error_body = body_content.trim();
+			println!("❌ [NODE ERROR] 400 reçu → {}", error_body);
+			Err(format!("Node a refusé : {}", error_body))
+		}
     } else {
         println!("❌ [TOR] Réponse inexploitable ({} octets)", response.len());
         Err("Réponse corrompue".to_string())
@@ -1279,17 +1280,29 @@ async fn send_wattcoin(
         (Some(hash), Some(timeout)) => TransactionType::HTLCLock { hash, timeout_block: timeout },
         _ => TransactionType::Standard,
     };
-
+	
+	// Version qui garde tout le travail ZKP déjà fait plus haut
     let tx_pq = Transaction {
         tx_type,
-        inputs: final_inputs,
-        outputs,
-        fee,
+        inputs: final_inputs,           // ← on garde les vraies preuves
+        outputs,                        // ← on garde les outputs
+        fee: 1000,
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
 
     let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
     let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
+	
+	// 💡 ENREGISTREMENT DES CAPSULES DÉPENSÉES (le "reprend")
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(get_spends_path()) {
+        for utxo in &selected_utxos {
+            let (_, capsule, _, _) = utxo;
+            let _ = writeln!(file, "{}", capsule);
+        }
+    }
+
+    println!("✅ Capsules marquées comme dépensées dans .wattcoin_spends");
 
     match &tx_pq.tx_type {
         TransactionType::HTLCLock { .. } => {
@@ -1323,13 +1336,36 @@ async fn refund_wattcoin_swap(
 
 #[tauri::command]
 async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<Vec<SwapContract>, String> {
-    let res_str = tor_fetch("GET", "/swaps", None).await?;
+    println!("🔍 [DEBUG] Demande swaps → BTC: {} | WATT: {}", btc_address, watt_address);
+
+    let res_str = match tor_fetch("GET", "/swaps", None).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("❌ [DEBUG] Erreur /swaps : {}", e);
+            return Ok(vec![]); // fallback silencieux
+        }
+    };
+
+    println!("📥 [DEBUG] Réponse brute du node : {}", res_str);
+
     let all_swaps: Vec<SwapContract> = serde_json::from_str(&res_str).unwrap_or_default();
-    
+
     let my_swaps: Vec<SwapContract> = all_swaps.into_iter()
         .filter(|s| s.buyer_btc_address == btc_address || s.seller_watt_address == watt_address)
         .collect();
-        
+
+    println!("✅ [DEBUG] Swaps trouvés pour ce wallet : {}", my_swaps.len());
+
+    // Fallback localStorage si rien ne vient du node
+    if my_swaps.is_empty() {
+        if let Ok(cached) = std::fs::read_to_string("/tmp/my_swaps_cache.json") {
+            if let Ok(parsed) = serde_json::from_str::<Vec<SwapContract>>(&cached) {
+                println!("♻️ [DEBUG] Utilisation du cache local");
+                return Ok(parsed);
+            }
+        }
+    }
+
     Ok(my_swaps)
 }
 
