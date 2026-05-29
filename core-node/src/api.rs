@@ -150,7 +150,9 @@ pub async fn start_api_server(
                 if !timeout_passed { return warp::reply::with_status(warp::reply::json(&"⏳ Délai non expiré"), warp::http::StatusCode::BAD_REQUEST); }
             }
 
-            let mut pool = mempool.lock().unwrap();
+            println!("📥 [MEMPOOL] Nouvelle TX reçue via API sur le RELAY ! (propagée via P2P)");
+			
+			let mut pool = mempool.lock().unwrap();
             pool.push(tx.clone());
 
             let tx_clone = tx.clone();
@@ -351,6 +353,7 @@ pub async fn start_api_server(
 			if !tx.is_valid() || !matches!(tx.tx_type, TransactionType::HTLCLock { .. }) {
 				return warp::reply::with_status(warp::reply::json(&"❌ HTLCLock invalide"), warp::http::StatusCode::BAD_REQUEST);
 			}
+			println!("📥 [MEMPOOL] Nouvelle TX reçue via API sur le RELAY ! (propagée via P2P)");
 			let mut pool = mempool.lock().unwrap();
 			pool.push(tx.clone());
 			let tx_clone = tx.clone();
@@ -367,6 +370,7 @@ pub async fn start_api_server(
 			if !tx.is_valid() || !matches!(tx.tx_type, TransactionType::HTLCClaim { .. }) {
 				return warp::reply::with_status(warp::reply::json(&"❌ HTLCClaim invalide"), warp::http::StatusCode::BAD_REQUEST);
 			}
+			println!("📥 [MEMPOOL] Nouvelle TX reçue via API sur le RELAY ! (propagée via P2P)");
 			let mut pool = mempool.lock().unwrap();
 			pool.push(tx.clone());
 			let tx_clone = tx.clone();
