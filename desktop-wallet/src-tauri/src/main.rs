@@ -1305,13 +1305,9 @@ async fn send_wattcoin(
     println!("✅ Capsules marquées comme dépensées dans .wattcoin_spends");
 
     match &tx_pq.tx_type {
-        TransactionType::HTLCLock { .. } => {
-            Ok("🔒 HTLC LOCK WATT déployé avec succès !".to_string())
-        }
-        _ => {
-            Ok(format!("☢️ TX ZKP ENVOYÉE ! Inputs : {} Outputs : {}", selected_utxos.len(), tx_pq.outputs.len()))
-        }
-    }
+		TransactionType::HTLCLock { .. } => Ok("🔒 HTLC Lock WATT accepté par le relay !".to_string()),
+		_ => Ok("TX envoyée".to_string()),
+	}
 }
 
 #[tauri::command]

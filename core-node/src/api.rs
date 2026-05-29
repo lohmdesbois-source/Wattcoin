@@ -158,6 +158,7 @@ pub async fn start_api_server(
             let tx_clone = tx.clone();
             tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
             
+			println!("✅ [HTLC] Transaction acceptée et propagée (type: {:?})", tx.tx_type);
             warp::reply::with_status(warp::reply::json(&"✅ TX acceptée par le réseau"), warp::http::StatusCode::OK)
         });
     
@@ -358,6 +359,7 @@ pub async fn start_api_server(
 			pool.push(tx.clone());
 			let tx_clone = tx.clone();
 			tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
+			println!("✅ [HTLC] Transaction acceptée et propagée (type: {:?})", tx.tx_type);
 			warp::reply::with_status(warp::reply::json(&"✅ HTLCLock accepté"), warp::http::StatusCode::OK)
 		});
 
@@ -375,6 +377,7 @@ pub async fn start_api_server(
 			pool.push(tx.clone());
 			let tx_clone = tx.clone();
 			tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
+			println!("✅ [HTLC] Transaction acceptée et propagée (type: {:?})", tx.tx_type);
 			warp::reply::with_status(warp::reply::json(&"✅ HTLCClaim accepté"), warp::http::StatusCode::OK)
 		});
 	// =====================================================================

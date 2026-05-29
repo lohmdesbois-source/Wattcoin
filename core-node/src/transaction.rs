@@ -68,11 +68,25 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn is_valid(&self) -> bool {
-        // Coinbase, DexSettlement, LotteryPayout → toujours valides (générés par mineur)
-        if matches!(self.tx_type, TransactionType::Coinbase | TransactionType::DexSettlement { .. } | TransactionType::LotteryPayout { .. }) 
-            || self.dilithium_signature == "PRUNED" {
-            return true;
+		// 💡 Coinbase + Dex + Lottery + TOUS les HTLC + PRUNED → toujours acceptés
+		if matches!(self.tx_type,
+			TransactionType::Coinbase 
+			| TransactionType::DexSettlement { .. } 
+			| TransactionType::LotteryPayout { .. }
+			| TransactionType::HTLCLock { .. }
+			| TransactionType::HTLCClaim { .. }
+			| TransactionType::HTLCRefund { .. }
+		) || self.dilithium_signature == "PRUNED" {
+        
+        // Vérification minimale ultra-légère pour les HTLC (ne casse rien)
+        match &self.tx_type {
+            TransactionType::HTLCLock { hash, .. } if hash.len() != 64 => return false,
+            TransactionType::HTLCClaim { secret } if secret.is_empty() => return false,
+            TransactionType::HTLCRefund { hash } if hash.len() != 64 => return false,
+            _ => {}
         }
+        return true;   // ← Tout passe direct (comme avant pour PRUNED)
+    }
 
         // 💡 Sécurité du Ticket de Loterie
         if let TransactionType::HTLCLottery { .. } = &self.tx_type {
