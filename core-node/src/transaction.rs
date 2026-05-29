@@ -68,8 +68,7 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn is_valid(&self) -> bool {
-        println!("🔍 [VALIDATION] TX reçue → Type: {:?} | Dilithium: {} | Fee: {}", 
-                 self.tx_type, self.dilithium_signature, self.fee);
+        //println!("🔍 [VALIDATION] TX reçue → Type: {:?} | Dilithium: {} | Fee: {}", self.tx_type, self.dilithium_signature, self.fee);
 
         // 🔥 BYPASS TOTAL POUR HTLC + PRUNED (on garde tout ce que tu avais)
         if matches!(self.tx_type,
@@ -97,15 +96,16 @@ impl Transaction {
         // =================================================================
         // HTLC Claim : vérification cryptographique stricte
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-            if secret.is_empty() || self.inputs.is_empty() { return false; }
-            let secret_bytes = hex::decode(secret).unwrap_or_default();
-            let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-            return calculated_hash == self.dilithium_signature; // le hash doit correspondre à la signature
-        }
+			if secret.is_empty() { return false; }
+			let secret_bytes = hex::decode(secret).unwrap_or_default();
+			let real_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+			return real_hash == self.dilithium_signature; // signature = hash du secret (standard HTLC)
+		}
 
-        if let TransactionType::HTLCLock { hash, .. } = &self.tx_type {
-            if hash.len() != 64 { return false; }
-        }
+		if let TransactionType::HTLCLock { hash, timeout_block } = &self.tx_type {
+			if hash.len() != 64 || *timeout_block == 0 { return false; }
+			// On pourrait aussi vérifier que l'output est bien un stealth_address spécial "HTLC_LOCK"
+		}
 
         if let TransactionType::HTLCRefund { hash } = &self.tx_type {
             if hash.len() != 64 || self.inputs.is_empty() { return false; }

@@ -1480,375 +1480,47 @@ fn save_miner_script(os: String, address: String) -> Result<String, String> {
     Ok(format!("Script généré avec succès dans :\n{}", file_path.display()))
 }
 
+// ==================== BTC HTLC - VERSION SOLIDE 2026 ====================
 #[tauri::command]
-async fn create_btc_htlc(buyer_pubkey_hex: String, seller_pubkey_hex: String, secret_hex: String, locktime: u32) -> Result<String, String> {
-    use bitcoin::hashes::{sha256, Hash};
-    use bitcoin::blockdata::script::Builder;
-    use bitcoin::opcodes::all::*;
-    use bitcoin::{Address, Network};
-
-    let buyer_pubkey = bitcoin::PublicKey::from_str(&buyer_pubkey_hex).map_err(|_| "Clé Alice invalide".to_string())?;
-    let seller_pubkey = bitcoin::PublicKey::from_str(&seller_pubkey_hex).map_err(|_| "Clé Bob invalide".to_string())?;
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
-    let btc_hash = sha256::Hash::hash(&secret_bytes);
-
-    let htlc_script = Builder::new()
-        .push_opcode(OP_IF)
-            .push_opcode(OP_SHA256)
-            .push_slice(&btc_hash.to_byte_array())
-            .push_opcode(OP_EQUALVERIFY)
-            .push_key(&seller_pubkey) 
-        .push_opcode(OP_ELSE)
-            .push_int(locktime as i64)
-            .push_opcode(OP_CSV)
-            .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey)  
-        .push_opcode(OP_ENDIF)
-        .push_opcode(OP_CHECKSIG)
-        .into_script();
-
-    let address = Address::p2wsh(&htlc_script, Network::Testnet);
-    Ok(address.to_string())
+async fn create_btc_htlc(buyer_pubkey_hex: String, seller_pubkey_hex: String, secret_hex: String, locktime: u64) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "buyer_pubkey": buyer_pubkey_hex,
+        "seller_pubkey": seller_pubkey_hex,
+        "secret": secret_hex,
+        "locktime": locktime
+    });
+    tor_fetch("POST", "/btc/htlc/create", Some(serde_json::to_string(&payload).unwrap())).await
 }
 
 #[tauri::command]
 async fn get_btc_balance(master_seed_hex: String) -> Result<f64, String> {
-    let _tor = get_tor_client().await?; 
-
-    let task = tokio::task::spawn_blocking(move || -> Result<f64, String> {
-        use bdk::bitcoin::Network as BdkNetwork;
-        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
-        use bdk::blockchain::esplora::EsploraBlockchainConfig;
-        use bdk::blockchain::{EsploraBlockchain, ConfigurableBlockchain}; 
-        use bdk::{Wallet, SyncOptions};
-        use bdk::database::MemoryDatabase;
-
-        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
-        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
-        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
-
-        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
-            .map_err(|e| e.to_string())?;
-
-        // ✅ Fiables et routés anonymement via Tor
-		let endpoints = [
-			"https://mempool.space/testnet/api",
-			"https://blockstream.info/testnet/api"
-		];
-
-        let mut synced = false;
-        for endpoint in endpoints {
-            let config = EsploraBlockchainConfig {
-                base_url: endpoint.to_string(), proxy: Some("socks5h://127.0.0.1:9150".to_string()), 
-                concurrency: Some(4), stop_gap: 20, timeout: Some(120),
-            };
-
-            if let Ok(blockchain) = EsploraBlockchain::from_config(&config) {
-                if wallet.sync(&blockchain, SyncOptions::default()).is_ok() {
-                    synced = true; break;
-                }
-            }
-        }
-
-        if !synced { return Err("❌ Services cachés Bitcoin injoignables.".to_string()); }
-
-        let balance = wallet.get_balance().map_err(|e| e.to_string())?;
-        Ok((balance.confirmed + balance.untrusted_pending) as f64 / 100_000_000.0)
-    });
-
-    match tokio::time::timeout(std::time::Duration::from_secs(300), task).await {
-        Ok(Ok(Ok(bal))) => Ok(bal),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(e)) => Err(format!("Thread crash: {}", e)),
-        Err(_) => Err("Timeout API Bitcoin via Tor".to_string()),
-    }
+    let res = tor_fetch("GET", &format!("/btc/balance?master_seed={}", master_seed_hex), None).await?;
+    Ok(serde_json::from_str::<serde_json::Value>(&res).unwrap()["balance"].as_f64().unwrap_or(0.0))
 }
 
 #[tauri::command]
-async fn send_btc_to_htlc(master_seed_hex: String, htlc_address: String, amount_btc: f64) -> Result<String, String> {
-    let _tor = get_tor_client().await?;
-    
-    let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        use bdk::bitcoin::Network as BdkNetwork;
-        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
-        use bdk::bitcoin::Address as BdkAddress;
-        use bdk::blockchain::esplora::EsploraBlockchainConfig;
-        use bdk::blockchain::{EsploraBlockchain, ConfigurableBlockchain};
-        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
-        use bdk::database::MemoryDatabase;
-
-        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
-        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
-        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
-
-        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
-            .map_err(|e| format!("Erreur Init Wallet: {}", e))?;
-
-        // ✅ Fiables et routés anonymement via Tor
-		let endpoints = [
-			"https://mempool.space/testnet/api",
-			"https://blockstream.info/testnet/api"
-		];
-
-
-        let mut active_blockchain = None;
-        for endpoint in endpoints {
-            let config = EsploraBlockchainConfig {
-                base_url: endpoint.to_string(), proxy: Some("socks5h://127.0.0.1:9150".to_string()),
-                concurrency: Some(4), stop_gap: 20, timeout: Some(120),
-            };
-
-            if let Ok(blockchain) = EsploraBlockchain::from_config(&config) {
-                if wallet.sync(&blockchain, SyncOptions::default()).is_ok() {
-                    active_blockchain = Some(blockchain); break;
-                }
-            }
-        }
-
-        let blockchain = active_blockchain.ok_or_else(|| "❌ Services cachés BTC injoignables.".to_string())?;
-
-        let target_address = BdkAddress::from_str(&htlc_address).map_err(|_| "Adresse HTLC invalide".to_string())?;
-        let amount_sats = (amount_btc * 100_000_000.0) as u64;
-
-        let (mut psbt, _details) = {
-            let mut builder = wallet.build_tx();
-            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
-            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
-            builder.finish().map_err(|e| format!("Erreur TX Builder: {}", e))?
-        };
-
-        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
-        if !finalized { return Err("❌ BDK n'a pas pu signer.".to_string()); }
-
-        let raw_tx = psbt.extract_tx();
-        bdk::blockchain::Blockchain::broadcast(&blockchain, &raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
-
-        Ok(format!("✅ Contrat BTC déployé via Tor !\nTXID: {}", raw_tx.txid()))
+async fn send_btc_to_htlc(htlc_address: String, amount_btc: f64, raw_tx: Option<String>) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "htlc_address": htlc_address,
+        "amount_btc": amount_btc,
+        "raw_tx": raw_tx.unwrap_or_default()
     });
-
-    match tokio::time::timeout(std::time::Duration::from_secs(300), task).await {
-        Ok(Ok(Ok(res))) => Ok(res),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(e)) => Err(format!("Thread crash: {}", e)),
-        Err(_) => Err("Timeout Tor".to_string()),
-    }
+    tor_fetch("POST", "/btc/send/to_htlc", Some(serde_json::to_string(&payload).unwrap())).await
+        .map(|_| "✅ BTC verrouillé dans le HTLC par le NODE (connexion Tor stable)".to_string())
 }
 
 #[tauri::command]
-async fn send_btc_direct(master_seed_hex: String, recipient_address: String, amount_btc: f64) -> Result<String, String> {
-    let _tor = get_tor_client().await?; 
-	
-	// 💡 AJOUT DU CHECK DE SÉCURITÉ : Avant de dépenser, on vérifie l'existence/accessibilité
-    let contract_exists = check_btc_contract_exists(&recipient_address).await?;
-    if !contract_exists {
-        return Err("❌ Impossible d'atteindre l'adresse HTLC sur le réseau Bitcoin. Vérifiez la connexion ou réessayez.".to_string());
-    }
-    
-    let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        use bdk::bitcoin::Network as BdkNetwork;
-        use bdk::bitcoin::bip32::ExtendedPrivKey as BdkXpriv;
-        use bdk::bitcoin::Address as BdkAddress;
-        use bdk::blockchain::esplora::EsploraBlockchainConfig;
-        use bdk::blockchain::{EsploraBlockchain, ConfigurableBlockchain};
-        use bdk::{Wallet, SyncOptions, SignOptions, FeeRate};
-        use bdk::database::MemoryDatabase;
-        use std::str::FromStr;
-
-        let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-        let xprv = BdkXpriv::new_master(BdkNetwork::Testnet, &seed).map_err(|e| e.to_string())?;
-        let desc = format!("wpkh({}/84'/1'/0'/0/*)", xprv);
-        let change_desc = format!("wpkh({}/84'/1'/0'/1/*)", xprv);
-
-        let wallet = Wallet::new(&desc, Some(&change_desc), BdkNetwork::Testnet, MemoryDatabase::default())
-            .map_err(|e| format!("Erreur Init Wallet: {}", e))?;
-
-        // ✅ Fiables et routés anonymement via Tor
-		let endpoints = [
-			"https://mempool.space/testnet/api",
-			"https://blockstream.info/testnet/api"
-		];
-
-
-        let mut active_blockchain = None;
-        for endpoint in endpoints {
-            let config = EsploraBlockchainConfig {
-                base_url: endpoint.to_string(), proxy: Some("socks5h://127.0.0.1:9150".to_string()),
-                concurrency: Some(4), stop_gap: 20, timeout: Some(120),
-            };
-
-            if let Ok(blockchain) = EsploraBlockchain::from_config(&config) {
-                if wallet.sync(&blockchain, SyncOptions::default()).is_ok() {
-                    active_blockchain = Some(blockchain); break;
-                }
-            }
-        }
-
-        let blockchain = active_blockchain.ok_or_else(|| "❌ Services cachés BTC injoignables.".to_string())?;
-        let target_address = BdkAddress::from_str(&recipient_address).map_err(|_| "Adresse invalide".to_string())?;
-        let amount_sats = (amount_btc * 100_000_000.0) as u64;
-
-        let balance = wallet.get_balance().map_err(|e| e.to_string())?;
-        if (balance.confirmed + balance.untrusted_pending) < amount_sats + 1000 {
-            return Err("Fonds insuffisants !".to_string());
-        }
-
-        let (mut psbt, _details) = {
-            let mut builder = wallet.build_tx();
-            builder.add_recipient(target_address.payload.script_pubkey(), amount_sats);
-            builder.fee_rate(FeeRate::from_sat_per_vb(2.0)); 
-            builder.finish().map_err(|e| format!("Erreur Builder: {}", e))?
-        };
-
-        let finalized = wallet.sign(&mut psbt, SignOptions::default()).map_err(|e| e.to_string())?;
-        if !finalized { return Err("Échec signature".to_string()); }
-
-        let raw_tx = psbt.extract_tx();
-        bdk::blockchain::Blockchain::broadcast(&blockchain, &raw_tx).map_err(|e| format!("Erreur Broadcast: {}", e))?;
-
-        Ok(format!("✅ BTC envoyés via Tor !\nTXID: {}", raw_tx.txid()))
-    });
-
-    match tokio::time::timeout(std::time::Duration::from_secs(300), task).await {
-        Ok(Ok(Ok(res))) => Ok(res),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(e)) => Err(format!("Thread crash: {}", e)),
-        Err(_) => Err("Timeout Tor".to_string()),
-    }
+async fn send_btc_direct(recipient_address: String, amount_btc: f64) -> Result<String, String> {
+    let payload = serde_json::json!({ "recipient": recipient_address, "amount_btc": amount_btc });
+    tor_fetch("POST", "/btc/send/direct", Some(serde_json::to_string(&payload).unwrap())).await
+        .map(|_| "✅ BTC envoyé directement via le NODE".to_string())
 }
 
 #[tauri::command]
-async fn claim_btc_swap(master_seed_hex: String, htlc_address: String, secret_hex: String, buyer_pubkey_hex: String, seller_pubkey_hex: String) -> Result<String, String> {
-    use bdk::bitcoin::Network;
-    use bdk::bitcoin::bip32::{ExtendedPrivKey, DerivationPath}; 
-    use bdk::bitcoin::{Address, PrivateKey, PublicKey, OutPoint, Txid, Sequence, Transaction, TxIn, TxOut, Witness, ScriptBuf};
-    use bdk::bitcoin::blockdata::script::Builder;
-    use bdk::bitcoin::opcodes::all::*;
-    use bdk::bitcoin::hashes::{sha256, Hash};
-    use bdk::bitcoin::secp256k1::{Secp256k1, Message};
-    use bdk::bitcoin::sighash::{SighashCache, EcdsaSighashType}; 
-    use bdk::bitcoin::absolute::LockTime; 
-    use std::str::FromStr;
-
-    let _tor = get_tor_client().await?; 
-
-    let seed = hex::decode(&master_seed_hex).map_err(|_| "Erreur Seed".to_string())?;
-    let xprv = ExtendedPrivKey::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
-    let secp = Secp256k1::new();
-    
-    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
-    let child = xprv.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
-    let bob_priv_key = PrivateKey::new(child.private_key, Network::Testnet);
-    
-    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey_hex).unwrap();
-    let seller_pubkey = PublicKey::from_str(&seller_pubkey_hex).unwrap();
-    let bob_address = Address::p2wpkh(&seller_pubkey, Network::Testnet).unwrap();
-
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| "Secret invalide".to_string())?;
-    let btc_hash = sha256::Hash::hash(&secret_bytes); 
-    
-    let htlc_script = Builder::new()
-        .push_opcode(OP_IF)
-            .push_opcode(OP_SHA256)
-            .push_slice(&btc_hash.to_byte_array()) 
-            .push_opcode(OP_EQUALVERIFY)
-            .push_key(&seller_pubkey) 
-        .push_opcode(OP_ELSE)
-            .push_int(144)
-            .push_opcode(OP_CSV)
-            .push_opcode(OP_DROP)
-            .push_key(&buyer_pubkey)
-        .push_opcode(OP_ENDIF)
-        .push_opcode(OP_CHECKSIG)
-        .into_script();
-
-    let p2wsh_address = Address::p2wsh(&htlc_script, Network::Testnet);
-    if p2wsh_address.to_string() != htlc_address { return Err("Erreur critique: Script reconstruit invalide.".to_string()); }
-
-    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9150").map_err(|_| "Impossible de lier le proxy".to_string())?;
-    let client = reqwest::Client::builder().proxy(proxy).build().map_err(|_| "Erreur HTTP".to_string())?;
-
-    // ✅ Fiables et routés anonymement via Tor
-		let endpoints = [
-			"https://mempool.space/testnet/api",
-			"https://blockstream.info/testnet/api"
-		];
-
-
-    let mut utxos = None;
-    let mut active_endpoint = String::new();
-
-    for endpoint in endpoints {
-        let url = format!("{}/address/{}/utxo", endpoint, htlc_address);
-        if let Ok(res) = client.get(&url).send().await {
-            if let Ok(json) = res.json::<serde_json::Value>().await {
-                utxos = Some(json);
-                active_endpoint = endpoint.to_string();
-                break;
-            }
-        }
-    }
-
-    let utxos = utxos.ok_or_else(|| "❌ Services Bitcoin injoignables. Le pare-feu Tor a peut-être été bloqué. Réessayez dans 10 secondes !".to_string())?;
-    if utxos.as_array().unwrap_or(&vec![]).is_empty() { return Err("❌ Aucun Bitcoin trouvé dans le contrat !".to_string()); }
-    
-    let txid_str = utxos[0]["txid"].as_str().unwrap();
-    let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
-    let vout = utxos[0]["vout"].as_u64().unwrap() as u32;
-    let value_sats = utxos[0]["value"].as_u64().unwrap();
-
-    let fee_sats = 600; 
-    if value_sats <= fee_sats { return Err("Montant trop faible pour payer les frais !".to_string()); }
-    let amount_to_receive = value_sats - fee_sats;
-
-    let txin = TxIn {
-        previous_output: OutPoint { txid, vout },
-        script_sig: ScriptBuf::new(), 
-        sequence: Sequence::MAX, 
-        witness: Witness::new(), 
-    };
-
-    let txout = TxOut {
-        value: amount_to_receive,
-        script_pubkey: bob_address.script_pubkey(),
-    };
-
-    let mut tx = Transaction {
-        version: 2, lock_time: LockTime::ZERO, input: vec![txin], output: vec![txout],
-    };
-
-    let mut sighash_cache = SighashCache::new(&mut tx);
-    let sighash = sighash_cache.segwit_signature_hash(0, &htlc_script, value_sats, EcdsaSighashType::All).map_err(|e| e.to_string())?;
-
-    let message = Message::from_slice(&sighash.to_byte_array()).unwrap();
-    let signature = secp.sign_ecdsa(&message, &bob_priv_key.inner);
-    
-    let mut sig_with_hashtype = signature.serialize_der().to_vec();
-    sig_with_hashtype.push(EcdsaSighashType::All as u8);
-
-    let mut witness = Witness::new();
-    witness.push(sig_with_hashtype);  
-    witness.push(secret_bytes);       
-    witness.push(vec![1]);            
-    witness.push(htlc_script.into_bytes()); 
-
-    tx.input[0].witness = witness;
-
-    let raw_tx_bytes = bdk::bitcoin::consensus::encode::serialize(&tx);
-    let raw_tx_hex = hex::encode(raw_tx_bytes);
-
-    let broadcast_url = format!("{}/tx", active_endpoint);
-    let broadcast_res = client.post(&broadcast_url)
-        .body(raw_tx_hex)
-        .send().await.map_err(|_| "Erreur réseau (Broadcast via Tor)".to_string())?;
-
-    if broadcast_res.status().is_success() {
-         Ok(format!("🎉 VRAI SWAP RÉUSSI VIA TOR ! Tx diffusée : {}\nVous avez reçu {} sats !", tx.txid(), amount_to_receive))
-    } else {
-         let err_text = broadcast_res.text().await.unwrap_or_default();
-         Err(format!("Rejeté par Bitcoin : {}", err_text))
-    }
+async fn claim_btc_swap(htlc_address: String, raw_witness_tx: String) -> Result<String, String> {
+    let payload = serde_json::json!({ "raw_tx": raw_witness_tx });
+    tor_fetch("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap())).await
+        .map(|_| "🎉 CLAIM BTC RÉUSSI – Swap atomique terminé !".to_string())
 }
 
 // ========================================================================

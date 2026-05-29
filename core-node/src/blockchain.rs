@@ -648,6 +648,15 @@ impl Blockchain {
 				}
 			}
 
+			// ✅ FIX ATOMIC SWAP – vérification réelle du HTLCClaim (dans la boucle)
+			if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
+				let secret_bytes = hex::decode(secret).unwrap_or_default();
+				let provided_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+				if provided_hash != tx.dilithium_signature {
+					return Err("❌ HTLC Claim : secret invalide".into());
+				}
+			}
+
 			total_block_fees += tx.fee;
 		}
 
@@ -662,8 +671,6 @@ impl Blockchain {
 			return Err(format!("Inflation illégale ! Attendu: {}, Reçu: {}", 
 				expected_subsidy + total_block_fees, actual_reward));
 		}
-
-		
 
         // Tout est bon → on applique
         for ki in block_key_images { 

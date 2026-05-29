@@ -352,11 +352,15 @@ function App() {
 	};
 
 	const handleAliceClaimWatt = async (swap) => {
-	  const secret = generatedSecrets[swap.htlc_hash] || prompt("Entrez le secret (hex) que vous avez utilisé pour BTC :");
-	  if (!secret) return;
+	  const secret = generatedSecrets[swap.htlc_hash] || localStorage.getItem(`secret_${swap.htlc_hash}`);
+	  if (!secret) {
+		toast.error("❌ Fais d'abord le Lock BTC (bouton 1)");
+		return;
+	  }
 
 	  setIsProcessing(true);
-	  const toastId = toast.loading("🎉 Réclamation des WATT...");
+	  const toastId = toast.loading("🎉 Réclamation WATT envoyée...");
+
 	  try {
 		const res = await invoke("claim_wattcoin_swap", {
 		  secret,
@@ -364,11 +368,13 @@ function App() {
 		  wattAddress: walletData.watt_address,
 		  amount: swap.watt_amount_flames / 1e9
 		});
-		toast.success(res, { id: toastId });
-		setActionnedSwaps(prev => new Set([...prev, swap.htlc_hash]));
+		toast.success("✅ " + res + " → Swap terminé côté WATT !", { id: toastId });
+		removeSwapFromCache(swap.htlc_hash);
 	  } catch (e) {
-		toast.error(e.toString(), { id: toastId });
-	  } finally { setIsProcessing(false); }
+		toast.error("❌ " + e.toString(), { id: toastId });
+	  } finally {
+		setIsProcessing(false);
+	  }
 	};
 
 	// Optionnel : version sans prompt (utilise un secret déjà stocké)
@@ -915,74 +921,80 @@ function App() {
                           </td>
                           <td>
 							  {isAlice ? (
-								  <div style={{display: "flex", flexDirection: "column", gap: "8px"}}>
+								  <div style={{display: "flex", flexDirection: "column", gap: "10px", alignItems: "flex-start"}}>
+									
 									<button 
-									  className="btn-secondary" 
-									  disabled={isProcessing}
+									  className="btn-secondary"
 									  onClick={async () => {
-										const confirmed = window.confirm("🔒 Verrouiller BTC dans le HTLC ?");
+										const confirmed = window.confirm("🔒 Verrouiller BTC dans le HTLC ? (essai avec retry)");
 										if (!confirmed) return;
 
-										const toastId = toast.loading("1/3 → Génération du secret...");
+										const toastId = toast.loading("🔄 Tentative 1/3 Tor BTC...");
 										setIsProcessing(true);
 
-										try {
-										  console.log("🔑 [Alice] Génération secret...");
-										  const secretBytes = new Uint8Array(32);
-										  crypto.getRandomValues(secretBytes);
-										  const secretHex = Array.from(secretBytes).map(b => b.toString(16).padStart(2,'0')).join('');
+										let success = false;
+										for (let attempt = 1; attempt <= 3; attempt++) {
+										  try {
+											const secretBytes = new Uint8Array(32);
+											crypto.getRandomValues(secretBytes);
+											const secretHex = Array.from(secretBytes).map(b => b.toString(16).padStart(2,'0')).join('');
 
-										  setGeneratedSecrets(prev => ({ ...prev, [s.htlc_hash]: secretHex }));
+											setGeneratedSecrets(prev => ({ ...prev, [s.htlc_hash]: secretHex }));
+											localStorage.setItem(`secret_${s.htlc_hash}`, secretHex);
+											navigator.clipboard.writeText(secretHex);
 
-										  toast.loading("2/3 → Création du script HTLC...", { id: toastId });
+											const htlcAddr = await invoke("create_btc_htlc", {
+											  buyerPubkeyHex: s.buyer_btc_pubkey,
+											  sellerPubkeyHex: s.seller_btc_pubkey,
+											  secretHex,
+											  locktime: 144
+											});
 
-										  const htlcAddr = await invoke("create_btc_htlc", {
-											buyerPubkeyHex: s.buyer_btc_pubkey,
-											sellerPubkeyHex: s.seller_btc_pubkey,
-											secretHex,
-											locktime: 144
-										  });
+											const res = await invoke("send_btc_to_htlc", {
+											  masterSeedHex: walletData.master_seed_hex,
+											  htlcAddress: htlcAddr,
+											  amountBtc: s.btc_amount_sats / 100000000
+											});
 
-										  toast.loading("3/3 → Envoi BTC via Tor...", { id: toastId });
-
-										  const res = await invoke("send_btc_to_htlc", {
-											masterSeedHex: walletData.master_seed_hex,
-											htlcAddress: htlcAddr,
-											amountBtc: s.btc_amount_sats / 100000000
-										  });
-
-										  toast.success("✅ BTC verrouillés avec succès !\n" + res, { id: toastId, duration: 8000 });
-										  setActionnedSwaps(prev => new Set([...prev, s.htlc_hash]));
-										  console.log("✅ Succès Lock BTC :", res);
-
-										} catch (e) {
-										  console.error("❌ Erreur Lock BTC :", e);
-										  toast.error("❌ " + (e.toString() || "Échec Tor/BDK - vérifie la connexion"), { id: toastId });
-										} finally {
-										  setIsProcessing(false);
+											toast.success("✅ BTC verrouillés avec succès ! (tentative " + attempt + ")", { id: toastId });
+											setActionnedSwaps(prev => new Set([...prev, s.htlc_hash]));
+											localStorage.setItem(`btc_locked_${s.htlc_hash}`, "true");
+											success = true;
+											break;
+										  } catch (e) {
+											toast.loading(`⏳ Tentative ${attempt+1}/3... (Tor lent)`, { id: toastId });
+											await new Promise(r => setTimeout(r, 6000)); // 6 secondes de pause
+										  }
 										}
+
+										if (!success) {
+										  toast.error("❌ Tor BTC toujours injoignable après 3 essais.\nRedémarre le wallet + le node.", { id: toastId });
+										}
+										setIsProcessing(false);
 									  }}
 									>
-									  1. Lock BTC (génère secret)
+									  1. Lock BTC (3 tentatives + 6s d’attente)
 									</button>
 
-									<button className="btn-primary" onClick={() => handleAliceClaimWatt(s)}>
-									  3. Claim WATT (avec secret)
+									<div style={{background:"#1e2937", padding:"8px", borderRadius:"6px", width:"100%", fontSize:"0.82rem"}}>
+									  🔑 Secret : <span style={{fontFamily:"monospace", color:"#67e8f9", wordBreak:"break-all"}}>
+										{generatedSecrets[s.htlc_hash] || localStorage.getItem(`secret_${s.htlc_hash}`) || "— Clique sur 1 —"}
+									  </span>
+									</div>
+
+									<button className="btn-primary" onClick={() => handleAliceClaimWatt(s)} disabled={isProcessing}>
+									  🔥 3. Claim WATT (propre)
 									</button>
 
-									<button className="btn-danger" onClick={() => removeSwapFromCache(s.htlc_hash)}>
-									  Cacher ce swap
-									</button>
+									<button className="btn-danger" onClick={() => removeSwapFromCache(s.htlc_hash)}>🗑️ Cacher</button>
 								  </div>
 								) : isBob ? (
-								<div style={{display: "flex", flexDirection: "column", gap: "8px"}}>
-								  <button className="btn-secondary" onClick={() => handleBobLockWatt(s)}>2. Lock WATT</button>
-								    <button className="btn-primary" onClick={() => handleBobClaimBtc(s)}>
-									  4. Claim BTC (avec secret)
-									</button>
-								  <button className="btn-danger" onClick={() => handleRefundWatt(s)}>Refund WATT</button>
-								</div>
-							  ) : "Observateur"}
+								  <div style={{display: "flex", flexDirection: "column", gap: "8px"}}>
+									<button className="btn-secondary" onClick={() => handleBobLockWatt(s)}>2. Lock WATT</button>
+									<button className="btn-primary" onClick={() => handleBobClaimBtc(s)}>4. Claim BTC</button>
+									<button className="btn-danger" onClick={() => handleRefundWatt(s)}>Refund WATT</button>
+								  </div>
+								) : "Observateur"}
 							</td>
                         </tr>
                       )})}
