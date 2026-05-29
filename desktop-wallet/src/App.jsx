@@ -865,6 +865,26 @@ function App() {
               <h1>Exécution des Swaps (Cross-Chain)</h1>
               <p style={{ color: "var(--text-muted)" }}>Protocoles d'échanges atomiques sans intermédiaire</p>
             </header>
+			
+			{/* === DEBUG SWAPS === */}
+			<div style={{margin: "10px 0", display:"flex", gap:"10px", justifyContent:"center"}}>
+			  <button 
+				className="btn-secondary"
+				onClick={async () => {
+				  console.log("🔄 [DEBUG] Force refresh swaps demandé");
+				  const res = await invoke("get_active_swaps", {
+					btcAddress: walletData.btc_address,
+					wattAddress: walletData.watt_address
+				  });
+				  console.log("📦 get_active_swaps a renvoyé :", res);
+				  setPendingSwaps(res);
+				  toast.success(`✅ ${res.length} swaps reçus du node`);
+				}}
+			  >
+				🔄 Forcer refresh Swaps + voir dans console
+			  </button>
+			  <button onClick={() => { setPendingSwaps([]); toast("Cache vidé") }}>🗑️ Vider cache</button>
+			</div>
 
             <div className="dex-grid" style={{ gridTemplateColumns: "1fr" }}>
               <div className="dark-pool">
