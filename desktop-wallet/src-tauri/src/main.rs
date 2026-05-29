@@ -63,17 +63,18 @@ static TOR_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
 fn get_wallet_dir() -> PathBuf {
     #[cfg(debug_assertions)]
-    {
-        // 🧪 MODE TEST : On utilise le dossier temporaire de l'OS 
-        // pour NE PAS déclencher le Hot-Reload (rafraîchissement) de Vite/Tauri !
-        let mut path = std::env::temp_dir();
-        path.push("wallet_wattcoin_dev");
-        if !path.exists() {
-            std::fs::create_dir_all(&path).expect("Impossible de créer le dossier de test");
-        }
-        println!("🛠️ [DEV MODE] Wallet de test chargé dans : {:?}", path);
-        return path;
-    }
+	{
+		// Dossier persistant en mode DEV (ne se reset plus jamais)
+		let mut path = dirs::data_local_dir().expect("Impossible de trouver le dossier data local");
+		path.push("WattcoinWallet-Dev");   // ← dossier permanent
+
+		if !path.exists() {
+			std::fs::create_dir_all(&path).expect("Impossible de créer le dossier dev");
+		}
+
+		println!("🛠️ [DEV MODE] Wallet persistant chargé dans : {:?}", path);
+		return path;
+	}
 
     #[cfg(not(debug_assertions))]
     {
@@ -389,15 +390,14 @@ pub struct Transaction {
 struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub btc_pubkey: String, pub watt_address: String, pub expires_at: i64 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SwapContract { 
-    pub buyer_btc_address: String, 
-    pub buyer_btc_pubkey: String, 
-    pub seller_watt_address: String, 
-    pub seller_btc_pubkey: String, 
-    pub watt_amount_flames: u64, 
-    pub btc_amount_sats: u64, 
-    pub htlc_secret: String, 
-    pub htlc_hash: String 
+pub struct SwapContract {
+    pub buyer_btc_address: String,
+    pub buyer_btc_pubkey: String,
+    pub seller_watt_address: String,
+    pub seller_btc_pubkey: String,
+    pub watt_amount_flames: u64,
+    pub btc_amount_sats: u64,
+    pub htlc_hash: String,           // ← SEULEMENT le hash
 }
 
 #[tauri::command]
@@ -1010,13 +1010,13 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
 
 #[tauri::command]
 async fn send_wattcoin(
-    recipient_kyber_hex: String, 
-    amount: f64, 
+    recipient_kyber_hex: String,
+    amount: f64,
     sender_dilithium_secret_hex: String,
     sender_dilithium_public_hex: String,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
-    htlc_hash_hex: Option<String>, 
+    htlc_hash_hex: Option<String>,   
     htlc_timeout: Option<u64>
 ) -> Result<String, String> {
     use pqcrypto_kyber::kyber768;
@@ -1281,9 +1281,9 @@ async fn send_wattcoin(
     };
 
     let tx_pq = Transaction {
-        tx_type, 
+        tx_type,
         inputs: final_inputs,
-        outputs, 
+        outputs,
         fee,
         dilithium_signature: hex::encode(dilithium_signature.as_bytes()),
     };
@@ -1291,89 +1291,34 @@ async fn send_wattcoin(
     let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
     let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(get_spends_path()) {
-        for utxo in &selected_utxos {
-            let (_, capsule, _, _) = utxo;
-            let _ = writeln!(file, "{}", capsule);
+    match &tx_pq.tx_type {
+        TransactionType::HTLCLock { .. } => {
+            Ok("🔒 HTLC LOCK WATT déployé avec succès !".to_string())
         }
-    }
-    
-    if tx_pq.tx_type == TransactionType::Standard {
-        Ok(format!("☢️ TX ZKP ENVOYÉE !\nInputs : {}\nOutputs : {}", selected_utxos.len(), tx_pq.outputs.len()))
-    } else {
-        Ok("🔒 CONTRAT HTLC DÉPLOYÉ ! Les fonds sont verrouillés sur le réseau Wattcoin.".to_string())
+        _ => {
+            Ok(format!("☢️ TX ZKP ENVOYÉE ! Inputs : {} Outputs : {}", selected_utxos.len(), tx_pq.outputs.len()))
+        }
     }
 }
 
 #[tauri::command]
 async fn refund_wattcoin_swap(
-    hash: String, watt_address: String, amount: f64
+    hash: String,
+    _watt_address: String,
+    _amount: f64
 ) -> Result<String, String> {
-    
-    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
-    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
-
-    let mut locked_utxo = None;
-    let mut locked_commitment = None;
-
-    for tx in all_txs {
-        if let TransactionType::HTLCLock { hash: lock_hash, .. } = &tx.tx_type {
-            if lock_hash == &hash && !tx.outputs.is_empty() {
-                locked_utxo = Some(tx.outputs[0].kyber_capsule.clone());
-                locked_commitment = Some(tx.outputs[0].lattice_commitment.clone());
-                break;
-            }
-        }
-    }
-
-    let (utxo_id, commitment) = match (locked_utxo, locked_commitment) {
-        (Some(u), Some(c)) => (u, c),
-        _ => return Err("Impossible de trouver les fonds verrouillés !".to_string()),
-    };
-
-    let key_image = hex::encode(blake3::hash(format!("REFUND_{}_{}", hash, utxo_id).as_bytes()).as_bytes());
-    let dummy_signature = PQLatticeRingSignature { key_image, c0: String::new(), z_responses: vec![], p_keys: vec![] };
-    let refund_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment, source_height: 0, };
-
-    use pqcrypto_kyber::kyber768;
-    let recipient_bytes = hex::decode(&watt_address).unwrap();
-    let pk = kyber768::PublicKey::from_bytes(&recipient_bytes).unwrap();
-    let (shared_secret, kyber_capsule) = kyber768::encapsulate(&pk);
-
-    let total_locked_flames = (amount * 1_000_000_000.0) as u64; 
-    let fee: u64 = 1000;
-    if total_locked_flames <= fee { return Err("Montant trop faible pour payer les frais.".to_string()); }
-    let amount_to_receive = total_locked_flames - fee;
-
-    let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
-    let payload = format!("{}|{}", amount_to_receive, hex::encode(otp));
-    
-    let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
-    let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).unwrap();
-    let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
-
-    let mut bf_claim = [0u32; LATTICE_DIM];
-    for val in bf_claim.iter_mut() { *val = rand::thread_rng().gen_range(0..LATTICE_Q); }
-    let out_commitment = LWECommitment::commit(amount_to_receive, bf_claim);
-
     let refund_tx = Transaction {
         tx_type: TransactionType::HTLCRefund { hash: hash.clone() },
-        inputs: vec![refund_input],
-        outputs: vec![ TransactionOutput {
-            stealth_address: format!("pq_watt_{}", hex::encode(&otp[0..8])),
-            kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
-            aes_vault: hex::encode(final_vault), lattice_commitment: out_commitment,
-        }],
-        fee, dilithium_signature: hash.clone(), 
+        inputs: vec![],
+        outputs: vec![],
+        fee: 1000,
+        dilithium_signature: hash.clone(),
     };
 
     let tx_json = serde_json::to_string(&refund_tx).map_err(|e| e.to_string())?;
     let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
 
-    Ok(format!("🔙 DEMANDE DE REMBOURSEMENT ENVOYÉE ! (Frais réseau payés : {} Flames).", fee))
+    Ok("🔙 REMBOURSEMENT WATT DEMANDÉ ! (Frais réseau : 1000 Flames). Attends le timeout.".to_string())
 }
 
 #[tauri::command]
@@ -1416,86 +1361,34 @@ let endpoints = [
 
 #[tauri::command]
 async fn claim_wattcoin_swap(
-    secret: String, hash: String, watt_address: String, amount: f64
+    secret: String,
+    hash: String,
+    _watt_address: String, 
+    _amount: f64
 ) -> Result<String, String> {
-	// 💡 AJOUTE CECI AU DÉBUT DE ta fonction claim_wattcoin_swap
-	// Tu dois interroger l'explorer (comme tu le fais dans claim_btc_swap)
-	// pour voir si le contrat BTC existe bien et contient les fonds.
-	let btc_contract_exists = check_btc_contract_exists(&hash).await?; 
-	if !btc_contract_exists {
-		return Err("❌ Aucun contrat BTC correspondant n'a été trouvé !".to_string());
-	}
-    let secret_bytes = hex::decode(&secret).unwrap_or_default();
-    let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-    if calculated_hash != hash { return Err("❌ Le secret révélé par le DEX est un faux !".to_string()); }
-
-    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
-    let all_txs: Vec<Transaction> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
-
-    let mut locked_utxo = None;
-    let mut locked_commitment = None;
-
-    for tx in all_txs {
-        if let TransactionType::HTLCLock { hash: lock_hash, .. } = &tx.tx_type {
-            if lock_hash == &hash && !tx.outputs.is_empty() {
-                locked_utxo = Some(tx.outputs[0].kyber_capsule.clone());
-                locked_commitment = Some(tx.outputs[0].lattice_commitment.clone());
-                break;
-            }
-        }
+    let btc_contract_exists = check_btc_contract_exists(&hash).await?;
+    if !btc_contract_exists {
+        return Err("❌ Aucun contrat BTC correspondant n'a été trouvé !".to_string());
     }
 
-    let (utxo_id, commitment) = match (locked_utxo, locked_commitment) {
-        (Some(u), Some(c)) => (u, c),
-        _ => return Err("⏳ Le vendeur n'a pas encore verrouillé ses WATT !".to_string()),
-    };
-
-    let key_image = hex::encode(blake3::hash(format!("CLAIM_{}_{}", secret, utxo_id).as_bytes()).as_bytes());
-    let dummy_signature = PQLatticeRingSignature { key_image, c0: String::new(), z_responses: vec![], p_keys: vec![] };
-    let claim_input = TransactionInput { pq_ring_inputs: vec![], pq_ring_signature: dummy_signature, commitment, source_height: 0, };
-
-    use pqcrypto_kyber::kyber768;
-
-    let recipient_bytes = hex::decode(&watt_address).unwrap();
-    let pk = kyber768::PublicKey::from_bytes(&recipient_bytes).unwrap();
-    let (shared_secret, kyber_capsule) = kyber768::encapsulate(&pk);
-
-    let total_locked_flames = (amount * 1_000_000_000.0) as u64; 
-    let fee: u64 = 1000;
-    if total_locked_flames <= fee { return Err("❌ Montant bloqué trop faible pour payer les frais réseau.".to_string()); }
-    let amount_to_receive = total_locked_flames - fee;
-
-    let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
-    let payload = format!("{}|{}", amount_to_receive, hex::encode(otp));
-    
-    let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
-    let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).unwrap();
-    let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
-
-    let mut bf_claim = [0u32; LATTICE_DIM];
-    for val in bf_claim.iter_mut() { *val = rand::thread_rng().gen_range(0..LATTICE_Q); }
-    let out_commitment = LWECommitment::commit(amount_to_receive, bf_claim);
+    let secret_bytes = hex::decode(&secret).unwrap_or_default();
+    let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+    if calculated_hash != hash {
+        return Err("❌ Le secret révélé est invalide !".to_string());
+    }
 
     let claim_tx = Transaction {
         tx_type: TransactionType::HTLCClaim { secret: secret.clone() },
-        inputs: vec![claim_input],
-        outputs: vec![
-            TransactionOutput {
-                stealth_address: format!("pq_watt_{}", hex::encode(&otp[0..8])),
-                kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
-                aes_vault: hex::encode(final_vault),
-                lattice_commitment: out_commitment,
-            }
-        ],
-        fee, 
-        dilithium_signature: hash.clone(), 
+        inputs: vec![],
+        outputs: vec![],
+        fee: 1000,
+        dilithium_signature: hash.clone(),
     };
 
     let tx_json = serde_json::to_string(&claim_tx).map_err(|e| e.to_string())?;
-    let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
+    let _ = tor_fetch("POST", "/htlc/claim", Some(tx_json)).await?;
 
-    Ok(format!("🎉 ATOMIC SWAP RÉUSSI ! Le secret a débloqué les fonds (Frais réseau payés : {} Flames).", fee))
+    Ok("🎉 WATT RÉCLAMÉS AVEC SUCCÈS ! Le secret a débloqué les fonds.".to_string())
 }
 
 #[tauri::command]
