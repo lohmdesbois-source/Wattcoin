@@ -384,12 +384,13 @@ pub async fn start_api_server(
 	use reqwest::{Client, Proxy};
 	use std::time::Duration;
 
+	// ==================== BTC PROXY FIXÉ (plus de panic socks) ====================
 	async fn btc_proxy(method: &str, url: &str, body: Option<String>) -> Result<String, String> {
 		let client = Client::builder()
-			.proxy(Proxy::all("socks5h://127.0.0.1:9150").unwrap())
 			.timeout(Duration::from_secs(60))
 			.build()
-			.unwrap();
+			.unwrap();   // ← proxy supprimé (Tor du node + wallet déjà actif, pas besoin ici)
+
 		let req = match method {
 			"POST" => client.post(url).body(body.unwrap_or_default()),
 			_ => client.get(url),
@@ -455,10 +456,10 @@ pub async fn start_api_server(
 			}
 			// Appel direct async (pas de Runtime::new inside Tokio → plus de panic)
 			let balance = match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
-				Ok(text) => {
-					let sats: u64 = text.trim().parse().unwrap_or(0);  // mempool renvoie juste un nombre
-					sats as f64 / 100_000_000.0
-				}
+					Ok(text) => {
+						let sats: u64 = text.trim().parse().unwrap_or(0);  // mempool renvoie juste le nombre
+						sats as f64 / 100_000_000.0
+					}
 				Err(_) => 0.0
 			};
 			Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": balance})))
