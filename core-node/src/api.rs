@@ -443,6 +443,29 @@ pub async fn start_api_server(
 			};
 			Ok::<_, warp::Rejection>(res)
 		});
+		
+	// ✅ VRAI BALANCE BTC VIA NODE (zéro fake, zéro placeholder)
+	let get_btc_balance_route = warp::path!("btc" / "balance")
+		.and(warp::get())
+		.and(warp::query::<std::collections::HashMap<String, String>>())
+		.map(|params: std::collections::HashMap<String, String>| {
+			let address = params.get("address").cloned().unwrap_or_default();
+			if address.is_empty() {
+				return warp::reply::json(&serde_json::json!({"balance": 0.0}));
+			}
+			// Appel réel mempool via le proxy Tor du node
+			let rt = tokio::runtime::Runtime::new().unwrap();
+			let balance = rt.block_on(async {
+				match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
+					Ok(json) => {
+						let data: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+						data.as_u64().unwrap_or(0) as f64 / 100_000_000.0
+					}
+					Err(_) => 0.0
+				}
+			});
+			warp::reply::json(&serde_json::json!({"balance": balance}))
+		});
 
 	// ==================== INTÉGRATION FINALE ====================
     let cors = warp::cors()
@@ -466,6 +489,7 @@ pub async fn start_api_server(
         .or(btc_create_htlc)
         .or(btc_send_to_htlc)
         .or(btc_send_direct)
+		.or(get_btc_balance_route)
         .with(cors);
 
     warp::serve(routes).run((host_ip, port)).await;

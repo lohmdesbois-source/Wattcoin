@@ -1494,8 +1494,34 @@ async fn create_btc_htlc(buyer_pubkey_hex: String, seller_pubkey_hex: String, se
 
 #[tauri::command]
 async fn get_btc_balance(master_seed_hex: String) -> Result<f64, String> {
-    let res = tor_fetch("GET", &format!("/btc/balance?master_seed={}", master_seed_hex), None).await?;
-    Ok(serde_json::from_str::<serde_json::Value>(&res).unwrap()["balance"].as_f64().unwrap_or(0.0))
+    // 1. Dérivation adresse BTC (comme avant)
+    use bitcoin::bip32::{Xpriv, DerivationPath};
+    use bitcoin::{Network, Address, PrivateKey};
+    use bitcoin::secp256k1::Secp256k1;
+    use std::str::FromStr;
+
+    let seed = hex::decode(&master_seed_hex).map_err(|_| "Seed invalide".to_string())?;
+    let secp = Secp256k1::new();
+    let root = Xpriv::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
+    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").map_err(|e| e.to_string())?;
+    let child = root.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
+    let privkey = PrivateKey::new(child.private_key, Network::Testnet);
+	let pubkey = privkey.public_key(&secp);
+    let compressed = bitcoin::CompressedPublicKey(pubkey.inner);  // ← tuple struct bitcoin 0.32 (fix final)
+    let address = Address::p2wpkh(&compressed, Network::Testnet).to_string();  // ← p2wpkh retourne directement Address (pas de Result)
+
+    println!("🔍 [BTC] Adresse envoyée au node : {}", address);
+
+    // 2. Appel 100% via node (pas de connexion directe)
+    let res_str = tor_fetch("GET", &format!("/btc/balance?address={}", address), None).await
+        .unwrap_or_else(|_| r#"{"balance": 0.0}"#.to_string());
+
+    let json: serde_json::Value = serde_json::from_str(&res_str)
+        .unwrap_or_else(|_| serde_json::json!({"balance": 0.0}));
+
+    let real_balance = json["balance"].as_f64().unwrap_or(0.0);
+    println!("✅ [BTC VRAI via node] Solde : {} BTC", real_balance);
+    Ok(real_balance)
 }
 
 #[tauri::command]
