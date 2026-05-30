@@ -381,7 +381,7 @@ pub async fn start_api_server(
         });
 	
 	// ===================== BTC BRIDGE PRODUCTION – VERSION COMPILABLE (FIXÉ) ====================
-	use reqwest::{Client, Proxy};
+	use reqwest::Client;
 	use std::time::Duration;
 
 	// ==================== BTC PROXY FIXÉ (plus de panic socks) ====================
