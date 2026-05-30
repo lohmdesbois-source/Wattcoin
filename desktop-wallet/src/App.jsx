@@ -366,7 +366,7 @@ function App() {
 		  secret,
 		  hash: swap.htlc_hash,
 		  wattAddress: walletData.watt_address,
-		  amount: swap.watt_amount_flames / 1e9
+		  amount: swap.watt_amount_flames / 1e9   // le backend ignore le montant pour l'instant
 		});
 		toast.success("✅ " + res + " → Swap terminé côté WATT !", { id: toastId });
 		removeSwapFromCache(swap.htlc_hash);
@@ -944,9 +944,9 @@ function App() {
 											navigator.clipboard.writeText(secretHex);
 
 											const htlcAddr = await invoke("create_btc_htlc", {
-											  buyerPubkeyHex: s.buyer_btc_pubkey,
-											  sellerPubkeyHex: s.seller_btc_pubkey,
-											  secretHex,
+											  buyer_pubkey: s.buyer_btc_pubkey,   
+											  seller_pubkey: s.seller_btc_pubkey,
+											  secret: secretHex,
 											  locktime: 144
 											});
 

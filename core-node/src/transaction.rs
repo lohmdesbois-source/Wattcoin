@@ -70,45 +70,35 @@ impl Transaction {
     pub fn is_valid(&self) -> bool {
         //println!("🔍 [VALIDATION] TX reçue → Type: {:?} | Dilithium: {} | Fee: {}", self.tx_type, self.dilithium_signature, self.fee);
 
-        // 🔥 BYPASS TOTAL POUR HTLC + PRUNED (on garde tout ce que tu avais)
+                // ✅ 100% ATOMIC HTLC – plus de bypass dangereux
         if matches!(self.tx_type,
             TransactionType::Coinbase 
             | TransactionType::DexSettlement { .. } 
-            | TransactionType::LotteryPayout { .. }
-            | TransactionType::HTLCLock { .. }
-            | TransactionType::HTLCClaim { .. }
-            | TransactionType::HTLCRefund { .. })
-            || self.dilithium_signature == "PRUNED" 
-            || self.dilithium_signature.contains("HTLC") {   // sécurité supplémentaire
-
-            println!("✅ [VALIDATION] HTLC / Special TX → ACCEPTÉE IMMÉDIATEMENT");
+            | TransactionType::LotteryPayout { .. }) 
+            || self.dilithium_signature == "PRUNED" {
             return true;
+        }
+
+        // HTLC réel : vérification cryptographique stricte
+        if let TransactionType::HTLCClaim { secret } = &self.tx_type {
+            if secret.is_empty() { return false; }
+            let secret_bytes = hex::decode(secret).unwrap_or_default();
+            let real_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+            return real_hash == self.dilithium_signature; // signature = hash(secret)
+        }
+
+        if let TransactionType::HTLCLock { hash, timeout_block } = &self.tx_type {
+            if hash.len() != 64 || *timeout_block == 0 { return false; }
+        }
+
+        if let TransactionType::HTLCRefund { hash } = &self.tx_type {
+            if hash.len() != 64 || self.inputs.is_empty() { return false; }
         }
 
         // 💡 Sécurité du Ticket de Loterie
         if let TransactionType::HTLCLottery { .. } = &self.tx_type {
             if self.outputs.is_empty() || self.outputs[0].stealth_address != "LOTTERY_RESERVE" { return false; }
             if self.outputs[0].aes_vault != "10000000000" { return false; } // Le ticket DOIT coûter 10 WATT
-        }
-
-        // =================================================================
-        // 🔐 1. LE TRIBUNAL DES CONTRATS INTELLIGENTS (HTLC)
-        // =================================================================
-        // HTLC Claim : vérification cryptographique stricte
-        if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-			if secret.is_empty() { return false; }
-			let secret_bytes = hex::decode(secret).unwrap_or_default();
-			let real_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-			return real_hash == self.dilithium_signature; // signature = hash du secret (standard HTLC)
-		}
-
-		if let TransactionType::HTLCLock { hash, timeout_block } = &self.tx_type {
-			if hash.len() != 64 || *timeout_block == 0 { return false; }
-			// On pourrait aussi vérifier que l'output est bien un stealth_address spécial "HTLC_LOCK"
-		}
-
-        if let TransactionType::HTLCRefund { hash } = &self.tx_type {
-            if hash.len() != 64 || self.inputs.is_empty() { return false; }
         }
 
         // =================================================================

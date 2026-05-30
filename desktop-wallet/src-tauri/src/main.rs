@@ -1517,7 +1517,7 @@ async fn send_btc_direct(recipient_address: String, amount_btc: f64) -> Result<S
 }
 
 #[tauri::command]
-async fn claim_btc_swap(htlc_address: String, raw_witness_tx: String) -> Result<String, String> {
+async fn claim_btc_swap(_htlc_address: String, raw_witness_tx: String) -> Result<String, String> {  
     let payload = serde_json::json!({ "raw_tx": raw_witness_tx });
     tor_fetch("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap())).await
         .map(|_| "🎉 CLAIM BTC RÉUSSI – Swap atomique terminé !".to_string())

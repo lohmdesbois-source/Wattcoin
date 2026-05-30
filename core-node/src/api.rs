@@ -406,7 +406,7 @@ pub async fn start_api_server(
 		.and(warp::body::json())
 		.map(|params: serde_json::Value| {
 			let buyer_pk = params["buyer_pubkey"].as_str().unwrap_or_default();
-			let _seller_pk = params["seller_pubkey"].as_str().unwrap_or_default();  // ← on ignore avec _
+			let _seller_pk = params["seller_pubkey"].as_str().unwrap_or_default(); // ← fix warning
 			let locktime = params["locktime"].as_u64().unwrap_or(144);
 			let htlc_addr = format!("tb1qhtlc-node-{}-{}", &buyer_pk[0..std::cmp::min(8, buyer_pk.len())], locktime);
 			println!("🔨 [NODE BTC PROD] HTLC créé → {}", htlc_addr);
