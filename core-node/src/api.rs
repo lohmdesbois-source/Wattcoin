@@ -445,22 +445,29 @@ pub async fn start_api_server(
 			Ok::<_, warp::Rejection>(res)
 		});
 		
-	// ✅ VRAI BALANCE BTC VIA NODE (zéro fake, zéro placeholder) – FIX PANIC RUNTIME
+	// ✅ VRAI BALANCE BTC VIA NODE - VERSION ROBUSTE + LOGS VISIBLES (fix final)
 	let get_btc_balance_route = warp::path!("btc" / "balance")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
 		.and_then(|params: std::collections::HashMap<String, String>| async move {
 			let address = params.get("address").cloned().unwrap_or_default();
+			println!("🔍 [NODE BTC BALANCE] Demande reçue pour adresse : {}", address);
 			if address.is_empty() {
+				println!("❌ [NODE BTC BALANCE] Adresse vide → 0");
 				return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": 0.0})));
 			}
-			// Appel direct async (pas de Runtime::new inside Tokio → plus de panic)
 			let balance = match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
-					Ok(text) => {
-						let sats: u64 = text.trim().parse().unwrap_or(0);  // mempool renvoie juste le nombre
-						sats as f64 / 100_000_000.0
-					}
-				Err(_) => 0.0
+				Ok(text) => {
+					println!("📥 [NODE BTC BALANCE] Réponse brute mempool : {}", text.trim());
+					let sats: u64 = text.trim().parse().unwrap_or(0);
+					let b = sats as f64 / 100_000_000.0;
+					println!("✅ [NODE BTC BALANCE] SOLDE RÉEL CALCULÉ : {} BTC ({} sats)", b, sats);
+					b
+				}
+				Err(e) => {
+					println!("❌ [NODE BTC BALANCE] Erreur proxy : {}", e);
+					0.0
+				}
 			};
 			Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": balance})))
 		});
