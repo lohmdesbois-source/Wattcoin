@@ -444,27 +444,24 @@ pub async fn start_api_server(
 			Ok::<_, warp::Rejection>(res)
 		});
 		
-	// ✅ VRAI BALANCE BTC VIA NODE (zéro fake, zéro placeholder)
+	// ✅ VRAI BALANCE BTC VIA NODE (zéro fake, zéro placeholder) – FIX PANIC RUNTIME
 	let get_btc_balance_route = warp::path!("btc" / "balance")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
-		.map(|params: std::collections::HashMap<String, String>| {
+		.and_then(|params: std::collections::HashMap<String, String>| async move {
 			let address = params.get("address").cloned().unwrap_or_default();
 			if address.is_empty() {
-				return warp::reply::json(&serde_json::json!({"balance": 0.0}));
+				return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": 0.0})));
 			}
-			// Appel réel mempool via le proxy Tor du node
-			let rt = tokio::runtime::Runtime::new().unwrap();
-			let balance = rt.block_on(async {
-				match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
-					Ok(text) => {
-						let sats: u64 = text.trim().parse().unwrap_or(0);  // ← vrai parsing nombre brut
-						sats as f64 / 100_000_000.0
-					}
-					Err(_) => 0.0
+			// Appel direct async (pas de Runtime::new inside Tokio → plus de panic)
+			let balance = match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
+				Ok(text) => {
+					let sats: u64 = text.trim().parse().unwrap_or(0);  // mempool renvoie juste un nombre
+					sats as f64 / 100_000_000.0
 				}
-			});
-			warp::reply::json(&serde_json::json!({"balance": balance}))
+				Err(_) => 0.0
+			};
+			Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": balance})))
 		});
 
 	// ==================== INTÉGRATION FINALE ====================
