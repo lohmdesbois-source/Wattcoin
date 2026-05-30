@@ -445,7 +445,7 @@ pub async fn start_api_server(
 			Ok::<_, warp::Rejection>(res)
 		});
 		
-	// ✅ VRAI BALANCE BTC VIA NODE - VERSION ROBUSTE + LOGS VISIBLES (fix final)
+	// ✅ VRAI BALANCE BTC VIA NODE - FIX 404 + parsing mempool correct (full address object)
 	let get_btc_balance_route = warp::path!("btc" / "balance")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
@@ -456,12 +456,16 @@ pub async fn start_api_server(
 				println!("❌ [NODE BTC BALANCE] Adresse vide → 0");
 				return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": 0.0})));
 			}
-			let balance = match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
+			let balance = match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}", address), None).await {
 				Ok(text) => {
-					println!("📥 [NODE BTC BALANCE] Réponse brute mempool : {}", text.trim());
-					let sats: u64 = text.trim().parse().unwrap_or(0);
+					println!("📥 [NODE BTC BALANCE] Réponse brute mempool ({} octets) : {}", text.len(), text.chars().take(200).collect::<String>());
+					let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+					let chain = &json["chain_stats"];
+					let funded = chain["funded_txo_sum"].as_u64().unwrap_or(0);
+					let spent  = chain["spent_txo_sum"].as_u64().unwrap_or(0);
+					let sats = funded.saturating_sub(spent);
 					let b = sats as f64 / 100_000_000.0;
-					println!("✅ [NODE BTC BALANCE] SOLDE RÉEL CALCULÉ : {} BTC ({} sats)", b, sats);
+					println!("✅ [NODE BTC BALANCE] SOLDE RÉEL : {} BTC (funded {} - spent {})", b, funded, spent);
 					b
 				}
 				Err(e) => {
