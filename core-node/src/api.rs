@@ -457,9 +457,9 @@ pub async fn start_api_server(
 			let rt = tokio::runtime::Runtime::new().unwrap();
 			let balance = rt.block_on(async {
 				match btc_proxy("GET", &format!("https://mempool.space/testnet/api/address/{}/balance", address), None).await {
-					Ok(json) => {
-						let data: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
-						data.as_u64().unwrap_or(0) as f64 / 100_000_000.0
+					Ok(text) => {
+						let sats: u64 = text.trim().parse().unwrap_or(0);  // ← vrai parsing nombre brut
+						sats as f64 / 100_000_000.0
 					}
 					Err(_) => 0.0
 				}
