@@ -65,7 +65,7 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
     }
 }
 
-fn start_peer_connection(
+pub fn start_peer_connection(
     socket: TcpStream, peer_ip: String, my_port: String,
     blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool,
     known_peers: crate::SharedPeers, active_peers: ActivePeers
@@ -147,18 +147,20 @@ fn start_peer_connection(
                 },
                 
                 P2PMessage::SyncResponse { blocks } => {
-                    if blocks.is_empty() { continue; }
-                    println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {}). Tentative de fusion...", blocks.len(), blocks.first().unwrap().header.index, blocks.last().unwrap().header.index);
-                    let mut chain = blockchain.lock().unwrap(); 
-                    
-                    if chain.resolve_partial_fork(blocks.clone()) { 
-                        println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
-                        let mut mp = mempool.lock().unwrap();
-                        mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == tx.outputs[0].kyber_capsule)) });
-                    } else {
-                        println!("❌ [SYNC] Échec de la fusion ! La fonction 'resolve_partial_fork' a refusé d'intégrer les blocs.");
-                    }
-                },
+					if blocks.is_empty() {
+						println!("⚠️ [SYNC] Lot de blocs vide reçu, ignoré.");
+						continue;
+					}
+					println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, blocks.last().unwrap().header.index);
+					let mut chain = blockchain.lock().unwrap(); 
+					if chain.resolve_partial_fork(blocks.clone()) { 
+						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
+						let mut mp = mempool.lock().unwrap();
+						mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.dilithium_signature == tx.dilithium_signature)) });
+					} else {
+						println!("❌ [SYNC] Échec de la fusion !");
+					}
+				},
 
                 P2PMessage::NewBlock { block, sender_port } => {
                     let reject_info = {
@@ -392,18 +394,20 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
                                     }
                                 },
                                 P2PMessage::SyncResponse { blocks } => {
-                                    if !blocks.is_empty() {
-                                        println!("📥 [SYNC TOR] Lot de {} blocs reçu ! Tentative de fusion...", blocks.len());
-                                        let mut chain = bc_clone.lock().unwrap(); 
-                                        if chain.resolve_partial_fork(blocks.clone()) { 
-                                            println!("✅ [SYNC TOR] Rattrapage réussi !");
-                                            let mut mp = mp_clone.lock().unwrap();
-                                            mp.retain(|t| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule)) });
-                                        } else {
-                                            println!("❌ [SYNC TOR] Échec de la fusion !");
-                                        }
-                                    }
-                                },
+									if blocks.is_empty() {
+										println!("⚠️ [SYNC TOR] Lot de blocs vide reçu, ignoré.");
+										continue;
+									}
+									println!("📥 [SYNC TOR] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, blocks.last().unwrap().header.index);
+									let mut chain = blockchain.lock().unwrap(); 
+									if chain.resolve_partial_fork(blocks.clone()) { 
+										println!("✅ [SYNC TOR] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
+										let mut mp = mempool.lock().unwrap();
+										mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.dilithium_signature == tx.dilithium_signature)) });
+									} else {
+										println!("❌ [SYNC TOR] Échec de la fusion !");
+									}
+								},
                                 P2PMessage::NewBlock { block, sender_port } => {
                                     let reject_info = {
                                         let mut chain = bc_clone.lock().unwrap();

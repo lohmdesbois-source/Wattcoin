@@ -38,8 +38,8 @@ function App() {
   const [txHistory, setTxHistory] = useState([]);
   const [syncMessage, setSyncMessage] = useState("Établissement du tunnel Tor...");
 
-  const [actionnedSwaps, setActionnedSwaps] = useState(new Set());
-  const [generatedSecrets, setGeneratedSecrets] = useState({}); // ← secret par hash HTLC
+  const [btcLocked, setBtcLocked] = useState(false);
+  const [btcLockedStatus, setBtcLockedStatus] = useState({}); // { htlc_hash: true/false }
   
   const [appVersion, setAppVersion] = useState("");
   
@@ -57,6 +57,61 @@ function App() {
     toast.success("Copié dans le presse-papier !");
     setTimeout(() => setCopied(""), 2000);
   };
+  
+	// ==================== GESTION D'ÉTAT CENTRALISÉ ====================
+	const getSwapStates = () => {
+	  try {
+		return JSON.parse(localStorage.getItem('swapStates') || '{}');
+	  } catch {
+		return {};
+	  }
+	};
+
+	const getSwapState = (hash) => {
+	  const states = getSwapStates();
+	  return states[hash] || {
+		role: null,
+		btcLocked: false,
+		wattLocked: false,
+		claimSent: false,
+		wattClaimed: false,
+		btcClaimed: false,
+		secret: null,
+		lastChecked: 0
+	  };
+	};
+
+	const updateSwapState = (hash, updates) => {
+	  const states = getSwapStates();
+	  states[hash] = {
+		...getSwapState(hash),
+		...updates,
+		lastChecked: Date.now()
+	  };
+	  localStorage.setItem('swapStates', JSON.stringify(states));
+	};
+
+	const removeSwapState = (hash) => {
+	  const states = getSwapStates();
+	  delete states[hash];
+	  localStorage.setItem('swapStates', JSON.stringify(states));
+	};
+	
+	// ==================== NETTOYAGE DES ANCIENS FLAGS ====================
+	const cleanupOldSwapFlags = (hash) => {
+	  try {
+		// Supprime tous les anciens flags dispersés pour ce swap
+		localStorage.removeItem(`btc_locked_${hash}`);
+		localStorage.removeItem(`secret_${hash}`);
+		localStorage.removeItem(`claim_sent_${hash}`);
+		localStorage.removeItem(`watt_claimed_${hash}`);
+		localStorage.removeItem(`btc_claimed_${hash}`);
+		
+		console.log(`[Cleanup] Anciens flags supprimés pour ${hash.substring(0, 10)}...`);
+	  } catch (e) {
+		console.warn("Erreur lors du nettoyage des flags:", e);
+	  }
+	};
 
   useEffect(() => {
     async function checkVault() {
@@ -80,48 +135,53 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (view === "syncing" && walletData) {
-      const performInitialSync = async () => {
-        try {
-          setSyncMessage("Connexion au réseau furtif en cours...");
-          const info = await invoke("get_network_info");
-          if(info.last_price_sats) setGlobalWattPriceSats(info.last_price_sats);
+	  if (view === "syncing" && walletData) {
+		const performInitialSync = async () => {
+		  try {
+			setSyncMessage("Connexion au réseau furtif en cours...");
+			const info = await invoke("get_network_info");
+			if (info.last_price_sats) setGlobalWattPriceSats(info.last_price_sats);
 
-          setSyncMessage("Déchiffrement de la blockchain...");
-          const balWATT = await invoke("get_watt_balance", { keys: walletData });
-          setWattBalance(balWATT);
+			setSyncMessage("Déchiffrement de la blockchain...");
+			const balWATT = await invoke("get_watt_balance", { keys: walletData });
+			setWattBalance(balWATT);
 
-          const hist = await invoke("get_history", { keys: walletData });
-          setTxHistory(hist);
+			const hist = await invoke("get_history", { keys: walletData });
+			setTxHistory(hist);
 
-          try {
-            const supply = await invoke("get_total_supply");
-            setTotalSupply(supply);
-            const jackpot = await invoke("get_current_jackpot");
-            setCurrentJackpot(jackpot);
-          } catch(e) {}
+			const supply = await invoke("get_total_supply").catch(() => 0);
+			setTotalSupply(supply);
+			const jackpot = await invoke("get_current_jackpot").catch(() => 0);
+			setCurrentJackpot(jackpot);
 
-          setView("dashboard");
-          toast.success("Synchronisation terminée, coffre ouvert !");
+			// FORCE BTC (défensif)
+			console.log("🔥 [FORCE] Envoi adresse stockée :", walletData?.btc_address);
+			const balBTC = await invoke("get_btc_balance", { 
+			  masterSeedHex: walletData.master_seed_hex, 
+			  btc_address: walletData.btc_address 
+			}).catch(() => 0);
+			setBtcBalance(balBTC);
 
-          invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex })
-            .then(balBTC => setBtcBalance(balBTC))
-            .catch(btcError => console.warn("Erreur BTC L1 :", btcError));
+			// Lightning
+			const lnBal = await invoke("get_lightning_balance", { masterSeedHex: walletData.master_seed_hex })
+			  .catch(() => 0);
+			setLnBalance(lnBal);
 
-          // ⚡ Initialisation Lightning
-          invoke("get_lightning_balance", { masterSeedHex: walletData.master_seed_hex })
-            .then(balSats => setLnBalance(balSats))
-            .catch(err => console.warn("Erreur Lightning :", err));
+			setView("dashboard");
+			toast.success("Synchronisation terminée, coffre ouvert !");
 
-        } catch (e) {
-          console.error("Erreur de sync initiale:", e);
-          setSyncMessage("⚠️ Tor est très lent ou le Nœud est hors ligne. Nouvelle tentative...");
-          setTimeout(performInitialSync, 5000);
-        }
-      };
-      performInitialSync();
-    }
-  }, [view, walletData]);
+		  } catch (e) {
+			console.error("Erreur critique pendant la sync :", e);
+			setSyncMessage("❌ Erreur de synchronisation. Redémarre l'application.");
+			toast.error("Impossible d'ouvrir le dashboard : " + e.toString());
+			// Fallback sécurité
+			setView("dashboard");
+		  }
+		};
+
+		performInitialSync();
+	  }
+	}, [view, walletData]);
 
   useEffect(() => {
     if (view !== "dex" && view !== "dashboard" && view !== "swaps" && view !== "history" && view !== "casino") return;
@@ -140,7 +200,12 @@ function App() {
         const hist = await invoke("get_history", { keys: walletData });
         setTxHistory(hist);
 
-        const balBTC = await invoke("get_btc_balance", { masterSeedHex: walletData.master_seed_hex });
+        console.log("📤 [DEBUG updateData] walletData.btc_address =", walletData.btc_address);
+        const balBTC = await invoke("get_btc_balance", { 
+            masterSeedHex: walletData.master_seed_hex, 
+            btc_address: walletData.btc_address   // ← nom EXACT Rust
+        });
+        console.log("✅ [DEBUG updateData] Solde reçu =", balBTC, "avec adresse", walletData.btc_address);
         setBtcBalance(balBTC);
 
         const pool = await invoke("get_dark_pool");
@@ -187,6 +252,125 @@ function App() {
       unlistenPromise.then(unlisten => unlisten()); 
     };
   }, [view, walletData]);
+  
+	// ==================== LE WATCHDOG (Version 100% Centralisée) ====================
+	useEffect(() => {
+	  if (view !== "swaps" || !walletData) return;
+
+	  const watchdogTimer = setInterval(async () => {
+		const cachedSwaps = JSON.parse(localStorage.getItem('my_swaps') || '[]');
+
+		for (const swap of cachedSwaps) {
+		  const hash = swap.htlc_hash;
+		  const isAlice = swap.buyer_btc_address === walletData.btc_address;
+		  const isBob = swap.seller_watt_address === walletData.watt_address;
+
+		  if (!isAlice && !isBob) continue;
+
+		  const state = getSwapState(hash);
+
+			// ==================== ALICE ====================
+			if (isAlice) {
+			  if (state.role !== "alice") {
+				updateSwapState(hash, { role: "alice" });
+			  }
+
+			  // On ne dépend PLUS du flag btcLocked pour déclencher le claim
+			  // On regarde directement si le lock WATT existe on-chain (node = tribunal)
+			  try {
+				const isWattLocked = await invoke("check_watt_lock_exists", { hash });
+
+				if (isWattLocked && !state.wattClaimed) {
+				  const secret = state.secret;
+				  if (!secret) {
+					console.error(`[Watchdog] ERREUR: Secret manquant pour le swap ${hash.substring(0, 10)}...`);
+					continue;
+				  }
+
+				  if (!state.claimSent) {
+					await invoke("claim_wattcoin_swap", {
+					  secret,
+					  hash,
+					  amountFlames: swap.watt_amount_flames,
+					  wattAddress: walletData.watt_address
+					});
+					updateSwapState(hash, { claimSent: true });
+					console.log(`[Watchdog] Claim envoyé pour hash ${hash.substring(0, 16)}...`);
+				  }
+
+				  // Vérifie si le claim a été miné
+				  try {
+					const revealed = await invoke("get_revealed_secret", { htlcHash: hash });
+					if (revealed) {
+					  updateSwapState(hash, { wattClaimed: true });
+					  toast.success("🔥 WATT Réclamés ! (Confirmé on-chain)", { icon: '✅' });
+					}
+				  } catch (_) {}
+				}
+			  } catch (e) {
+				console.log("Watchdog Alice en attente du lock WATT de Bob...");
+			  }
+			}
+
+		  // ==================== BOB ====================
+		  if (isBob) {
+			if (state.role !== "bob") {
+			  updateSwapState(hash, { role: "bob" });
+			}
+
+			if (!state.btcClaimed) {
+			  try {
+				const res = await invoke("auto_claim_btc_swap", {
+				  htlcHash: hash,
+				  htlcAddress: swap.buyer_btc_address
+				});
+				updateSwapState(hash, { btcClaimed: true });
+				toast.success("🤖 WATCHDOG BOB : " + res, { duration: 10000, icon: '⚡' });
+			  } catch (e) {}
+			}
+		  }
+		}
+		// === Nettoyage automatique quand le swap est terminé ===
+		if (state.wattClaimed || state.btcClaimed) {
+		  // Optionnel : on peut nettoyer les anciens flags ici aussi
+		  cleanupOldSwapFlags(hash);
+		}
+	  }, 6000);
+
+	  return () => clearInterval(watchdogTimer);
+	}, [view, walletData]);
+  
+	// Vérifie toutes les 4 secondes si le contrat BTC existe
+	// ==================== BTC LOCK STATUS (par swap) ====================
+	useEffect(() => {
+	  if (!walletData || pendingSwaps.length === 0) return;
+
+	  const checkAllBtcLocks = async () => {
+		const newStatus = {};
+		
+		for (const swap of pendingSwaps) {
+		  try {
+			const exists = await invoke("check_btc_contract_exists", {
+			  htlcHash: swap.htlc_hash,
+			});
+			newStatus[swap.htlc_hash] = exists;
+		  } catch (e) {
+			newStatus[swap.htlc_hash] = false;
+		  }
+		}
+		
+		setBtcLockedStatus(newStatus);
+	  };
+
+	  checkAllBtcLocks();
+	  const interval = setInterval(checkAllBtcLocks, 5000); // toutes les 5s
+
+	  return () => clearInterval(interval);
+	}, [pendingSwaps, walletData]);
+  
+  
+  
+  
 
   const handleUnlock = async () => {
     setError("");
@@ -227,10 +411,30 @@ function App() {
     setIsProcessing(true);
 
     try {
+      let hashToSend = null;
+      
+      // 💡 Le Vrai Atomic Swap : L'acheteur génère le verrou AVANT l'envoi
+      if (orderType === "buy") {
+		  const cryptoData = await invoke("create_swap_secret");
+		  hashToSend = cryptoData.hash;
+
+		  // Stockage unique et propre dans swapStates
+		  updateSwapState(hashToSend, {
+			role: "alice",
+			secret: cryptoData.secret
+		  });
+
+	  }
+
       await invoke("submit_order", {
-        orderType: orderType, amount: amountWATT, price: unitPriceBtc, 
-        btcAddress: walletData.btc_address, btcPubkey: walletData.btc_pubkey_hex, wattAddress: walletData.watt_address
-      });
+		  orderType: orderType, 
+		  amount: amountWATT, 
+		  price: unitPriceBtc, 
+		  btcAddress: walletData.btc_address, 
+		  btcPubkey: walletData.btc_pubkey_hex, 
+		  wattAddress: walletData.watt_address,
+		  htlcHash: hashToSend || null   // ← explicite
+		});
       setOrderAmount(""); setOrderTotalBtc("");
       const pool = await invoke("get_dark_pool");
       setDarkPool(pool);
@@ -320,8 +524,7 @@ function App() {
     } finally { setIsProcessing(false); }
   };
 
-  // --- ACTIONS DU SWAP ---
-
+	// --- ACTIONS DU SWAP ---
 	// ==================== HANDLE HTLC SIMPLIFIÉ (version propre) ====================
 	const handleBobLockWatt = async (swap) => {
 	  if (isProcessing) return;
@@ -333,7 +536,7 @@ function App() {
 
 	  try {
 		const res = await invoke("send_wattcoin", {
-		  recipientKyberHex: swap.seller_watt_address,
+		  recipientKyberHex: swap.buyer_watt_address,    // ← CORRECT : Alice claimera ces WATT
 		  amount: swap.watt_amount_flames / 1e9,
 		  senderDilithiumSecretHex: walletData.dilithium_secret_hex,
 		  senderDilithiumPublicHex: walletData.dilithium_public_hex,
@@ -343,7 +546,10 @@ function App() {
 		  htlcTimeout: 144
 		});
 		toast.success("✅ WATT verrouillés ! Alice peut maintenant réclamer.", { id: toastId });
-		setActionnedSwaps(prev => new Set([...prev, swap.htlc_hash]));
+		updateSwapState(swap.htlc_hash, { 
+		  role: "bob", 
+		  wattLocked: true 
+		});
 	  } catch (e) {
 		toast.error("❌ " + e, { id: toastId });
 	  } finally {
@@ -352,51 +558,57 @@ function App() {
 	};
 
 	const handleAliceClaimWatt = async (swap) => {
-	  const secret = generatedSecrets[swap.htlc_hash] || localStorage.getItem(`secret_${swap.htlc_hash}`);
+	  const hash = swap.htlc_hash;
+
+	  // On cherche d’abord dans l’état centralisé
+	  let secret = getSwapState(hash).secret;
+
+	  console.log("🔍 [DEBUG Claim WATT] Hash =", hash, 
+				  "| Secret trouvé =", secret ? secret.substring(0, 20) + "..." : "❌ MANQUANT");
+
 	  if (!secret) {
-		toast.error("❌ Fais d'abord le Lock BTC (bouton 1)");
+		toast.error("❌ Secret perdu (redémarrage wallet). Refais d’abord le bouton 1. Lock BTC.");
 		return;
 	  }
 
 	  setIsProcessing(true);
-	  const toastId = toast.loading("🎉 Réclamation WATT envoyée...");
+	  const toastId = toast.loading("🔑 Vérification secret + Réclamation WATT...");
 
 	  try {
 		const res = await invoke("claim_wattcoin_swap", {
-		  secret,
-		  hash: swap.htlc_hash,
-		  wattAddress: walletData.watt_address,
-		  amount: swap.watt_amount_flames / 1e9   // le backend ignore le montant pour l'instant
+		  secret: secret,
+		  hash: hash
 		});
-		toast.success("✅ " + res + " → Swap terminé côté WATT !", { id: toastId });
-		removeSwapFromCache(swap.htlc_hash);
+
+		toast.success("✅ " + res + " → Swap atomique terminé !", { id: toastId });
+		removeSwapFromCache(hash);
 	  } catch (e) {
+		console.error("Claim error:", e);
 		toast.error("❌ " + e.toString(), { id: toastId });
 	  } finally {
 		setIsProcessing(false);
 	  }
 	};
 
-	// Optionnel : version sans prompt (utilise un secret déjà stocké)
+	// === BOUTON 4 : CLAIM BTC (version finale propre) ===
 	const handleBobClaimBtc = async (swap) => {
-	  const secret = generatedSecrets[swap.htlc_hash] || prompt("Secret révélé par Alice :");
-	  if (!secret) return;
-
 	  setIsProcessing(true);
-	  const toastId = toast.loading("💰 Réclamation BTC sur Bitcoin...");
+	  const toastId = toast.loading("🔍 Récupération du secret + Claim BTC automatique...");
+
 	  try {
-		const res = await invoke("claim_btc_swap", {
-		  masterSeedHex: walletData.master_seed_hex,
-		  htlcAddress: swap.buyer_btc_address, // ou l'adresse HTLC reconstruite
-		  secretHex: secret,
-		  buyerPubkeyHex: swap.buyer_btc_pubkey,
-		  sellerPubkeyHex: swap.seller_btc_pubkey
+		const res = await invoke("auto_claim_btc_swap", {
+			htlcHash: swap.htlc_hash,
+			htlcAddress: swap.seller_btc_address || swap.buyer_btc_address   // mieux
 		});
+
 		toast.success(res, { id: toastId });
-		setActionnedSwaps(prev => new Set([...prev, swap.htlc_hash]));
+		updateSwapState(swap.htlc_hash, { btcClaimed: true });
 	  } catch (e) {
-		toast.error(e.toString(), { id: toastId });
-	  } finally { setIsProcessing(false); }
+		console.error(e);
+		toast.error("❌ " + e.toString(), { id: toastId });
+	  } finally {
+		setIsProcessing(false);
+	  }
 	};
 
   const handleRefundWatt = async (swap) => {
@@ -412,22 +624,32 @@ function App() {
       });
       toast.success(response, { id: loadingToast, duration: 5000 });
       toast.success("N'oubliez pas de miner un bloc pour récupérer vos WATT.");
-      setActionnedSwaps(prev => new Set(prev).add(swap.htlc_hash));
     } catch (error) { toast.error(error.toString(), { id: loadingToast }); } 
     finally { setIsProcessing(false); }
   };
 
   const removeSwapFromCache = (hash) => {
-      if (!actionnedSwaps.has(hash)) {
-          toast.error("🚨 Action requise ! Effectuez une transaction (Réclamation ou Refund) avant d'effacer ce contrat.");
-          return;
-      }
-      const cached = JSON.parse(localStorage.getItem('my_swaps') || '[]');
-      const updated = cached.filter(s => s.htlc_hash !== hash);
-      localStorage.setItem('my_swaps', JSON.stringify(updated));
-      setPendingSwaps(updated);
-      toast.success("Swap nettoyé de l'interface !");
-  };
+		const state = getSwapState(hash);
+
+		if (!state.wattLocked && !state.btcClaimed && !state.wattClaimed) {
+		  toast.error("🚨 Action requise ! Effectuez une transaction (Lock, Claim ou Refund) avant d'effacer ce contrat.");
+		  return;
+		}
+
+	  // 1. Supprime l'état structuré
+	  removeSwapState(hash);
+
+	  // 2. Nettoie les anciens flags dispersés
+	  cleanupOldSwapFlags(hash);
+
+	  // 3. Supprime le swap du cache local
+	  const cached = JSON.parse(localStorage.getItem('my_swaps') || '[]');
+	  const updated = cached.filter(s => s.htlc_hash !== hash);
+	  localStorage.setItem('my_swaps', JSON.stringify(updated));
+	  setPendingSwaps(updated);
+
+	  toast.success("Swap nettoyé et purgé complètement !");
+	};
 
   // ================= UI COMPONENTS =================
 
@@ -573,7 +795,9 @@ function App() {
                   <span className="badge">Réseau L1 Furtif</span>
                 </div>
                 <div className="address-box">
-                  <span className="mono" style={{ color: "#888", fontSize: "0.8rem" }}>{walletData.watt_address.substring(0, 16)}...</span>
+					<span className="mono" style={{ color: "#888", fontSize: "0.8rem" }}>
+					  {walletData?.watt_address ? walletData.watt_address.substring(0, 16) + "..." : "—"}
+					</span>
                   <button onClick={(e) => handleCopy(e, walletData.watt_address, 'WATT')} style={{ background: "transparent", border: "none", color: "var(--text-muted)", cursor: "pointer" }}>
                     {copied === 'WATT' ? <Check size={16} color="var(--primary)"/> : <Copy size={16}/>}
                   </button>
@@ -597,7 +821,9 @@ function App() {
                   <span className="badge" style={{ background: "rgba(247, 147, 26, 0.1)", color: "var(--btc-color)" }}>Testnet L1</span>
                 </div>
                 <div className="address-box">
-                  <span className="mono" style={{ color: "#888", fontSize: "0.8rem" }}>{walletData.btc_address}</span>
+					<span className="mono" style={{ color: "#888", fontSize: "0.8rem" }}>
+					  {walletData?.btc_address || "—"}
+					</span>
                   <button onClick={(e) => handleCopy(e, walletData.btc_address, 'BTC')} style={{ background: "transparent", border: "none", color: "var(--text-muted)", cursor: "pointer" }}>
                     {copied === 'BTC' ? <Check size={16} color="var(--btc-color)"/> : <Copy size={16}/>}
                   </button>
@@ -905,7 +1131,6 @@ function App() {
                       {pendingSwaps.map((s, i) => {
                         const isAlice = s.buyer_btc_address === walletData.btc_address;
                         const isBob = s.seller_watt_address === walletData.watt_address;
-                        const hasActioned = actionnedSwaps.has(s.htlc_hash);
 
                         return (
                         <tr key={i}>
@@ -914,87 +1139,169 @@ function App() {
                              isBob ? <span className="badge" style={{background: "rgba(247, 147, 26, 0.1)", color: "var(--btc-color)"}}>Vendeur WATT</span> : 
                              <span className="badge">Observateur</span>}
                           </td>
-                          <td className="mono" style={{ fontSize: "0.8rem", color: "var(--primary)" }}>{s.htlc_hash.substring(0, 16)}...</td>
+                          <td className="mono" style={{ fontSize: "0.8rem", color: "var(--primary)" }}>
+							  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+								<span>{s.htlc_hash.substring(0, 16)}...</span>
+								
+								<button
+								  onClick={(e) => {
+									e.stopPropagation();
+									navigator.clipboard.writeText(s.htlc_hash);
+									toast.success("Hash HTLC copié ! (prêt pour explorer)");
+								  }}
+								  style={{
+									background: "transparent",
+									border: "1px solid #444",
+									borderRadius: "4px",
+									padding: "2px 6px",
+									cursor: "pointer",
+									color: "#888",
+									fontSize: "0.7rem"
+								  }}
+								  title="Copier le hash complet pour explorer BTC"
+								>
+								  📋
+								</button>
+							  </div>
+							</td>
                           <td style={{ fontWeight: "bold" }}>{s.watt_amount_flames / 1000000000}</td>
                           <td style={{ fontWeight: "bold" }}>
                             {s.btc_amount_sats / 100000000}
                           </td>
                           <td>
 							  {isAlice ? (
-								  <div style={{display: "flex", flexDirection: "column", gap: "10px", alignItems: "flex-start"}}>
-									
-									<button 
+								  <div style={{ display: "flex", flexDirection: "column", gap: "10px", alignItems: "flex-start" }}>
+									{/* === BOUTON 1 ALICE === */}
+									<button
 									  className="btn-secondary"
+									  disabled={getSwapState(s.htlc_hash).btcLocked}
 									  onClick={async () => {
-										const confirmed = window.confirm("🔒 Verrouiller BTC dans le HTLC ? (essai avec retry)");
+										if (isProcessing) return;
+
+										const confirmed = window.confirm(
+										  `🔒 Verrouiller ${s.btc_amount_sats / 100000000} BTC dans le HTLC ?`
+										);
 										if (!confirmed) return;
 
-										const toastId = toast.loading("🔄 Tentative 1/3 Tor BTC...");
 										setIsProcessing(true);
+										const toastId = toast.loading("🔄 Création HTLC BTC + verrouillage...");
 
-										let success = false;
-										for (let attempt = 1; attempt <= 3; attempt++) {
-										  try {
-											const secretBytes = new Uint8Array(32);
-											crypto.getRandomValues(secretBytes);
-											const secretHex = Array.from(secretBytes).map(b => b.toString(16).padStart(2,'0')).join('');
-
-											setGeneratedSecrets(prev => ({ ...prev, [s.htlc_hash]: secretHex }));
-											localStorage.setItem(`secret_${s.htlc_hash}`, secretHex);
-											navigator.clipboard.writeText(secretHex);
-
-											const htlcAddr = await invoke("create_btc_htlc", {
-											  buyer_pubkey: s.buyer_btc_pubkey,   
-											  seller_pubkey: s.seller_btc_pubkey,
-											  secret: secretHex,
-											  locktime: 144
-											});
-
-											const res = await invoke("send_btc_to_htlc", {
-											  masterSeedHex: walletData.master_seed_hex,
-											  htlcAddress: htlcAddr,
-											  amountBtc: s.btc_amount_sats / 100000000
-											});
-
-											toast.success("✅ BTC verrouillés avec succès ! (tentative " + attempt + ")", { id: toastId });
-											setActionnedSwaps(prev => new Set([...prev, s.htlc_hash]));
-											localStorage.setItem(`btc_locked_${s.htlc_hash}`, "true");
-											success = true;
-											break;
-										  } catch (e) {
-											toast.loading(`⏳ Tentative ${attempt+1}/3... (Tor lent)`, { id: toastId });
-											await new Promise(r => setTimeout(r, 6000)); // 6 secondes de pause
+										try {
+										  // 1. Récupérer le secret
+										  const secretHex = getSwapState(s.htlc_hash).secret;
+										  if (!secretHex) {
+											throw new Error("Secret introuvable ! Refais l’ordre.");
 										  }
-										}
 
-										if (!success) {
-										  toast.error("❌ Tor BTC toujours injoignable après 3 essais.\nRedémarre le wallet + le node.", { id: toastId });
+										  // 2. Créer le HTLC BTC (enregistre le hash dans le nœud)
+										  const createRes = await invoke("create_btc_htlc", {
+											buyerPubkeyHex: s.buyer_btc_pubkey,
+											sellerPubkeyHex: s.seller_btc_pubkey,
+											secretHex: secretHex,
+											locktime: 144
+										  });
+
+										  const parsed = typeof createRes === "string" ? JSON.parse(createRes) : createRes;
+										  const htlcAddress = parsed.htlc_address || parsed;
+
+										  // 3. Envoyer les BTC dans le HTLC
+										  await invoke("send_btc_to_htlc", {
+											htlcAddress: htlcAddress,
+											amountBtc: s.btc_amount_sats / 100000000,
+											rawTx: null
+										  });
+
+										  // 4. Marquer comme verrouillé
+										  updateSwapState(s.htlc_hash, { 
+											  btcLocked: true, 
+											  role: "alice",
+											  secret: secretHex 
+											});
+
+										  toast.success(`✅ BTC verrouillés dans le HTLC !`, { id: toastId });
+
+										} catch (e) {
+										  console.error("Erreur bouton 1 Alice:", e);
+										  toast.error("❌ " + (e.message || e), { id: toastId });
+										} finally {
+										  setIsProcessing(false);
 										}
-										setIsProcessing(false);
 									  }}
 									>
-									  1. Lock BTC (3 tentatives + 6s d’attente)
+									  {getSwapState(s.htlc_hash).btcLocked
+										? "🔒 1. BTC Verrouillés"
+										: "1. Lock BTC"}
 									</button>
 
-									<div style={{background:"#1e2937", padding:"8px", borderRadius:"6px", width:"100%", fontSize:"0.82rem"}}>
-									  🔑 Secret : <span style={{fontFamily:"monospace", color:"#67e8f9", wordBreak:"break-all"}}>
-										{generatedSecrets[s.htlc_hash] || localStorage.getItem(`secret_${s.htlc_hash}`) || "— Clique sur 1 —"}
-									  </span>
-									</div>
+									{/* Watchdog status */}
+									{getSwapState(s.htlc_hash).btcLocked && (
+									  <div style={{ 
+										background: "rgba(0,0,0,0.4)", 
+										padding: "10px", 
+										borderRadius: "6px", 
+										border: "1px solid var(--primary)", 
+										width: "100%" 
+									  }}>
+										{getSwapState(s.htlc_hash).wattClaimed ? (
+										  <div style={{ color: "#10b981", fontWeight: "bold", textAlign: "center" }}>
+											✅ WATT Récupérés ! Secret Révélé.
+										  </div>
+										) : (
+										  <div style={{ 
+											display: "flex", 
+											alignItems: "center", 
+											justifyContent: "center", 
+											gap: "8px", 
+											color: "var(--primary)", 
+											fontSize: "0.85rem" 
+										  }}>
+											<div className="spinner" style={{ 
+											  width: "14px", 
+											  height: "14px", 
+											  borderTopColor: "var(--primary)", 
+											  borderRightColor: "transparent" 
+											}}></div>
+											Watchdog : En attente du Lock WATT de Bob...
+										  </div>
+										)}
+									  </div>
+									)}
 
-									<button className="btn-primary" onClick={() => handleAliceClaimWatt(s)} disabled={isProcessing}>
-									  🔥 3. Claim WATT (propre)
+									<button className="btn-danger" onClick={() => removeSwapFromCache(s.htlc_hash)}>
+									  🗑️ Cacher
 									</button>
+								  </div>
+							  ) : isBob ? (
+								<div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+								  <button
+									className="btn-secondary"
+									onClick={() => handleBobLockWatt(s)}
+									disabled={
+									  getSwapState(s.htlc_hash).wattLocked || 
+									  !btcLockedStatus[s.htlc_hash]
+									}
+								  >
+									{getSwapState(s.htlc_hash).wattLocked 
+									  ? "🔒 2. WATT Verrouillés" 
+									  : "2. Lock WATT"}
+								  </button>
 
-									<button className="btn-danger" onClick={() => removeSwapFromCache(s.htlc_hash)}>🗑️ Cacher</button>
-								  </div>
-								) : isBob ? (
-								  <div style={{display: "flex", flexDirection: "column", gap: "8px"}}>
-									<button className="btn-secondary" onClick={() => handleBobLockWatt(s)}>2. Lock WATT</button>
-									<button className="btn-primary" onClick={() => handleBobClaimBtc(s)}>4. Claim BTC</button>
-									<button className="btn-danger" onClick={() => handleRefundWatt(s)}>Refund WATT</button>
-								  </div>
-								) : "Observateur"}
+								  {!btcLockedStatus[s.htlc_hash] && !getSwapState(s.htlc_hash).wattLocked && (
+									<p className="text-xs text-amber-400 mt-1">
+									  ⏳ En attente du verrouillage BTC d’Alice...
+									</p>
+								  )}
+
+								  <button 
+									className="btn-danger" 
+									onClick={() => handleRefundWatt(s)}
+								  >
+									Refund WATT (Si Alice annule)
+								  </button>
+								</div>
+							  ) : (
+								"Observateur"
+							  )}
 							</td>
                         </tr>
                       )})}

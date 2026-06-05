@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXVM};
 use rand::seq::SliceRandom;
 use crate::WattError;
-use crate::lattice::LATTICE_DIM; 
+use crate::lattice::LATTICE_DIM;
+use sha2::Digest;  
 
 const FLAME: u64 = 1_000_000_000;
 const MATURITY_BLOCKS: u64 = 3; 
@@ -452,33 +453,41 @@ impl Blockchain {
     }
     
     pub fn resolve_partial_fork(&mut self, new_blocks: Vec<Block>) -> bool {
-        if new_blocks.is_empty() { return false; }
+		if new_blocks.is_empty() {
+			println!("⚠️ [FORK] Lot de blocs vide reçu, ignoré.");
+			return false;
+		}
 
-        let start_index = new_blocks[0].header.index as usize;
-        if start_index == 0 { return self.resolve_fork(new_blocks); }
-        if start_index > self.chain.len() { return false; }
+		let start_index = new_blocks[0].header.index as usize;
+		if start_index == 0 {
+			return self.resolve_fork(new_blocks);
+		}
+		if start_index > self.chain.len() {
+			println!("❌ [FORK] Index trop grand ({}) > longueur de la chaîne ({})", start_index, self.chain.len());
+			return false;
+		}
 
-        // 1. Recherche de l'ancêtre commun
-        let mut ancestor_index = start_index.saturating_sub(1);
-        let mut found_ancestor = false;
+		// Recherche de l'ancêtre commun (sécurisée)
+		let mut ancestor_index = start_index.saturating_sub(1);
+		let mut found_ancestor = false;
 
-        while ancestor_index > 0 {
-            if self.chain[ancestor_index].header.hash == new_blocks[0].header.previous_hash {
-                found_ancestor = true;
-                break;
-            }
-            ancestor_index -= 1;
-        }
+		while ancestor_index > 0 && ancestor_index < self.chain.len() {
+			if self.chain[ancestor_index].header.hash == new_blocks[0].header.previous_hash {
+				found_ancestor = true;
+				break;
+			}
+			ancestor_index = ancestor_index.saturating_sub(1);
+		}
 
-        if !found_ancestor && self.chain[0].header.hash != new_blocks[0].header.previous_hash {
-            println!("❌ [FORK] Impossible de trouver un ancêtre commun avec ce lot. Le nœud a besoin d'un historique plus ancien !");
-            return false;
-        }
+		if !found_ancestor && self.chain[0].header.hash != new_blocks[0].header.previous_hash {
+			println!("❌ [FORK] Impossible de trouver un ancêtre commun.");
+			return false;
+		}
 
-        // 💡 LA MAGIE EST ICI : On fusionne virtuellement la chaîne AVANT de valider !
-        // Cela permet au validateur d'utiliser les bons blocs pour les changements d'Époque.
-        let mut theoretical_chain = self.chain[0..=ancestor_index].to_vec();
-        theoretical_chain.extend(new_blocks.clone());
+		// Construction sécurisée de la chaîne théorique
+		let end = std::cmp::min(ancestor_index + 1, self.chain.len());
+		let mut theoretical_chain = self.chain[0..end].to_vec();
+		theoretical_chain.extend(new_blocks.clone());
 
         // Petite fonction interne pour lire la graine sur la chaîne théorique
         let get_theoretical_seed = |height: u64, t_chain: &[Block]| -> String {
@@ -648,10 +657,10 @@ impl Blockchain {
 				}
 			}
 
-			// ✅ FIX ATOMIC SWAP – vérification réelle du HTLCClaim (dans la boucle)
+			// ✅ VRAI ATOMIC SWAP – vérification SHA256 (compatible Bitcoin HTLC)
 			if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
 				let secret_bytes = hex::decode(secret).unwrap_or_default();
-				let provided_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
+				let provided_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
 				if provided_hash != tx.dilithium_signature {
 					return Err("❌ HTLC Claim : secret invalide".into());
 				}

@@ -23,3 +23,5 @@ pqcrypto-traits = "0.3.5"
 arti-client = { version = "0.19.0", features = ["tokio", "rustls", "onion-service-client"] }
 tor-rtcompat = "0.19.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+sha2 = "0.10.6"
+bitcoin = { version = "0.32", features = ["rand-std"] }

@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use crate::lattice::LWECommitment;
+use sha2::Digest;
 
 const LATTICE_Q: u32 = 8380417;
 const LATTICE_DIM: usize = 4;
@@ -7,14 +8,15 @@ const LATTICE_DIM: usize = 4;
 // ==================== SWAP CONTRACT (sécurisé) ====================
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapContract {
+    pub buyer_watt_address: String,   
     pub buyer_btc_address: String,
     pub buyer_btc_pubkey: String,
     pub seller_watt_address: String,
+    pub seller_btc_address: String,   
     pub seller_btc_pubkey: String,
     pub watt_amount_flames: u64,
     pub btc_amount_sats: u64,
-    pub htlc_hash: String,           // ← SEULEMENT le hash (jamais le secret)
-    // secret n'est plus jamais stocké on-chain
+    pub htlc_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,11 +83,11 @@ impl Transaction {
 
         // HTLC réel : vérification cryptographique stricte
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-            if secret.is_empty() { return false; }
-            let secret_bytes = hex::decode(secret).unwrap_or_default();
-            let real_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-            return real_hash == self.dilithium_signature; // signature = hash(secret)
-        }
+			if secret.is_empty() { return false; }
+			let secret_bytes = hex::decode(secret).unwrap_or_default();
+			let real_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
+			return real_hash == self.dilithium_signature;
+		}
 
         if let TransactionType::HTLCLock { hash, timeout_block } = &self.tx_type {
             if hash.len() != 64 || *timeout_block == 0 { return false; }

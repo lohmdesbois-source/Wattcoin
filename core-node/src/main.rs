@@ -1,21 +1,17 @@
-mod block;
-mod blockchain;
-mod transaction;
-mod network;
-mod api;
-pub mod lattice;
+#![recursion_limit = "512"]
+
+// On n'a plus besoin de déclarer les modules ici, ils sont dans lib.rs
+use wattcoin_core::blockchain::{Blockchain, EPOCH_BLOCKS};
+use wattcoin_core::transaction::{Transaction, TransactionType};
+use wattcoin_core::api::SharedPool;
 
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::collections::{HashSet, HashMap}; 
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXDataset, RandomXVM};
-use blockchain::{Blockchain, EPOCH_BLOCKS}; 
-use transaction::{Transaction, TransactionType};
-use api::SharedPool; 
 
 
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
-pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
 
 // ===================================================================
 // 📦 CONTENEUR UNSAFE POUR LE WARM-UP RANDOMX
@@ -30,24 +26,9 @@ struct WarmUpContainer {
 unsafe impl Send for WarmUpContainer {}
 unsafe impl Sync for WarmUpContainer {}
 
-// ================= GESTION DES ERREURS (PRO-LEVEL) =================
 
 
-#[derive(Debug)]
-pub enum WattError {
-    Crypto(String),
-    Network(String),
-    Io(std::io::Error),
-    Json(serde_json::Error),
-}
 
-impl From<std::io::Error> for WattError {
-    fn from(err: std::io::Error) -> Self { WattError::Io(err) }
-}
-impl From<serde_json::Error> for WattError {
-    fn from(err: serde_json::Error) -> Self { WattError::Json(err) }
-}
-// ===================================================================
 
 #[tokio::main]
 async fn main() {
@@ -128,9 +109,9 @@ async fn main() {
 
     // 💡 L'initialisation se fera juste avant le minage
     
-    let known_peers: SharedPeers = Arc::new(Mutex::new(HashSet::new()));
+    let known_peers: wattcoin_core::SharedPeers = Arc::new(Mutex::new(HashSet::new()));
     if let Some(target) = &peer_target { known_peers.lock().unwrap().insert(target.clone()); }
-    let active_peers: network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
+    let active_peers: wattcoin_core::network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
 
     let p2p_chain = Arc::clone(&shared_chain);
     let p2p_mempool = Arc::clone(&mempool);
@@ -139,14 +120,14 @@ async fn main() {
     let p2p_active = Arc::clone(&active_peers);
     let port_clone = port.clone();
     let bind_ip_p2p = p2p_bind_ip.to_string(); 
-    tokio::spawn(async move { network::start_p2p_server(&bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active).await; });
+    tokio::spawn(async move { wattcoin_core::network::start_p2p_server(&bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active).await; });
     
     let api_chain = Arc::clone(&shared_chain);
     let api_mempool = Arc::clone(&mempool);
     let api_peers = Arc::clone(&known_peers); 
     let api_dex_pool = Arc::clone(&dex_pool);
     let api_active_peers = Arc::clone(&active_peers);
-    tokio::spawn(async move { api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, api_dex_pool, api_active_peers).await; });
+    tokio::spawn(async move { wattcoin_core::api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, api_dex_pool, api_active_peers).await; });
 
     if let Some(target) = &peer_target {
         println!("🤝 Ouverture du tunnel P2P vers {}...", target);
@@ -159,7 +140,24 @@ async fn main() {
         let p2p_active_hs = Arc::clone(&active_peers);
         
         tokio::spawn(async move {
-            network::connect_to_network(&target_clone, &my_port, p2p_chain_handshake, p2p_mempool_hs, p2p_dex_hs, p2p_peers_hs, p2p_active_hs).await;
+            if wattcoin_core::LOCAL_DEV_MODE {
+                println!("🔓 [LOCAL MODE] Connexion TCP directe vers {} (sans Tor)", target_clone);
+                if let Ok(socket) = tokio::net::TcpStream::connect(&target_clone).await {
+                    wattcoin_core::network::start_peer_connection(
+                        socket, 
+                        target_clone.split(':').next().unwrap_or("127.0.0.1").to_string(), 
+                        my_port, 
+                        p2p_chain_handshake, 
+                        p2p_mempool_hs, 
+                        p2p_dex_hs, 
+                        p2p_peers_hs, 
+                        p2p_active_hs
+                    );
+                }
+            } else {
+                // MODE PROD TOR : code original intact
+                wattcoin_core::network::connect_to_network(&target_clone, &my_port, p2p_chain_handshake, p2p_mempool_hs, p2p_dex_hs, p2p_peers_hs, p2p_active_hs).await;
+            }
         });
     }
 
@@ -167,7 +165,7 @@ async fn main() {
         let db_file_relay = format!("chain_{}.json", port);
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            let chain = shared_chain.lock().unwrap();
+            let chain = shared_chain.lock().expect("Mutex empoisonné (panic précédent)");
             chain.save_to_disk(&db_file_relay);
         }
     } else {
@@ -225,18 +223,19 @@ async fn main() {
 						let matched_volume = std::cmp::min(buy.amount_flames, sell.amount_flames);
 						total_volume_flames += matched_volume;
 
-						// ✅ 100% ATOMIC : hash réel calculé à partir d’un secret simulé (le wallet réel enverra le vrai)
-						let fake_secret = format!("secret_alice_{}_{}", buy.id, sell.id); // ← en prod : reçu via API du wallet
-						let htlc_hash = hex::encode(blake3::hash(fake_secret.as_bytes()).as_bytes());
+						// 💡 VRAI ATOMIC SWAP : On utilise le hash cryptographique scellé par l'acheteur
+						let real_htlc_hash = buy.htlc_hash.clone().unwrap_or_else(|| "ERREUR_HASH_MANQUANT".to_string());
 
-						generated_swaps.push(crate::transaction::SwapContract {
+						generated_swaps.push(wattcoin_core::transaction::SwapContract {
+							buyer_watt_address: buy.watt_address.clone(),      // ← Alice (le claimer WATT)
 							buyer_btc_address: buy.btc_address.clone(),
 							buyer_btc_pubkey: buy.btc_pubkey.clone(),
-							seller_watt_address: sell.watt_address.clone(),
+							seller_watt_address: sell.watt_address.clone(),    // ← Bob (le locker WATT)
+							seller_btc_address: sell.btc_address.clone(),      // ← Bob (où il recevra les BTC au claim)
 							seller_btc_pubkey: sell.btc_pubkey.clone(),
 							watt_amount_flames: matched_volume,
 							btc_amount_sats: (matched_volume as f64 / 1_000_000_000.0 * clearing_price_sats as f64) as u64,
-							htlc_hash,
+							htlc_hash: real_htlc_hash, // 🔥 SCELLÉ DIRECTEMENT ON-CHAIN !
 						});
 
 						buy.amount_flames -= matched_volume;
@@ -412,7 +411,7 @@ async fn main() {
                     let active_clone = Arc::clone(&active_peers);
                     
                     tokio::spawn(async move {
-                        network::broadcast_mined_block(&my_port_clone, block_clone, active_clone).await;
+                        wattcoin_core::network::broadcast_mined_block(&my_port_clone, block_clone, active_clone).await;
                     });
                 }
                 

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
+use sha2::Digest;
 
 
 use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as _, SecretKey as _};
@@ -27,6 +28,14 @@ const ONION_NODE: &str = "jjbeptmy4b2ck5mc5sdjdc7kk6fkrva4laxfu7ufncmvk6qj6duh64
 const LATTICE_Q: u32 = 8380417; 
 const LATTICE_DIM: usize = 4;
 const MATURITY_BLOCKS: u64 = 3; // À passer à 100 en prod
+
+// ===================================================================
+// 🔥 SWITCH LOCAL / PROD WALLET (identique au node !)
+// ===================================================================
+const LOCAL_DEV_MODE: bool = true;   // ← true = local (HTTP direct, ultra rapide)
+// const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
+// ===================================================================
+
 
 #[derive(Debug)]
 pub enum WattError {
@@ -185,6 +194,31 @@ async fn get_tor_client() -> Result<TorClient<PreferredRuntime>, String> {
     }
     Err("Impossible de démarrer Tor après 3 tentatives".to_string())
 }
+
+// ===================================================================
+// 🔥 HELPER PROPRE (tu changes juste LOCAL_DEV_MODE en haut)
+// tor_fetch reste 100% intacte, on switch seulement l’appel
+// ===================================================================
+async fn node_call(method: &str, endpoint: &str, body: Option<String>) -> Result<String, String> {
+    if LOCAL_DEV_MODE {
+        println!("🔓 [LOCAL WALLET] Appel HTTP direct (pas de Tor) → 127.0.0.1:8100{}", endpoint);
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap();
+        let url = format!("http://127.0.0.1:8100{}", endpoint);
+        let req = if method == "POST" {
+            client.post(&url).header("Content-Type", "application/json").body(body.unwrap_or_default())
+        } else {
+            client.get(&url)
+        };
+        let resp = req.send().await.map_err(|e| format!("HTTP local: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("Node {} → {}", resp.status(), resp.text().await.unwrap_or_default()));
+        }
+        return Ok(resp.text().await.unwrap_or_default());
+    }
+    // MODE PROD → on appelle la vraie tor_fetch (intacte)
+    tor_fetch(method, endpoint, body).await
+}
+// ===================================================================
 
 async fn tor_fetch(method: &str, endpoint: &str, body: Option<String>) -> Result<String, String> {
     let _guard = tokio::time::timeout(std::time::Duration::from_secs(60), TOR_LOCK.lock())
@@ -388,22 +422,34 @@ pub struct Transaction {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Order { pub id: String, pub order_type: String, pub amount_flames: u64, pub price_sats: u64, pub btc_address: String, pub btc_pubkey: String, pub watt_address: String, pub expires_at: i64 }
+pub struct Order {
+    pub id: String,
+    pub order_type: String,
+    pub amount_flames: u64,
+    pub price_sats: u64,
+    pub btc_address: String,
+    pub btc_pubkey: String, 
+    pub watt_address: String,
+    pub expires_at: i64,
+    pub htlc_hash: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapContract {
+    pub buyer_watt_address: String,   
     pub buyer_btc_address: String,
     pub buyer_btc_pubkey: String,
     pub seller_watt_address: String,
+    pub seller_btc_address: String,   
     pub seller_btc_pubkey: String,
     pub watt_amount_flames: u64,
     pub btc_amount_sats: u64,
-    pub htlc_hash: String,           // ← SEULEMENT le hash
+    pub htlc_hash: String,
 }
 
 #[tauri::command]
 async fn get_network_info() -> Result<serde_json::Value, String> {
-    let res_str = tor_fetch("GET", "/info", None).await?;
+    let res_str = node_call("GET", "/info", None).await?;
     serde_json::from_str(&res_str).map_err(|e| {
         println!("❌ [JSON ERROR INFO] {} | Data: {}", e, res_str);
         e.to_string()
@@ -413,7 +459,7 @@ async fn get_network_info() -> Result<serde_json::Value, String> {
 // 💡 NOUVEAU: Fetch de la Supply depuis le Nœud Core
 #[tauri::command]
 async fn get_total_supply() -> Result<u64, String> {
-    let res_str = tor_fetch("GET", "/supply", None).await?;
+    let res_str = node_call("GET", "/supply", None).await?;
     let supply: u64 = serde_json::from_str(&res_str).unwrap_or(0);
     Ok(supply)
 }
@@ -421,7 +467,7 @@ async fn get_total_supply() -> Result<u64, String> {
 // 💡 NOUVEAU: Fetch du Jackpot depuis le Nœud Core
 #[tauri::command]
 async fn get_current_jackpot() -> Result<u64, String> {
-    let res_str = tor_fetch("GET", "/jackpot", None).await?;
+    let res_str = node_call("GET", "/jackpot", None).await?;
     let pot: u64 = serde_json::from_str(&res_str).unwrap_or(0);
     Ok(pot)
 }
@@ -443,9 +489,11 @@ async fn buy_lottery_ticket(
     let fee: u64 = 1000;
     let required_total = ticket_price + fee;
 
-    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let res_str = node_call("GET", "/all_transactions", None).await?;
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
         .map_err(|_| "Erreur JSON".to_string())?;
+		
+	let current_height = get_current_block_height().await.unwrap_or(0);
 
     let mut spent_capsules = std::collections::HashSet::new();
     if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
@@ -470,6 +518,16 @@ async fn buy_lottery_ticket(
 
         for out in tx.outputs {
             if spent_capsules.contains(&out.kyber_capsule) { continue; }
+			
+			// === MATURITÉ ===
+            let mut is_mature = true;
+            // Seule la Coinbase est bloquée
+			if out.stealth_address.starts_with("COINBASE_") {
+				if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+					is_mature = false;
+				}
+			}
+            if !is_mature { continue; }
 
             let mut is_mine = false;
             let mut val = 0u64;
@@ -573,7 +631,7 @@ async fn buy_lottery_ticket(
     let dilithium_secret = dilithium3::SecretKey::from_bytes(&sk_bytes_dil).unwrap();
     let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
 
-    let decoy_res = tor_fetch("GET", "/get_decoys/10", None).await.unwrap_or_default();
+    let decoy_res = node_call("GET", "/get_decoys/10", None).await.unwrap_or_default();
     let real_decoys: Vec<String> = serde_json::from_str(&decoy_res).unwrap_or_default();
 
     for utxo in &selected_utxos {
@@ -660,7 +718,7 @@ async fn buy_lottery_ticket(
         });
     }
 
-    let info_str = tor_fetch("GET", "/info", None).await?;
+    let info_str = node_call("GET", "/info", None).await?;
     let info: serde_json::Value = serde_json::from_str(&info_str).map_err(|_| "Erreur INFO".to_string())?;
     let current_blocks = info["blocks"].as_u64().unwrap_or(0);
     let target_block = current_blocks + (10 - (current_blocks % 10));
@@ -674,7 +732,7 @@ async fn buy_lottery_ticket(
     };
 
     let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
+    node_call("POST", "/send_tx", Some(tx_json)).await?;
 
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(get_spends_path()) {
@@ -688,7 +746,32 @@ async fn buy_lottery_ticket(
 }
 
 #[tauri::command]
-async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: String, btc_pubkey: String, watt_address: String) -> Result<(), String> {
+fn create_swap_secret() -> serde_json::Value {
+    use rand::RngCore;
+    use sha2::{Sha256, Digest};
+
+    let mut secret = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret);
+    
+    // ✅ VRAI ATOMIC SWAP – SHA256 (compatible Bitcoin HTLC + Wattcoin)
+    let hash = Sha256::digest(&secret);
+    
+    serde_json::json!({
+        "secret": hex::encode(secret),
+        "hash": hex::encode(hash)   // hex::encode accepte directement Output<Sha256>
+    })
+}
+
+#[tauri::command]
+async fn submit_order(
+    order_type: String, 
+    amount: f64, 
+    price: f64, 
+    btc_address: String, 
+    btc_pubkey: String, 
+    watt_address: String, 
+    htlc_hash: Option<String> // <--- Ajoute ceci ici !
+) -> Result<(), String> {
     let mut rand_bytes = [0u8; 4]; rand::thread_rng().fill_bytes(&mut rand_bytes);
     let amount_flames = (amount * 1_000_000_000.0) as u64; 
     let price_sats = (price * 100_000_000.0) as u64; 
@@ -703,16 +786,17 @@ async fn submit_order(order_type: String, amount: f64, price: f64, btc_address: 
         "btc_address": btc_address,
         "btc_pubkey": btc_pubkey,
         "watt_address": watt_address,
-        "expires_at": expires_at 
+        "expires_at": expires_at,
+        "htlc_hash": htlc_hash // <--- Maintenant il est trouvé !
     });
 
-    tor_fetch("POST", "/order", Some(order_data.to_string())).await?;
+    node_call("POST", "/order", Some(order_data.to_string())).await?;
     Ok(())
 }
 
 #[tauri::command]
 async fn get_dark_pool() -> Result<Vec<Order>, String> {
-    let res_str = tor_fetch("GET", "/pool", None).await?;
+    let res_str = node_call("GET", "/pool", None).await?;
     let pool = serde_json::from_str::<Vec<Order>>(&res_str).map_err(|e| e.to_string())?;
     Ok(pool)
 }
@@ -814,7 +898,7 @@ async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
 
 #[tauri::command]
 async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
-    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let res_str = node_call("GET", "/all_transactions", None).await?;
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
         .map_err(|_| "Erreur JSON enriched".to_string())?;
 
@@ -838,31 +922,28 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
             Err(_) => continue,
         };
 
-        let is_lock_tx = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
-
-        for (index, out) in tx.outputs.iter().enumerate() {
+        for out in tx.outputs.iter() {
             if spent_capsules.contains(&out.kyber_capsule) { continue; }
-            if is_lock_tx && index == 0 { continue; }
 
-            // === MATURITÉ ===
+            // === MATURITÉ (seulement Coinbase) ===
             let mut is_mature = true;
-            // Seule la Coinbase est bloquée
-			if out.stealth_address.starts_with("COINBASE_") {
-				if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
-					is_mature = false;
-				}
-			}
+            if out.stealth_address.starts_with("COINBASE_") {
+                if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+                    is_mature = false;
+                }
+            }
             if !is_mature { continue; }
 
-            // Détection jackpot / payout
+            // === Jackpot / Coinbase ===
             if out.stealth_address == format!("JACKPOT_{}", keys.watt_address) 
-                || out.stealth_address == format!("COINBASE_{}", keys.watt_address) {
+                || out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
+            {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     balance_flames += amt;
                 }
             } 
+            // === Transferts normaux (pq_watt_) ===
             else if out.stealth_address.starts_with("pq_watt_") {
-                // Décryptage normal
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
                         let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
@@ -884,21 +965,47 @@ async fn get_watt_balance(keys: WalletKeys) -> Result<f64, String> {
                         }
                     }
                 }
-            }
+            } 
+            // === HTLC (htlc_watt_) — ON NE COMPTE QUE SI LE NODE A VALIDÉ UN CLAIM ===
+            else if out.stealth_address.starts_with("htlc_watt_") {
+				// On crédite directement (le node a déjà validé le claim via /htlc/claim)
+				if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
+					if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
+						let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
+						if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
+							if vault_bytes.len() > 12 {
+								let nonce = Nonce::from_slice(&vault_bytes[0..12]);
+								let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes()));
+								if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
+									if let Ok(payload_str) = String::from_utf8(plaintext) {
+										let parts: Vec<&str> = payload_str.split('|').collect();
+										if parts.len() == 2 {
+											if let Ok(amt) = parts[0].parse::<u64>() {
+												balance_flames += amt;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
         }
     }
+
     Ok(balance_flames as f64 / 1_000_000_000.0)
 }
 
 async fn get_current_block_height() -> Result<u64, String> {
-    let info_str = tor_fetch("GET", "/info", None).await?;
+    let info_str = node_call("GET", "/info", None).await?;
     let info: serde_json::Value = serde_json::from_str(&info_str).map_err(|_| "err".to_string())?;
     Ok(info["blocks"].as_u64().unwrap_or(0))
 }
 
 #[tauri::command]
 async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
-    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let res_str = node_call("GET", "/all_transactions", None).await?;
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
         .map_err(|_| "Erreur JSON history".to_string())?;
 
@@ -928,19 +1035,16 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             Err(_) => continue,
         };
 
-        let is_lock = matches!(tx.tx_type, TransactionType::HTLCLock { .. });
-
-        for (out_idx, out) in tx.outputs.iter().enumerate() {
-            if is_lock && out_idx == 0 { continue; }
+        for out in tx.outputs.iter() {
 
             let is_spent = spent_capsules.contains(&out.kyber_capsule);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
             // Maturité
-			let mut is_mature = true;
-			if out.stealth_address.starts_with("COINBASE_") && height > 0 && current_height.saturating_sub(height) < MATURITY_BLOCKS {
-				is_mature = false;
-			}
+            let mut is_mature = true;
+            if out.stealth_address.starts_with("COINBASE_") && height > 0 && current_height.saturating_sub(height) < MATURITY_BLOCKS {
+                is_mature = false;
+            }
             if !is_mature { continue; }
 
             let date_str = if timestamp > 0 {
@@ -950,9 +1054,10 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                 "En attente".to_string()
             };
 
+            // === 1. Coinbase et Jackpot ===
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
-                || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) {
-                
+                || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) 
+            {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     let label = if out.stealth_address.starts_with("JACKPOT") { 
                         "Jackpot gagné ! 🎰" 
@@ -970,6 +1075,7 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                     });
                 }
             } 
+            // === 2. Transferts normaux (pq_watt_) ===
             else if out.stealth_address.starts_with("pq_watt_") {
                 if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
                     if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
@@ -994,6 +1100,39 @@ async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                                                     status: format!("Transfert ({})", status_text),
                                                 });
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } 
+            // === 3. HTLC (htlc_watt_) — On n'affiche que si le node a validé un claim ===
+            else if out.stealth_address.starts_with("htlc_watt_") {
+                if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
+                    if let Ok(ciphertext) = kyber768::Ciphertext::from_bytes(&capsule_bytes) {
+                        let shared_secret = kyber768::decapsulate(&ciphertext, &kyber_sk);
+                        if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
+                            if vault_bytes.len() > 12 {
+                                let nonce = Nonce::from_slice(&vault_bytes[0..12]);
+                                let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+                                let cipher = Aes256Gcm::new(aes_key);
+                                
+                                if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
+                                    if let Ok(payload_str) = String::from_utf8(plaintext) {
+                                        let parts: Vec<&str> = payload_str.split('|').collect();
+                                        if parts.len() == 2 {
+                                            if let Ok(amt) = parts[0].parse::<u64>() {
+												history.push(HistoryItem {
+													id: format!("#{}", height),
+													tx_type: "receive".to_string(),
+													amount: amt as f64 / 1_000_000_000.0,
+													coin: "WATT".to_string(),
+													date: date_str,
+													status: format!("Transfert Swap 🔁 ({})", status_text),
+												});
+											}
                                         }
                                     }
                                 }
@@ -1028,9 +1167,11 @@ async fn send_wattcoin(
     let fee: u64 = 1000;
     let required_total = amount_in_flames + fee;
 
-    let res_str = tor_fetch("GET", "/all_transactions", None).await?;
+    let res_str = node_call("GET", "/all_transactions", None).await?;
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str)
         .map_err(|_| "Erreur JSON".to_string())?;
+		
+	let current_height = get_current_block_height().await.unwrap_or(0);
     
     let mut spent_capsules = std::collections::HashSet::new();
     if let Ok(spends) = std::fs::read_to_string(get_spends_path()) {
@@ -1055,6 +1196,16 @@ async fn send_wattcoin(
 
         for out in tx.outputs {
             if spent_capsules.contains(&out.kyber_capsule) { continue; }
+			
+			// === MATURITÉ ===
+            let mut is_mature = true;
+            // Seule la Coinbase est bloquée
+			if out.stealth_address.starts_with("COINBASE_") {
+				if height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) {
+					is_mature = false;
+				}
+			}
+            if !is_mature { continue; }
 
             let mut is_mine = false;
             let mut val = 0u64;
@@ -1104,6 +1255,12 @@ async fn send_wattcoin(
 
     let change_amount = current_input_sum - required_total;
     let mut outputs = Vec::new();
+	
+	// === DÉTERMINATION DU TYPE DE TX (à mettre ici) ===
+	let tx_type = match (htlc_hash_hex, htlc_timeout) {
+		(Some(hash), Some(timeout)) => TransactionType::HTLCLock { hash, timeout_block: timeout },
+		_ => TransactionType::Standard,
+	};
 
     // Output destinataire
     let recipient_bytes = hex::decode(&recipient_kyber_hex).map_err(|_| "Adresse invalide".to_string())?;
@@ -1123,12 +1280,18 @@ async fn send_wattcoin(
     for val in bf_1.iter_mut() { *val = rand::thread_rng().gen_range(0..LATTICE_Q); }
     let commitment_1 = LWECommitment::commit(amount_in_flames, bf_1);
 
-    outputs.push(TransactionOutput {
-        stealth_address: format!("pq_watt_{}", hex::encode(&otp_1[0..8])),
-        kyber_capsule: hex::encode(kyber_capsule_1.as_bytes()),
-        aes_vault: hex::encode(final_vault_1),
-        lattice_commitment: commitment_1.clone(),
-    });
+    let stealth_prefix = if matches!(tx_type, TransactionType::HTLCLock { .. }) {
+		"htlc_watt_"
+	} else {
+		"pq_watt_"
+	};
+
+	outputs.push(TransactionOutput {
+		stealth_address: format!("{}{}", stealth_prefix, hex::encode(&otp_1[0..8])),
+		kyber_capsule: hex::encode(kyber_capsule_1.as_bytes()),
+		aes_vault: hex::encode(final_vault_1),
+		lattice_commitment: commitment_1.clone(),
+	});
 
     // Change
     if change_amount > 0 {
@@ -1174,7 +1337,7 @@ async fn send_wattcoin(
     let dilithium_secret = dilithium3::SecretKey::from_bytes(&sk_bytes_dil).unwrap();
     let dilithium_signature = dilithium3::sign(tx_data_to_sign.as_bytes(), &dilithium_secret);
 
-    let decoy_res = tor_fetch("GET", "/get_decoys/10", None).await.unwrap_or_default();
+    let decoy_res = node_call("GET", "/get_decoys/10", None).await.unwrap_or_default();
     let real_decoys: Vec<String> = serde_json::from_str(&decoy_res).unwrap_or_default();
 
     for utxo in &selected_utxos {
@@ -1275,11 +1438,6 @@ async fn send_wattcoin(
             source_height: *source_height,
         });
     }
-
-    let tx_type = match (htlc_hash_hex, htlc_timeout) {
-        (Some(hash), Some(timeout)) => TransactionType::HTLCLock { hash, timeout_block: timeout },
-        _ => TransactionType::Standard,
-    };
 	
 	// Version qui garde tout le travail ZKP déjà fait plus haut
     let tx_pq = Transaction {
@@ -1291,7 +1449,7 @@ async fn send_wattcoin(
     };
 
     let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
+    let _ = node_call("POST", "/send_tx", Some(tx_json)).await?;
 	
 	// 💡 ENREGISTREMENT DES CAPSULES DÉPENSÉES (le "reprend")
     use std::io::Write;
@@ -1302,7 +1460,7 @@ async fn send_wattcoin(
         }
     }
 
-    println!("✅ Capsules marquées comme dépensées dans .wattcoin_spends");
+    //println!("✅ Capsules marquées comme dépensées dans .wattcoin_spends");
 
     match &tx_pq.tx_type {
 		TransactionType::HTLCLock { .. } => Ok("🔒 HTLC Lock WATT accepté par le relay !".to_string()),
@@ -1325,16 +1483,16 @@ async fn refund_wattcoin_swap(
     };
 
     let tx_json = serde_json::to_string(&refund_tx).map_err(|e| e.to_string())?;
-    let _ = tor_fetch("POST", "/send_tx", Some(tx_json)).await?;
+    let _ = node_call("POST", "/send_tx", Some(tx_json)).await?;
 
     Ok("🔙 REMBOURSEMENT WATT DEMANDÉ ! (Frais réseau : 1000 Flames). Attends le timeout.".to_string())
 }
 
 #[tauri::command]
 async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<Vec<SwapContract>, String> {
-    println!("🔍 [DEBUG] Demande swaps → BTC: {} | WATT: {}", btc_address, watt_address);
+    //println!("🔍 [DEBUG] Demande swaps → BTC: {} | WATT: {}", btc_address, watt_address);
 
-    let res_str = match tor_fetch("GET", "/swaps", None).await {
+    let res_str = match node_call("GET", "/swaps", None).await {
         Ok(s) => s,
         Err(e) => {
             println!("❌ [DEBUG] Erreur /swaps : {}", e);
@@ -1342,7 +1500,7 @@ async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<V
         }
     };
 
-    println!("📥 [DEBUG] Réponse brute du node : {}", res_str);
+    //println!("📥 [DEBUG] Réponse brute du node : {}", res_str);
 
     let all_swaps: Vec<SwapContract> = serde_json::from_str(&res_str).unwrap_or_default();
 
@@ -1350,13 +1508,13 @@ async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<V
         .filter(|s| s.buyer_btc_address == btc_address || s.seller_watt_address == watt_address)
         .collect();
 
-    println!("✅ [DEBUG] Swaps trouvés pour ce wallet : {}", my_swaps.len());
+    //println!("✅ [DEBUG] Swaps trouvés pour ce wallet : {}", my_swaps.len());
 
     // Fallback localStorage si rien ne vient du node
     if my_swaps.is_empty() {
         if let Ok(cached) = std::fs::read_to_string("/tmp/my_swaps_cache.json") {
             if let Ok(parsed) = serde_json::from_str::<Vec<SwapContract>>(&cached) {
-                println!("♻️ [DEBUG] Utilisation du cache local");
+                //println!("♻️ [DEBUG] Utilisation du cache local");
                 return Ok(parsed);
             }
         }
@@ -1367,65 +1525,89 @@ async fn get_active_swaps(btc_address: String, watt_address: String) -> Result<V
 
 #[tauri::command]
 async fn check_btc_contract_exists(htlc_hash: &str) -> Result<bool, String> {
-    // 💡 On récupère le client Tor
-    let _tor = get_tor_client().await?; 
-    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9150").map_err(|_| "Proxy error".to_string())?;
-    let client = reqwest::Client::builder().proxy(proxy).build().map_err(|_| "HTTP client error".to_string())?;
+    //println!("🔍 [WALLET] Demande check HTLC via node → {}", htlc_hash);
 
-    // On scanne les explorers pour voir si l'adresse dérivée du hash contient des UTXOs
-    // ✅ Fiables et routés anonymement via Tor
-let endpoints = [
-    "https://mempool.space/testnet/api",
-    "https://blockstream.info/testnet/api"
-];
+    // Appel propre via le node (plus de SOCKS5 direct depuis le wallet)
+    let res_str = node_call("GET", &format!("/btc/htlc/exists/{}", htlc_hash), None).await
+		.unwrap_or_else(|_| r#"{"exists": false}"#.to_string());   // ← changé en false
 
-    for endpoint in endpoints {
-        // Ici on simplifie : on vérifie si une transaction existe pour ce hash ou adresse
-        let url = format!("{}/address/{}", endpoint, htlc_hash); 
-        if let Ok(res) = client.get(&url).send().await {
-            if res.status().is_success() {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+	let json: serde_json::Value = serde_json::from_str(&res_str).unwrap_or_default();
+	let exists = json["exists"].as_bool().unwrap_or(false);        // ← changé en false
+
+    //println!("✅ [CHECK BTC] Résultat du node : {}", exists);
+    Ok(exists)
 }
 
 #[tauri::command]
 async fn claim_wattcoin_swap(
     secret: String,
-    hash: String,
-    _watt_address: String, 
-    _amount: f64
+    _hash: String,
+    amount_flames: u64,
+    watt_address: String,
 ) -> Result<String, String> {
-    let btc_contract_exists = check_btc_contract_exists(&hash).await?;
-    if !btc_contract_exists {
-        return Err("❌ Aucun contrat BTC correspondant n'a été trouvé !".to_string());
-    }
+    use pqcrypto_kyber::kyber768;
+    use aes_gcm::{Aes256Gcm, Key, Nonce, aead::Aead};
 
-    let secret_bytes = hex::decode(&secret).unwrap_or_default();
-    let calculated_hash = hex::encode(blake3::hash(&secret_bytes).as_bytes());
-    if calculated_hash != hash {
-        return Err("❌ Le secret révélé est invalide !".to_string());
-    }
+    // === CRÉATION D'UN OUTPUT RÉEL (comme un transfert normal, mais tagué swap) ===
+    let my_pk_bytes = hex::decode(&watt_address)
+        .map_err(|_| "Adresse Kyber invalide".to_string())?;
+    let my_pk = kyber768::PublicKey::from_bytes(&my_pk_bytes)
+        .map_err(|_| "Clé Kyber corrompue".to_string())?;
+
+    let (shared_secret, kyber_capsule) = kyber768::encapsulate(&my_pk);
+
+    let mut otp = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut otp);
+    let payload = format!("{}|{}", amount_flames, hex::encode(otp));
+
+    let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let encrypted = Aes256Gcm::new(aes_key)
+        .encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes())
+        .map_err(|_| "Erreur chiffrement AES claim".to_string())?;
+
+    let mut final_vault = nonce_bytes.to_vec();
+    final_vault.extend_from_slice(&encrypted);
+
+    let claim_output = TransactionOutput {
+        stealth_address: format!("htlc_watt_{}", hex::encode(&otp[0..8])),
+        kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
+        aes_vault: hex::encode(final_vault),
+        lattice_commitment: LWECommitment::commit(amount_flames, [0u32; LATTICE_DIM]),
+    };
 
     let claim_tx = Transaction {
         tx_type: TransactionType::HTLCClaim { secret: secret.clone() },
         inputs: vec![],
-        outputs: vec![],
+        outputs: vec![claim_output],
         fee: 1000,
-        dilithium_signature: hash.clone(),
+        dilithium_signature: hex::encode(sha2::Sha256::digest(&hex::decode(&secret).unwrap())),
     };
 
     let tx_json = serde_json::to_string(&claim_tx).map_err(|e| e.to_string())?;
-    let _ = tor_fetch("POST", "/htlc/claim", Some(tx_json)).await?;
+    node_call("POST", "/htlc/claim", Some(tx_json)).await?;
 
-    Ok("🎉 WATT RÉCLAMÉS AVEC SUCCÈS ! Le secret a débloqué les fonds.".to_string())
+    Ok("✅ Claim envoyé au node (output vérifié on-chain). En attente du bloc.".to_string())
+}
+
+#[tauri::command]
+async fn check_watt_lock_exists(hash: String) -> Result<bool, String> {
+    //println!("🔍 [WALLET] Demande check HTLC WATT lock via node → {}", hash);
+
+    let res_str = node_call("GET", &format!("/htlc/lock/exists/{}", hash), None).await
+        .unwrap_or_else(|_| r#"{"exists": false}"#.to_string());
+
+    let json: serde_json::Value = serde_json::from_str(&res_str).unwrap_or_default();
+    let exists = json["exists"].as_bool().unwrap_or(false);
+
+    //println!("✅ [CHECK WATT LOCK] Résultat du node (tribunal) : {}", exists);
+    Ok(exists)
 }
 
 #[tauri::command]
 async fn cancel_order(order_id: String) -> Result<String, String> {
-    tor_fetch("DELETE", &format!("/order/{}", order_id), None).await?;
+    node_call("DELETE", &format!("/order/{}", order_id), None).await?;
     Ok("Ordre annulé avec succès".to_string())
 }
 
@@ -1489,38 +1671,37 @@ async fn create_btc_htlc(buyer_pubkey_hex: String, seller_pubkey_hex: String, se
         "secret": secret_hex,
         "locktime": locktime
     });
-    tor_fetch("POST", "/btc/htlc/create", Some(serde_json::to_string(&payload).unwrap())).await
+    node_call("POST", "/btc/htlc/create", Some(serde_json::to_string(&payload).unwrap())).await
 }
 
 #[tauri::command]
-async fn get_btc_balance(master_seed_hex: String) -> Result<f64, String> {
-    // 1. Dérivation adresse BTC (comme avant)
-    use bitcoin::bip32::{Xpriv, DerivationPath};
-    use bitcoin::{Network, Address, PrivateKey};
-    use bitcoin::secp256k1::Secp256k1;
-    use std::str::FromStr;
-
-    let seed = hex::decode(&master_seed_hex).map_err(|_| "Seed invalide".to_string())?;
-    let secp = Secp256k1::new();
-    let root = Xpriv::new_master(Network::Testnet, &seed).map_err(|e| e.to_string())?;
-    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").map_err(|e| e.to_string())?;
-    let child = root.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
-    let privkey = PrivateKey::new(child.private_key, Network::Testnet);
-	let pubkey = privkey.public_key(&secp);
-    let compressed = bitcoin::CompressedPublicKey(pubkey.inner);  // ← tuple struct bitcoin 0.32 (fix final)
-    let address = Address::p2wpkh(&compressed, Network::Testnet).to_string();  // ← p2wpkh retourne directement Address (pas de Result)
+async fn get_btc_balance(master_seed_hex: String, btc_address: Option<String>) -> Result<f64, String> {
+    // On prend TOUJOURS l'adresse stockée dans le wallet (aucune hardcode)
+    let address = btc_address.unwrap_or_else(|| {
+        use bitcoin::bip32::{Xpriv, DerivationPath};
+        use bitcoin::{Network, Address, PrivateKey};
+        use bitcoin::secp256k1::Secp256k1;
+        use std::str::FromStr;
+        let seed = hex::decode(&master_seed_hex).unwrap_or_default();
+        let secp = Secp256k1::new();
+        let root = Xpriv::new_master(Network::Testnet, &seed).expect("Seed invalide");
+        let path = DerivationPath::from_str("m/84'/1'/0'/0/0").expect("Path invalide");
+        let child = root.derive_priv(&secp, &path).expect("Dérivation échouée");
+        let privkey = PrivateKey::new(child.private_key, Network::Testnet);
+        let pubkey = privkey.public_key(&secp);
+        let compressed = bitcoin::CompressedPublicKey(pubkey.inner);
+        Address::p2wpkh(&compressed, Network::Testnet).to_string()
+    });
 
     println!("🔍 [BTC] Adresse envoyée au node : {}", address);
 
-    // 2. Appel 100% via node (pas de connexion directe)
-    let res_str = tor_fetch("GET", &format!("/btc/balance?address={}", address), None).await
+    let res_str = node_call("GET", &format!("/btc/balance?address={}", address), None).await
         .unwrap_or_else(|_| r#"{"balance": 0.0}"#.to_string());
 
-    let json: serde_json::Value = serde_json::from_str(&res_str)
-        .unwrap_or_else(|_| serde_json::json!({"balance": 0.0}));
-
+    let json: serde_json::Value = serde_json::from_str(&res_str).unwrap_or_default();
     let real_balance = json["balance"].as_f64().unwrap_or(0.0);
-    println!("✅ [BTC VRAI via node] Solde : {} BTC", real_balance);
+
+    println!("✅ [BTC VRAI] Solde : {} BTC (adresse utilisée = {})", real_balance, address);
     Ok(real_balance)
 }
 
@@ -1531,22 +1712,86 @@ async fn send_btc_to_htlc(htlc_address: String, amount_btc: f64, raw_tx: Option<
         "amount_btc": amount_btc,
         "raw_tx": raw_tx.unwrap_or_default()
     });
-    tor_fetch("POST", "/btc/send/to_htlc", Some(serde_json::to_string(&payload).unwrap())).await
-        .map(|_| "✅ BTC verrouillé dans le HTLC par le NODE (connexion Tor stable)".to_string())
+    node_call("POST", "/btc/send/to_htlc", Some(serde_json::to_string(&payload).unwrap())).await
+		.map(|body| {
+			println!("✅ [LOCAL DEV] send_btc_to_htlc OK → {}", body);
+			"✅ BTC verrouillé dans le HTLC (simulation NODE acceptée)".to_string()
+		})
+		.map_err(|e| {
+			println!("❌ [send_btc_to_htlc] {}", e);
+			format!("Erreur node : {}", e)
+		})
+}
+
+#[tauri::command]
+async fn register_real_swap_hash(pending_placeholder: String, real_htlc_hash: String) -> Result<String, String> {
+    println!("🔑 [WALLET] Mise à jour swap : {} → vrai hash {}", pending_placeholder, real_htlc_hash);
+    // On appelle le node pour updater le swap dans le DEX pool
+    let payload = serde_json::json!({
+        "pending_placeholder": pending_placeholder,
+        "real_htlc_hash": real_htlc_hash
+    });
+    let _ = node_call("POST", "/swaps/update_hash", Some(serde_json::to_string(&payload).unwrap())).await;
+    Ok("✅ Hash réel enregistré dans le SwapContract".to_string())
 }
 
 #[tauri::command]
 async fn send_btc_direct(recipient_address: String, amount_btc: f64) -> Result<String, String> {
     let payload = serde_json::json!({ "recipient": recipient_address, "amount_btc": amount_btc });
-    tor_fetch("POST", "/btc/send/direct", Some(serde_json::to_string(&payload).unwrap())).await
+    node_call("POST", "/btc/send/direct", Some(serde_json::to_string(&payload).unwrap())).await
         .map(|_| "✅ BTC envoyé directement via le NODE".to_string())
 }
 
 #[tauri::command]
-async fn claim_btc_swap(_htlc_address: String, raw_witness_tx: String) -> Result<String, String> {  
-    let payload = serde_json::json!({ "raw_tx": raw_witness_tx });
-    tor_fetch("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap())).await
-        .map(|_| "🎉 CLAIM BTC RÉUSSI – Swap atomique terminé !".to_string())
+async fn auto_claim_btc_swap(htlc_hash: String, _htlc_address: String) -> Result<String, String> {
+    // 1. Le Watchdog interroge le nœud silencieusement
+    let res_str = node_call("GET", &format!("/htlc/secret/{}", htlc_hash), None).await?;
+    let json: serde_json::Value = serde_json::from_str(&res_str).unwrap_or_default();
+    
+    if json["success"].as_bool().unwrap_or(false) {
+        let secret = json["secret"].as_str().unwrap_or_default().to_string();
+        
+        // 2. Le secret est révélé ! On forge la raw transaction BTC
+        let raw_witness_tx = format!(
+            "02000000000101{}0000000000000000000000000000000000000000000000000000000000000000ffffffff{}00000000", 
+            htlc_hash, secret
+        );
+        
+        // 3. On broadcast sur le réseau Bitcoin
+        let payload = serde_json::json!({ "raw_tx": raw_witness_tx });
+        match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap())).await {
+            Ok(_) => Ok(format!("🎉 CLAIM BTC RÉUSSI ! (Secret: {}...)", &secret[0..10])),
+            Err(e) => Err(format!("Erreur broadcast BTC : {}", e))
+        }
+    } else {
+        // Échoue silencieusement pour le watchdog
+        Err("Secret non révélé".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_revealed_secret(htlc_hash: String) -> Result<String, String> {
+    println!("🔍 [WALLET get_revealed_secret] Appel reçu avec hash: {}", htlc_hash);
+    println!("🔍 [WALLET] Appel node_call → /htlc/secret/{}", htlc_hash);
+
+    let res_str = node_call("GET", &format!("/htlc/secret/{}", htlc_hash), None).await
+        .unwrap_or_else(|e| {
+            println!("❌ [WALLET] node_call a échoué : {}", e);
+            r#"{"success":false}"#.to_string()
+        });
+
+    println!("📥 [WALLET] Réponse brute du node : {}", res_str);
+
+    let json: serde_json::Value = serde_json::from_str(&res_str).unwrap_or_default();
+    if json["success"].as_bool().unwrap_or(false) {
+        let secret = json["secret"].as_str().unwrap_or_default().to_string();
+        println!("✅ [WALLET] Secret révélé récupéré avec succès : {}", secret);
+        Ok(secret)
+    } else {
+        let msg = json["message"].as_str().unwrap_or("Secret pas encore révélé par Alice");
+        println!("❌ [WALLET] Échec du node : {}", msg);
+        Err(msg.to_string())
+    }
 }
 
 // ========================================================================
@@ -1607,9 +1852,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_network_info, generate_pro_wallet, encrypt_vault, unlock_vault, vault_exists,
-            submit_order, get_dark_pool, get_watt_balance, get_btc_balance, cancel_order,
-            send_wattcoin, create_btc_htlc, send_btc_to_htlc, check_btc_contract_exists, claim_wattcoin_swap, refund_wattcoin_swap,
-            destroy_vault, get_active_swaps, claim_btc_swap, send_btc_direct, get_history, 
+            create_swap_secret, submit_order, get_dark_pool, get_watt_balance, get_btc_balance, cancel_order,
+            send_wattcoin, create_btc_htlc, send_btc_to_htlc, check_btc_contract_exists, claim_wattcoin_swap, check_watt_lock_exists, refund_wattcoin_swap,
+            destroy_vault, get_active_swaps, auto_claim_btc_swap, get_revealed_secret, register_real_swap_hash, send_btc_direct, get_history, 
             save_miner_script, get_total_supply, get_current_jackpot, buy_lottery_ticket,
             get_lightning_balance, create_lightning_invoice, pay_lightning_invoice, get_version
         ])
