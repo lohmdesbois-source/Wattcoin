@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 // On n'a plus besoin de déclarer les modules ici, ils sont dans lib.rs
 use wattcoin_core::blockchain::{Blockchain, EPOCH_BLOCKS};
