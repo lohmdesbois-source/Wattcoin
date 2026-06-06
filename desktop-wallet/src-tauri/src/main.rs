@@ -32,8 +32,8 @@ const MATURITY_BLOCKS: u64 = 3; // À passer à 100 en prod
 // ===================================================================
 // 🔥 SWITCH LOCAL / PROD WALLET (identique au node !)
 // ===================================================================
-const LOCAL_DEV_MODE: bool = true;   // ← true = local (HTTP direct, ultra rapide)
-// const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
+//const LOCAL_DEV_MODE: bool = true;   // ← true = local (HTTP direct, ultra rapide)
+const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
 // ===================================================================
 
 
@@ -1571,11 +1571,11 @@ async fn claim_wattcoin_swap(
     final_vault.extend_from_slice(&encrypted);
 
     let claim_output = TransactionOutput {
-        stealth_address: format!("htlc_watt_{}", hex::encode(&otp[0..8])),
-        kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
-        aes_vault: hex::encode(final_vault),
-        lattice_commitment: LWECommitment::commit(amount_flames, [0u32; LATTICE_DIM]),
-    };
+		stealth_address: watt_address.clone(),   // ← CORRECTION : doit matcher exactement buyer_watt_address du swap
+		kyber_capsule: hex::encode(kyber_capsule.as_bytes()),
+		aes_vault: hex::encode(final_vault),
+		lattice_commitment: LWECommitment::commit(amount_flames, [0u32; LATTICE_DIM]),
+	};
 
     let claim_tx = Transaction {
         tx_type: TransactionType::HTLCClaim { secret: secret.clone() },

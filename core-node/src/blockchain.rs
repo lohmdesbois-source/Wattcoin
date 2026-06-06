@@ -142,47 +142,52 @@ impl Blockchain {
         supply
     }
 
-    // 💡 Calcul du Jackpot en cours
+    // 💡 Calcul du Jackpot en cours - VERSION PERSISTANTE (rollover automatique)
     pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
-		let mut tickets = Vec::new();
-		let mut pot = 0u64;
+        let mut tickets = Vec::new();
+        let mut total_reserved = 0u64;
+        let mut total_paid = 0u64;
 
-		if target_height < LOTTERY_TIME_BLOCK { return (0, tickets); }
-		let start = target_height - LOTTERY_TIME_BLOCK;
+        // On parcourt TOUTE la chaîne (pas seulement les 10 derniers blocs)
+        for block in &self.chain {
+            for tx in &block.transactions {
+                // 1. Tout ce qui est entré dans la réserve (taxes + tickets)
+                if tx.tx_type == TransactionType::Coinbase {
+                    for out in &tx.outputs {
+                        if out.stealth_address == "LOTTERY_RESERVE" {
+                            total_reserved += out.aes_vault.parse::<u64>().unwrap_or(0);
+                        }
+                    }
+                }
 
-		for i in start..target_height {
-			if (i as usize) >= self.chain.len() { continue; }
-			let block = &self.chain[i as usize];
+                // 2. Tickets du cycle actuel (pour l'affichage)
+                if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
+                    if *target_block == target_height && !tx.outputs.is_empty() {
+                        let ticket_id = tx.outputs[0].kyber_capsule.clone();
+                        tickets.push((ticket_id, player_pubkey.clone()));
 
-			for tx in &block.transactions {
-				// 1. On lit les taxes minées par la Coinbase (L'argent est dans LOTTERY_RESERVE)
-				if tx.tx_type == TransactionType::Coinbase {
-					for out in &tx.outputs {
-						if out.stealth_address == "LOTTERY_RESERVE" {
-							pot += out.aes_vault.parse::<u64>().unwrap_or(0);
-						}
-					}
-				}
+                        for out in &tx.outputs {
+                            if out.stealth_address == "LOTTERY_RESERVE" {
+                                total_reserved += out.aes_vault.parse::<u64>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
 
-				// 2. On lit les tickets achetés (L'argent est AUSSI dans LOTTERY_RESERVE)
-				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
-					if *target_block == target_height && !tx.outputs.is_empty() {
-						let ticket_id = tx.outputs[0].kyber_capsule.clone();
-						tickets.push((ticket_id, player_pubkey.clone()));
-						
-						// On lit le montant EXACT payé pour le ticket
-						for out in &tx.outputs {
-							if out.stealth_address == "LOTTERY_RESERVE" {
-								pot += out.aes_vault.parse::<u64>().unwrap_or(0);
-							}
-						}
-					}
-				}
-			}
-		}
-		tickets.sort_by(|a, b| a.0.cmp(&b.0));
-		(pot, tickets)
-	}
+                // 3. Tout ce qui a déjà été payé (pour ne pas recompter)
+                if let TransactionType::LotteryPayout { .. } = &tx.tx_type {
+                    for out in &tx.outputs {
+                        total_paid += out.aes_vault.parse::<u64>().unwrap_or(0);
+                    }
+                }
+            }
+        }
+
+        let unclaimed_pot = total_reserved.saturating_sub(total_paid);
+
+        tickets.sort_by(|a, b| a.0.cmp(&b.0));
+        (unclaimed_pot, tickets)
+    }
 
     pub fn get_current_jackpot(&self) -> (u64, Vec<(String, String)>) {
 		let current_height = self.chain.len() as u64;
@@ -291,7 +296,9 @@ impl Blockchain {
         // Note : expected_subsidy intègre DÉJÀ la vérification du TAIL_EMISSION
         // grâce à notre fonction get_next_base_reward() !
         
-        let lottery_tax = total_fees / 100; // 1% de taxe
+        // 💡 Taxe loterie TOUJOURS collectée (1% des frais)
+        // On ne la conditionne plus → le pot peut s'accumuler normalement
+        let lottery_tax = total_fees / 100;
         let miner_fees = total_fees - lottery_tax;
         let mut calculated_reward = expected_subsidy + miner_fees;
         if calculated_reward < TAIL_EMISSION { calculated_reward = TAIL_EMISSION; }

@@ -40,6 +40,7 @@ function App() {
 
   const [btcLocked, setBtcLocked] = useState(false);
   const [btcLockedStatus, setBtcLockedStatus] = useState({}); // { htlc_hash: true/false }
+  const [swapUiTrigger, setSwapUiTrigger] = useState(0);
   
   const [appVersion, setAppVersion] = useState("");
   
@@ -82,13 +83,14 @@ function App() {
 	};
 
 	const updateSwapState = (hash, updates) => {
-	  const states = getSwapStates();
-	  states[hash] = {
-		...getSwapState(hash),
-		...updates,
-		lastChecked: Date.now()
-	  };
-	  localStorage.setItem('swapStates', JSON.stringify(states));
+		const states = getSwapStates();
+		states[hash] = {
+			...getSwapState(hash),
+			...updates,
+			lastChecked: Date.now()
+		};
+		localStorage.setItem('swapStates', JSON.stringify(states));
+		setSwapUiTrigger(prev => prev + 1); // 💡 FORCE REACT À RAFRAÎCHIR L'UI
 	};
 
 	const removeSwapState = (hash) => {
@@ -212,7 +214,16 @@ function App() {
         setDarkPool(pool);
 
         const apiSwaps = await invoke("get_active_swaps", { btcAddress: walletData.btc_address, wattAddress: walletData.watt_address });
-        setPendingSwaps(apiSwaps);
+        setPendingSwaps(prev => {
+			// 💡 On garde les swaps terminés pour que l'utilisateur voie le message de succès
+			const completedToKeep = prev.filter(s => {
+				const st = getSwapState(s.htlc_hash);
+				const isFinished = st.wattClaimed || st.btcClaimed;
+				const isMissingFromNode = !apiSwaps.find(a => a.htlc_hash === s.htlc_hash);
+				return isFinished && isMissingFromNode;
+			});
+			return [...apiSwaps, ...completedToKeep];
+		});
         localStorage.setItem('my_swaps', JSON.stringify(apiSwaps));
 
         const supply = await invoke("get_total_supply");
@@ -253,92 +264,74 @@ function App() {
     };
   }, [view, walletData]);
   
-	// ==================== LE WATCHDOG (Version 100% Centralisée) ====================
+	// ==================== LE WATCHDOG (CORRIGÉ) ====================
 	useEffect(() => {
 	  if (view !== "swaps" || !walletData) return;
 
 	  const watchdogTimer = setInterval(async () => {
-		const cachedSwaps = JSON.parse(localStorage.getItem('my_swaps') || '[]');
+		// 1. On utilise pendingSwaps (state React) au lieu du localStorage pour être à jour
+		if (!pendingSwaps || pendingSwaps.length === 0) return;
 
-		for (const swap of cachedSwaps) {
+		for (const swap of pendingSwaps) {
 		  const hash = swap.htlc_hash;
 		  const isAlice = swap.buyer_btc_address === walletData.btc_address;
 		  const isBob = swap.seller_watt_address === walletData.watt_address;
-
+		  
 		  if (!isAlice && !isBob) continue;
 
 		  const state = getSwapState(hash);
 
-			// ==================== ALICE ====================
-			if (isAlice) {
-			  if (state.role !== "alice") {
-				updateSwapState(hash, { role: "alice" });
-			  }
+			// 1. SI DÉJÀ TERMINÉ, ON SORT DE LA BOUCLE POUR CE SWAP
+			if (state.wattClaimed || state.btcClaimed) {
+				console.log("Watchdog: Swap terminé, passage au suivant.");
+				continue; // Passe au swap suivant dans la liste
+			}
 
-			  // On ne dépend PLUS du flag btcLocked pour déclencher le claim
-			  // On regarde directement si le lock WATT existe on-chain (node = tribunal)
+		  // --- Logique ALICE ---
+		  if (isAlice) {
 			  try {
 				const isWattLocked = await invoke("check_watt_lock_exists", { hash });
-
 				if (isWattLocked && !state.wattClaimed) {
-				  const secret = state.secret;
-				  if (!secret) {
-					console.error(`[Watchdog] ERREUR: Secret manquant pour le swap ${hash.substring(0, 10)}...`);
-					continue;
-				  }
-
 				  if (!state.claimSent) {
 					await invoke("claim_wattcoin_swap", {
-					  secret,
-					  hash,
+					  secret: state.secret,
+					  hash: hash,
 					  amountFlames: swap.watt_amount_flames,
 					  wattAddress: walletData.watt_address
 					});
-					updateSwapState(hash, { claimSent: true });
-					console.log(`[Watchdog] Claim envoyé pour hash ${hash.substring(0, 16)}...`);
+					// On passe directement en succès dès que le node a accepté
+					updateSwapState(hash, { claimSent: true, wattClaimed: true });
+					toast.success("🔥 WATT Réclamés ! (Accepté par le node)", { icon: '✅' });
 				  }
-
-				  // Vérifie si le claim a été miné
-				  try {
-					const revealed = await invoke("get_revealed_secret", { htlcHash: hash });
-					if (revealed) {
-					  updateSwapState(hash, { wattClaimed: true });
-					  toast.success("🔥 WATT Réclamés ! (Confirmé on-chain)", { icon: '✅' });
-					}
-				  } catch (_) {}
 				}
 			  } catch (e) {
-				console.log("Watchdog Alice en attente du lock WATT de Bob...");
+				console.log("Watchdog: Attente WATT...");
 			  }
 			}
 
-		  // ==================== BOB ====================
-		  if (isBob) {
-			if (state.role !== "bob") {
-			  updateSwapState(hash, { role: "bob" });
-			}
-
-			if (!state.btcClaimed) {
-			  try {
-				const res = await invoke("auto_claim_btc_swap", {
-				  htlcHash: hash,
-				  htlcAddress: swap.buyer_btc_address
-				});
-				updateSwapState(hash, { btcClaimed: true });
-				toast.success("🤖 WATCHDOG BOB : " + res, { duration: 10000, icon: '⚡' });
-			  } catch (e) {}
-			}
+		  // --- Logique BOB ---
+		  if (isBob && !state.btcClaimed) {
+			try {
+			   // Vérifie si le secret est révélé sur la chaîne WATT
+			   const secret = await invoke("get_revealed_secret", { htlcHash: hash });
+			   if (secret) {
+				 const res = await invoke("auto_claim_btc_swap", { htlcHash: hash, htlcAddress: swap.buyer_btc_address });
+				 updateSwapState(hash, { btcClaimed: true });
+				 toast.success("⚡ Claim BTC réussi : " + res);
+			   }
+			} catch (e) {}
 		  }
-		}
-		// === Nettoyage automatique quand le swap est terminé ===
-		if (state.wattClaimed || state.btcClaimed) {
-		  // Optionnel : on peut nettoyer les anciens flags ici aussi
-		  cleanupOldSwapFlags(hash);
+
+		  // --- Nettoyage immédiat si terminé ---
+		  const currentState = getSwapState(hash);
+		  if (currentState.wattClaimed || currentState.btcClaimed) {
+			cleanupOldSwapFlags(hash);
+		  }
 		}
 	  }, 6000);
 
 	  return () => clearInterval(watchdogTimer);
-	}, [view, walletData]);
+	}, [view, walletData, pendingSwaps]); // 💡 Dépendance ajoutée ici
   
 	// Vérifie toutes les 4 secondes si le contrat BTC existe
 	// ==================== BTC LOCK STATUS (par swap) ====================

@@ -1,5 +1,6 @@
 // src/lib.rs
 // Wattcoin Core - Librairie (pour les tests et l'audit)
+#![recursion_limit = "1024"]
 
 
 
