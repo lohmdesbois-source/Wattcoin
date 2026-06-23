@@ -30,7 +30,8 @@ fn test_get_next_base_reward_decay_and_tail() {
 #[test]
 fn test_prepare_block_template_no_inflation() {
     let mut chain = Blockchain::new();
-    let (block, _target) = chain.prepare_block_template(vec![], "test_miner");
+    // ⚡ FIX: On récupère aussi les clés L2 (_l2_keys) renvoyées par la fonction
+    let (block, _target, _l2_keys) = chain.prepare_block_template(vec![], "test_miner");
     assert_eq!(block.transactions.len(), 1);
     let reward: u64 = block.transactions[0].outputs[0].aes_vault.parse().unwrap();
     assert!(reward > 0 && reward <= 25_000_000_000);
@@ -61,7 +62,9 @@ fn test_total_supply() {
             },
         }],
         fee: 0,
-        dilithium_signature: "COINBASE_SIG".to_string(),
+        // ⚡ FIX: Utilisation de WOTS+ et public_key
+        public_key: "COINBASE_SIG".to_string(),
+        wots_signature: None,
     };
     let header = BlockHeader {
         index: 1,
@@ -70,6 +73,8 @@ fn test_total_supply() {
         hash: "test".to_string(),
         nonce: 0,
         target_hex: "00".repeat(32),
+        // ⚡ FIX: Ajout de l'ancrage L2
+        l2_root: String::from("NO_L2_FOR_TESTS"),
     };
     chain.chain.push(wattcoin_core::block::Block { header, transactions: vec![coinbase] });
     assert!(chain.get_total_supply() >= 15_000_000_000);
@@ -93,7 +98,9 @@ fn test_validate_rejects_block_with_two_coinbases() {
             },
         }],
         fee: 0,
-        dilithium_signature: "COINBASE_SIG".to_string(),
+        // ⚡ FIX: Utilisation de WOTS+ et public_key
+        public_key: "COINBASE_SIG".to_string(),
+        wots_signature: None,
     };
 
     let coinbase2 = Transaction {
@@ -109,7 +116,9 @@ fn test_validate_rejects_block_with_two_coinbases() {
             },
         }],
         fee: 0,
-        dilithium_signature: "COINBASE_SIG".to_string(),
+        // ⚡ FIX: Utilisation de WOTS+ et public_key
+        public_key: "COINBASE_SIG".to_string(),
+        wots_signature: None,
     };
 
     // Bloc avec 2 coinbases (index 1 pour être juste après le genesis)
@@ -120,6 +129,8 @@ fn test_validate_rejects_block_with_two_coinbases() {
         hash: "fake_hash_for_test".to_string(),
         nonce: 0,
         target_hex: "00".repeat(32),
+        // ⚡ FIX: Ajout de l'ancrage L2
+        l2_root: String::from("NO_L2_FOR_TESTS"),
     };
 
     let bad_block = Block {

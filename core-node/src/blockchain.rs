@@ -6,20 +6,18 @@ use std::collections::HashSet;
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXVM};
 use rand::seq::SliceRandom;
 use crate::WattError;
-use crate::lattice::LATTICE_DIM;
 use sha2::Digest;  
 
 const FLAME: u64 = 1_000_000_000;
-const MATURITY_BLOCKS: u64 = 3; 
-const EXPECTED_BLOCK_TIME: u64 = 60;    
-// 18.000.000 / (144 blocs/jour * 365 jours * 20 ans) = ~1.7 Watts/bloc
+const MATURITY_BLOCKS: u64 = 3; // 100
+const EXPECTED_BLOCK_TIME: u64 = 120;    // 2 mins (120 s)
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
 const EMISSION_DECAY_SHIFT: u32 = 18;   // Ajusté pour ~21 ans
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
-pub const LOTTERY_TIME_BLOCK: u64 = 10;
+pub const LOTTERY_TIME_BLOCK: u64 = 10; // 720 blocks pour un jour
 // 💡 Changement de Dataset tous les 51 blocs pour tuer les ASICs !
-pub const EPOCH_BLOCKS: u64 = 51; 
+pub const EPOCH_BLOCKS: u64 = 255;  // toutes les 8H30 (8,5 Heures = 255 blocks)
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
@@ -90,7 +88,7 @@ impl Blockchain {
             for tx in &block.transactions {
                 if tx.tx_type != TransactionType::Coinbase {
                     for input in &tx.inputs {
-                        spent_key_images.insert(input.pq_ring_signature.key_image.clone());
+                        spent_key_images.insert(input.mpc_ring.key_image.clone());
                     }
                 }
             }
@@ -112,6 +110,25 @@ impl Blockchain {
         println!("💾 Blockchain sauvegardée en toute sécurité dans '{}'.", filename);
     }
 	
+    pub fn save_microblock_to_disk(filename: &str, micro_block: &crate::block::MicroBlock) {
+        // Lecture de la L2 chain existante
+        let mut l2_chain: Vec<crate::block::MicroBlock> = std::fs::read_to_string(filename)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_else(Vec::new);
+        
+        // Sécurité KISS : On vérifie qu'on n'enregistre pas un doublon
+        let is_duplicate = l2_chain.iter().any(|mb| 
+            mb.l1_parent_hash == micro_block.l1_parent_hash && mb.micro_index == micro_block.micro_index
+        );
+
+        if !is_duplicate {
+            l2_chain.push(micro_block.clone());
+            let json = serde_json::to_string_pretty(&l2_chain).unwrap();
+            std::fs::write(filename, json).unwrap_or_else(|_| println!("⚠️ Échec d'écriture L2"));
+        }
+    }
+	
 	/// 💡 OPTIMISATION PRO (O(1)) : Calcule la récompense directement 
     /// à partir de la récompense de base du bloc précédent.
     pub fn get_next_base_reward(prev_base_reward: u64) -> u64 {
@@ -128,14 +145,31 @@ impl Blockchain {
     // 💡 Calcul de la Supply Totale (Précision Absolue)
     pub fn get_total_supply(&self) -> u64 {
         let mut supply = 0;
-        // On commence à 1 car le bloc 0 (Genesis) est souvent un cas spécial
+        
         for block in &self.chain {
+            let mut block_fees = 0;
+            
+            // 1. On calcule le total des frais payés dans ce bloc (monnaie recyclée)
+            for tx in &block.transactions {
+                if tx.tx_type != TransactionType::Coinbase {
+                    block_fees += tx.fee;
+                }
+            }
+            
+            // 2. On fait la somme de TOUTES les parts de la Coinbase 
             for tx in &block.transactions {
                 if tx.tx_type == TransactionType::Coinbase {
-                    // On extrait la valeur réelle inscrite dans le vault du mineur
-                    if let Ok(reward) = tx.outputs[0].aes_vault.parse::<u64>() {
-                        supply += reward;
+                    let mut coinbase_total = 0;
+                    
+                    // On additionne le Validateur (20%) + Les Mineurs (80%) + La Loterie (Robin des Bois + Taxes)
+                    for out in &tx.outputs {
+                        if let Ok(val) = out.aes_vault.parse::<u64>() {
+                            coinbase_total += val;
+                        }
                     }
+                    
+                    // 3. La monnaie NOUVELLEMENT CRÉÉE = (Total distribué) - (Frais recyclés)
+                    supply += coinbase_total.saturating_sub(block_fees);
                 }
             }
         }
@@ -144,50 +178,42 @@ impl Blockchain {
 
     // 💡 Calcul du Jackpot en cours - VERSION PERSISTANTE (rollover automatique)
     pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
-        let mut tickets = Vec::new();
-        let mut total_reserved = 0u64;
-        let mut total_paid = 0u64;
+		let mut tickets = Vec::new();
+		let mut pot = 0u64;
 
-        // On parcourt TOUTE la chaîne (pas seulement les 10 derniers blocs)
-        for block in &self.chain {
-            for tx in &block.transactions {
-                // 1. Tout ce qui est entré dans la réserve (taxes + tickets)
-                if tx.tx_type == TransactionType::Coinbase {
-                    for out in &tx.outputs {
-                        if out.stealth_address == "LOTTERY_RESERVE" {
-                            total_reserved += out.aes_vault.parse::<u64>().unwrap_or(0);
-                        }
-                    }
-                }
+		// 💡 OPTIMISATION ARCHITECTE : On lit la blockchain à l'envers (.rev())
+		for block in self.chain.iter().rev() {
+			for tx in &block.transactions {
+				
+				// 1. On récupère les tickets joués pour CE tirage précis
+				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
+					if *target_block == target_height && !tx.outputs.is_empty() {
+						let ticket_id = tx.outputs[0].kyber_capsule.clone();
+						tickets.push((ticket_id, player_pubkey.clone()));
+					}
+				}
 
-                // 2. Tickets du cycle actuel (pour l'affichage)
-                if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
-                    if *target_block == target_height && !tx.outputs.is_empty() {
-                        let ticket_id = tx.outputs[0].kyber_capsule.clone();
-                        tickets.push((ticket_id, player_pubkey.clone()));
+				// 2. On ajoute l'argent à la cagnotte (Taxes + Prix des tickets)
+				if tx.tx_type == TransactionType::Coinbase || matches!(tx.tx_type, TransactionType::HTLCLottery { .. }) {
+					for out in &tx.outputs {
+						if out.stealth_address == "LOTTERY_RESERVE" {
+							pot += out.aes_vault.parse::<u64>().unwrap_or(0);
+						}
+					}
+				}
 
-                        for out in &tx.outputs {
-                            if out.stealth_address == "LOTTERY_RESERVE" {
-                                total_reserved += out.aes_vault.parse::<u64>().unwrap_or(0);
-                            }
-                        }
-                    }
-                }
+				// 3. 🛑 LE STOP OPTIMISÉ : On croise le dernier paiement du Loto !
+				// Cela signifie que la cagnotte des blocs précédents a déjà été vidée. On arrête de remonter le temps.
+				if let TransactionType::LotteryPayout { .. } = &tx.tx_type {
+					tickets.sort_by(|a, b| a.0.cmp(&b.0));
+					return (pot, tickets);
+				}
+			}
+		}
 
-                // 3. Tout ce qui a déjà été payé (pour ne pas recompter)
-                if let TransactionType::LotteryPayout { .. } = &tx.tx_type {
-                    for out in &tx.outputs {
-                        total_paid += out.aes_vault.parse::<u64>().unwrap_or(0);
-                    }
-                }
-            }
-        }
-
-        let unclaimed_pot = total_reserved.saturating_sub(total_paid);
-
-        tickets.sort_by(|a, b| a.0.cmp(&b.0));
-        (unclaimed_pot, tickets)
-    }
+		tickets.sort_by(|a, b| a.0.cmp(&b.0));
+		(pot, tickets)
+	}
 
     pub fn get_current_jackpot(&self) -> (u64, Vec<(String, String)>) {
 		let current_height = self.chain.len() as u64;
@@ -198,67 +224,55 @@ impl Blockchain {
 		self.get_jackpot_info(next_draw)
 	}
 
-    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint) {
+    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint, Vec<crate::wots::WotsKeyPair>) {
         let current_height = self.chain.len() as u64;
         println!("\n⏳ Préparation du Bloc {}...", current_height);
 
         let mut valid_transactions = Vec::new();
-        let mut total_fees = 0; 
+        let mut l1_total_fees = 0;
+        let mut temp_spent_images = self.spent_key_images.clone(); 
 
-        for tx in transactions {
-            if tx.is_valid() { 
-                // 🛡️ VÉRIFICATION DE MATURITÉ (uniquement sur les Coinbase, comme Bitcoin)
-				let mut immature = false;
+        // ====================================================================
+        // 🧱 TRAITEMENT DU MEMPOOL CLASSIQUE (L1 + L2)
+        // ====================================================================
+        for tx in &transactions {
+            if tx.is_valid() {
+                let mut immature = false;
+                if tx.tx_type != TransactionType::Coinbase {
+                    for input in &tx.inputs {
+                        if input.source_height > 0 {
+                            let confirmations = current_height.saturating_sub(input.source_height);
+                            if confirmations < MATURITY_BLOCKS {
+                                immature = true;
+                                println!("⛔ Input immature : {} confirmations < {}", confirmations, MATURITY_BLOCKS);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if immature { continue; }
 
-				if tx.tx_type != TransactionType::Coinbase {
-					for input in &tx.inputs {
-						// Si cet input dépense une récompense de minage
-						if input.source_height > 0 {  
-							let confirmations = current_height.saturating_sub(input.source_height);
-							
-							if confirmations < MATURITY_BLOCKS {
-								immature = true;
-								println!("⛔ Input immature (Coinbase) : {} confirmations < {} (hauteur source: {})", 
-										 confirmations, MATURITY_BLOCKS, input.source_height);
-								break;
-							}
-						}
-						// Si source_height == 0 → c'est une TX normale → pas de maturité
-					}
-				}
-
-				if immature {
-					continue; // On ignore cette TX pour le bloc en cours
-				}
-				
-				// Exception pour les payouts de loterie (ils n'ont pas de fee et ne doivent pas être ignorés)
                 if matches!(tx.tx_type, TransactionType::LotteryPayout { .. }) {
-                    valid_transactions.push(tx);
-                    continue;
+                    valid_transactions.push(tx.clone()); continue;
                 }
 
-                // 🛡️ 2. VÉRIFICATION DOUBLE DÉPENSE
                 let mut double_spend = false;
                 if tx.tx_type != TransactionType::Coinbase {
                     for input in &tx.inputs {
-                        if self.spent_key_images.contains(&input.pq_ring_signature.key_image) {
-                            double_spend = true;
-                            break;
+                        if temp_spent_images.contains(&input.mpc_ring.key_image) {
+                            double_spend = true; break;
                         }
                     }
                 }
                 
                 if !double_spend {
-                    println!("💸 Transaction détectée ! (Pourboire: {} Flames)", tx.fee);
-                    total_fees += tx.fee; 
-                    // 💡 C'est la toute DERNIÈRE opération qu'on fait avec `tx` pour éviter l'erreur de "move"
-                    valid_transactions.push(tx); 
-                } else {
-                    println!("🗑️ Transaction ignorée par le mineur (Déjà dépensée).");
+                    l1_total_fees += tx.fee; 
+                    valid_transactions.push(tx.clone()); 
+                    for input in &tx.inputs { temp_spent_images.insert(input.mpc_ring.key_image.clone()); }
                 }
             }
         }
-        
+
         let previous_block = self.chain.last().unwrap();
         let mut time_taken = chrono::Utc::now().timestamp() - previous_block.header.timestamp;
         if time_taken <= 0 { time_taken = 1; } 
@@ -273,55 +287,114 @@ impl Blockchain {
         if current_height > 1 { println!("⚙️  Dernier bloc miné en {}s", time_taken); }
         println!("🎯 Difficulté cible : {}.{:02}x", diff_int, diff_dec);
 
-        // 💡 OPTIMISATION O(1) : Calcul de la récompense "Smooth"
-        let expected_subsidy = if current_height == 0 {
-            INITIAL_REWARD
-        } else {
-            // On retrouve la récompense de base du bloc précédent
-            let prev_block = self.chain.last().unwrap();
-            let mut prev_fees = 0;
-            for tx in &prev_block.transactions {
-                if tx.tx_type != TransactionType::Coinbase {
-                    prev_fees += tx.fee;
-                }
-            }
+        // 🛡️ CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
+        let mut expected_subsidy = INITIAL_REWARD;
+        for _ in 0..current_height {
+            expected_subsidy = Blockchain::get_next_base_reward(expected_subsidy);
+        }
+
+        // 🛡️ BOUCLIER ANTI-FERMES DE MINAGE ("L'Effet Robin des Bois")
+        let mut slashed_for_jackpot = 0;
+        let mut allowed_subsidy = expected_subsidy;
+
+        // On ne punit qu'APRÈS la phase de calibrage de la difficulté (ex: après 17 blocs)
+        if current_height > 17 && time_taken < 30 {
+            let time_penalty_ratio = time_taken as f64 / 30.0;
+            allowed_subsidy = (expected_subsidy as f64 * time_penalty_ratio) as u64;
+            slashed_for_jackpot = expected_subsidy.saturating_sub(allowed_subsidy);
             
-            let prev_total_reward: u64 = prev_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(INITIAL_REWARD);
-            let prev_base_reward = prev_total_reward.saturating_sub(prev_fees);
-            
-            // Appel de la fonction O(1) !
-            Self::get_next_base_reward(prev_base_reward)
-        };
+            println!("🚨 [ANTI-FARM] Hashrate extrême détecté ! (Bloc trouvé en {}s), Pénalité de {}.", time_taken, allowed_subsidy );
+            println!("🎰 [ROBIN DES BOIS] Pénalité appliquée : {} WATT confisqués et envoyés au Jackpot L1 !", slashed_for_jackpot as f64 / 1_000_000_000.0);
+        }
 
         // Note : expected_subsidy intègre DÉJÀ la vérification du TAIL_EMISSION
         // grâce à notre fonction get_next_base_reward() !
-        
         // 💡 Taxe loterie TOUJOURS collectée (1% des frais)
         // On ne la conditionne plus → le pot peut s'accumuler normalement
-        let lottery_tax = total_fees / 100;
-        let miner_fees = total_fees - lottery_tax;
-        let mut calculated_reward = expected_subsidy + miner_fees;
-        if calculated_reward < TAIL_EMISSION { calculated_reward = TAIL_EMISSION; }
+        // 💡 DISTRIBUTION DES FRAIS ET DE LA LOTERIE
+		// 💡 Les taxes de base + l'argent confisqué aux gros mineurs vont dans la Loterie !
+        let l1_lottery_tax = l1_total_fees / 100;
+        let l1_miner_fees = l1_total_fees - l1_lottery_tax;
+        let total_lottery_tax = l1_lottery_tax + slashed_for_jackpot; 
+
+        // La récompense qui reste à partager (Base autorisée + Frais)
+        if allowed_subsidy < TAIL_EMISSION { allowed_subsidy = TAIL_EMISSION; }
+		let calculated_reward = allowed_subsidy + l1_miner_fees;
 
         println!("📉 Émission monétaire : {:.9} Watts", (expected_subsidy as f64) / (FLAME as f64));
-        println!("📉 Le mineur gagne : {:.9} Watts (Taxe Loterie: {} Flames)", (calculated_reward as f64) / (FLAME as f64), lottery_tax);
+        println!("📉 Le mineur L1 gagne : {:.9} Watts (Frais L1 {:.9})", (calculated_reward as f64) / (FLAME as f64), l1_miner_fees);
+		
+		// ⚡ RÉPARTITION ÉQUITABLE (80/20) P2POOL NATIF
+        let mut coinbase_outputs = Vec::new();
+        let mut valid_shares = Vec::new();
 
-        let mut coinbase_outputs = vec![
-            crate::transaction::TransactionOutput {
+        // On récupère un maximum de 50 parts de minage pour éviter de saturer le bloc
+        for tx in &transactions {
+            if let TransactionType::MiningShare { .. } = &tx.tx_type {
+                if valid_shares.len() < 50 { valid_shares.push(tx.clone()); }
+            }
+        }
+
+        if !valid_shares.is_empty() {
+			let finder_reward = calculated_reward * 20 / 100; 
+			
+			// 💡 FIX 1: On soustrait le finder_reward au lieu de recalculer 80% 
+			// pour ne pas perdre la décimale du split.
+			let total_community_reward = calculated_reward - finder_reward; 
+			
+			let share_reward = total_community_reward / valid_shares.len() as u64; 
+			
+			// 💡 FIX 2: On calcule le reste de la division (le modulo)
+			let remainder = total_community_reward % valid_shares.len() as u64;
+			
+			// 💡 On donne les poussières (Flames restants) au validateur pour ne rien perdre !
+			let final_finder_reward = finder_reward + remainder;
+
+			println!("🤝 [P2POOL] Répartition : Validateur ({:.9} Watts), Communauté ({:.9} Watts).", 
+				(final_finder_reward as f64) / (FLAME as f64),
+				(total_community_reward as f64) / (FLAME as f64)
+			);
+            println!("🤝 [P2POOL] Chacun des {} petits mineurs reçoit : {:.9} Watts", 
+                valid_shares.len(), 
+                (share_reward as f64) / (FLAME as f64)
+            );
+
+            // 1. Output pour le trouveur (20%)
+            coinbase_outputs.push(crate::transaction::TransactionOutput {
+				stealth_address: format!("COINBASE_{}", miner_address), 
+				kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
+				aes_vault: final_finder_reward.to_string(), // <- ICI
+				lattice_commitment: crate::lattice::LWECommitment::commit(final_finder_reward, [0, 0, 0, 0]),
+			});
+
+            // 2. Outputs pour la communauté (80%)
+            for (i, share_tx) in valid_shares.iter().enumerate() {
+                if let TransactionType::MiningShare { miner_address: share_addr, .. } = &share_tx.tx_type {
+                    coinbase_outputs.push(crate::transaction::TransactionOutput {
+                        stealth_address: format!("COINBASE_{}", share_addr), 
+                        kyber_capsule: format!("SHARE_CAPSULE_{}_{}", current_height, i),
+                        aes_vault: share_reward.to_string(), 
+                        lattice_commitment: crate::lattice::LWECommitment::commit(share_reward, [0, 0, 0, 0]),
+                    });
+                }
+            }
+        } else {
+            // S'il est tout seul sur le réseau, il prend les 100% de la récompense autorisée
+            coinbase_outputs.push(crate::transaction::TransactionOutput {
                 stealth_address: format!("COINBASE_{}", miner_address), 
                 kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
                 aes_vault: calculated_reward.to_string(), 
                 lattice_commitment: crate::lattice::LWECommitment::commit(calculated_reward, [0, 0, 0, 0]),
-            }
-        ];
+            });
+        }
 
-        // 💡 On envoie la taxe dans la réserve transparente !
-        if lottery_tax > 0 {
+        // 3. On alimente la réserve (Taxe de 1% + Argent confisqué aux fermes)
+        if total_lottery_tax > 0 {
             coinbase_outputs.push(crate::transaction::TransactionOutput {
                 stealth_address: "LOTTERY_RESERVE".to_string(), 
                 kyber_capsule: format!("TAX_CAPSULE_{}", current_height),
-                aes_vault: lottery_tax.to_string(), 
-                lattice_commitment: crate::lattice::LWECommitment::commit(lottery_tax, [0, 0, 0, 0]),
+                aes_vault: total_lottery_tax.to_string(), 
+                lattice_commitment: crate::lattice::LWECommitment::commit(total_lottery_tax, [0, 0, 0, 0]),
             });
         }
 		
@@ -341,7 +414,7 @@ impl Blockchain {
                     stealth_address: format!("JACKPOT_{}", winner_pubkey),
                     kyber_capsule: format!("JACKPOT_PAYOUT_{}", current_height),
                     aes_vault: jackpot_amount.to_string(),
-                    lattice_commitment: crate::lattice::LWECommitment::commit(jackpot_amount, [0; LATTICE_DIM]),
+                    lattice_commitment: crate::lattice::LWECommitment::commit(jackpot_amount, [0, 0, 0, 0]),
                 };
 
                 let lottery_payout_tx = Transaction {
@@ -352,7 +425,7 @@ impl Blockchain {
                     inputs: vec![],
                     outputs: vec![payout_output],
                     fee: 0,
-                    dilithium_signature: "LOTTERY_PAYOUT".to_string(),
+                    public_key: "LOTTERY_PAYOUT".to_string(), wots_signature: None,
                 };
 
                 valid_transactions.push(lottery_payout_tx);
@@ -365,50 +438,37 @@ impl Blockchain {
             inputs: vec![],
             outputs: coinbase_outputs,
             fee: 0,
-            dilithium_signature: "COINBASE_SIG".to_string(),
+            public_key: "COINBASE_SIG".to_string(), wots_signature: None,
         };
         valid_transactions.insert(0, coinbase_tx);
+		
+		// ⚡ GÉNÉRATION DU TROUSSEAU L2 (128 clés WOTS+ pour 2 minutes de L2)
+        let mut l2_keys = Vec::new();
+        let mut l2_pubkeys = Vec::new();
+        for _ in 0..128 {
+            let keys = crate::wots::WotsKeyPair::generate();
+            l2_pubkeys.push(keys.public_key.clone());
+            l2_keys.push(keys);
+        }
+
+        // Création de l'arbre de Merkle simple pour la racine
+        let mut l2_root = l2_pubkeys[0].clone();
+        for i in 1..128 {
+            l2_root = crate::merkle_ring::MpcRingSignature::hash_nodes(&l2_root, &l2_pubkeys[i]);
+        }
 
         let new_header = BlockHeader {
-			index: current_height,
-			timestamp: chrono::Utc::now().timestamp(),
-			previous_hash: previous_block.header.hash.clone(),
-			hash: String::new(),
-			nonce: 0,
-			target_hex: format!("{:0>64}", self.target.to_str_radix(16)),   // ← on stocke le target du moment
-		};
+            index: current_height,
+            timestamp: chrono::Utc::now().timestamp(),
+            previous_hash: previous_block.header.hash.clone(),
+            hash: String::new(),
+            nonce: 0,
+            target_hex: format!("{:0>64}", self.target.to_str_radix(16)),
+            l2_root, // La racine est ancrée dans le L1 !
+        };
 
         let block = Block { header: new_header, transactions: valid_transactions };
-        (block, self.target.clone())
-    }
-
-    pub fn prune_old_signatures(&mut self) {
-        let current_height = self.chain.len() as u64;
-        if current_height <= MATURITY_BLOCKS { return; }
-
-        let prune_target = current_height - MATURITY_BLOCKS;
-        let mut pruned_count = 0;
-
-        for block in &mut self.chain {
-            if block.header.index < prune_target {
-                for tx in &mut block.transactions {
-                    if tx.dilithium_signature != "PRUNED" && tx.tx_type != TransactionType::Coinbase {
-                        tx.dilithium_signature.clear(); 
-                        tx.dilithium_signature.push_str("PRUNED"); 
-                        for input in &mut tx.inputs {
-                            input.pq_ring_inputs.clear(); 
-                        }
-                        pruned_count += 1;
-                    }
-                }
-            } else {
-                break; 
-            }
-        }
-
-        if pruned_count > 0 {
-            println!("🪓 Pruning automatique : {} signatures quantiques purgées pour sauver l'espace !", pruned_count);
-        }
+        (block, self.target.clone(), l2_keys) // On retourne les clés L2 !
     }
     
     pub fn resolve_fork(&mut self, new_chain: Vec<Block>) -> bool {
@@ -434,22 +494,40 @@ impl Blockchain {
                 vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
             }
 
-            let header_data = format!("{}{}{}{}", current_block.header.index, current_block.header.timestamp, current_block.header.previous_hash, current_block.header.nonce);
+            let header_data = format!("{}{}{}{}{}", current_block.header.index, current_block.header.timestamp, current_block.header.previous_hash, current_block.header.nonce, current_block.header.l2_root);
             let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
             let expected_hash = hex::encode(&hash_bytes);
 
             if current_block.header.hash != expected_hash { return false; }
         }
 
+        // 🛡️ BOUCLIER ANTI-51% (MESS) POUR LES REORGANISATIONS TOTALES
+        let my_work = Blockchain::calculate_total_work(&self.chain);
+        let mut new_work = Blockchain::calculate_total_work(&new_chain);
+
+        let reorg_depth = self.chain.len().saturating_sub(1);
+        if reorg_depth > 10 {
+            let penalty_shift = std::cmp::min((reorg_depth - 10) as u32, 256);
+            println!("🛡️ [MESS] 🚨 ALERTE : Tentative de réorganisation depuis le Genesis (Profondeur: {} blocs) !", reorg_depth);
+            println!("🛡️ [MESS] 📉 Pénalité appliquée : Poids de la chaîne attaquante divisé par 2^{}", penalty_shift);
+            new_work = new_work >> penalty_shift;
+        }
+
+        // Si on a déjà miné des blocs, on refuse une chaîne plus faible
+        if new_work <= my_work && self.chain.len() > 1 {
+            println!("❌ [FORK] La nouvelle chaîne complète n'a pas assez de Preuve de Travail (MESS appliqué).");
+            return false;
+        }
+
         self.chain = new_chain;
-        self.recalculate_target_from_scratch(); 
+        self.recalculate_target_from_scratch();
         
         let mut new_spent = HashSet::new();
         for block in &self.chain {
             for tx in &block.transactions {
                 if tx.tx_type != TransactionType::Coinbase {
                     for input in &tx.inputs {
-                        new_spent.insert(input.pq_ring_signature.key_image.clone());
+                        new_spent.insert(input.mpc_ring.key_image.clone());
                     }
                 }
             }
@@ -523,7 +601,7 @@ impl Blockchain {
                 vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
             }
 
-            let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
+            let header_data = format!("{}{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce, block.header.l2_root);
             let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
             
             if hex::encode(&hash_bytes) != block.header.hash { 
@@ -532,9 +610,19 @@ impl Blockchain {
             }
         }
 
-        // 3. Pesée des deux chaînes (Preuve de travail)
+        // 3. Pesée des deux chaînes (Preuve de travail) et Bouclier MESS
         let my_work = Blockchain::calculate_total_work(&self.chain);
-        let new_work = Blockchain::calculate_total_work(&theoretical_chain);
+        let mut new_work = Blockchain::calculate_total_work(&theoretical_chain);
+
+        let reorg_depth = self.chain.len().saturating_sub(ancestor_index + 1);
+
+        // 🛡️ BOUCLIER ANTI-51% (Modified Exponential Subjective Scoring)
+        if reorg_depth > 10 {
+            let penalty_shift = std::cmp::min((reorg_depth - 10) as u32, 256); // Limite anti-overflow
+            println!("🛡️ [MESS] 🚨 ALERTE : Tentative de réorganisation profonde détectée (Profondeur: {} blocs) !", reorg_depth);
+            println!("🛡️ [MESS] 📉 Pénalité appliquée : Poids de la chaîne attaquante divisé par 2^{}", penalty_shift);
+            new_work = new_work >> penalty_shift;
+        }
 
         if new_work > my_work || (new_work == my_work && new_blocks.last().unwrap().header.timestamp < self.chain.last().unwrap().header.timestamp) {
             println!("✅ [FORK] Nouvelle chaîne adoptée ! On recule de {} blocs et on en applique {}.", 
@@ -549,7 +637,7 @@ impl Blockchain {
                 for tx in &block.transactions {
                     if tx.tx_type != TransactionType::Coinbase {
                         for input in &tx.inputs {
-                            new_spent.insert(input.pq_ring_signature.key_image.clone());
+                            new_spent.insert(input.mpc_ring.key_image.clone());
                         }
                     }
                 }
@@ -579,12 +667,15 @@ impl Blockchain {
 		let cache = randomx_rs::RandomXCache::new(flags, seed.as_bytes()).map_err(|_| "Erreur Cache")?;
 		let vm = randomx_rs::RandomXVM::new(flags, Some(cache), None).map_err(|_| "Erreur VM")?;
 
-		let header_data = format!("{}{}{}{}", 
+		// 🛡️ L2 ANCHORING
+		let header_data = format!("{}{}{}{}{}", 
 			block.header.index, 
 			block.header.timestamp, 
 			block.header.previous_hash, 
-			block.header.nonce
+			block.header.nonce,
+			block.header.l2_root
 		);
+		
 		let hash_bytes = vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur calcul")?;
 		
 		if block.header.hash != hex::encode(&hash_bytes) { 
@@ -602,21 +693,11 @@ impl Blockchain {
 		let mut block_key_images = HashSet::new();
 		let current_height = block.header.index;
 
-		// Calcul de la récompense théorique
-		let expected_subsidy = if current_height == 0 {
-			INITIAL_REWARD
-		} else {
-			let prev_block = self.chain.last().unwrap();
-			let mut prev_fees = 0;
-			for tx in &prev_block.transactions {
-				if tx.tx_type != TransactionType::Coinbase {
-					prev_fees += tx.fee;
-				}
-			}
-			let prev_total_reward: u64 = prev_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(INITIAL_REWARD);
-			let prev_base_reward = prev_total_reward.saturating_sub(prev_fees);
-			Self::get_next_base_reward(prev_base_reward)
-		};
+		// 🛡️ CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
+        let mut expected_subsidy = INITIAL_REWARD;
+        for _ in 0..current_height {
+            expected_subsidy = Blockchain::get_next_base_reward(expected_subsidy);
+        }
 
 		// Premier passage : validation
 		for tx in &block.transactions {
@@ -643,23 +724,31 @@ impl Blockchain {
 					}
 				}
 			}
+			
+			// 🛡️ VÉRIFICATION STRICTE DES PARTS DE MINAGE (Anti-Triche P2Pool)
+			if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = &tx.tx_type {
+				let header_data = format!("{}{}{}{}", current_height, timestamp, block.header.previous_hash, nonce);
+				let hash_bytes = vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur VM P2Pool")?;
+				
+				if hex::encode(&hash_bytes) != *hash { 
+					return Err("❌ MiningShare: Hash falsifié !".into()); 
+				}
+				
+				let hash_bigint = num_bigint::BigUint::parse_bytes(hash.as_bytes(), 16).unwrap_or_default();
+				if hash_bigint > (&self.target * 20u32) { 
+					return Err("❌ MiningShare: Preuve de travail insuffisante !".into()); 
+				}
+			}
 
 			// Validité intrinsèque
 			if !tx.is_valid() { 
-				return Err("Signature ou preuve ZKP invalide.".to_string()); 
-			}
-
-			// Vérification balance LWE
-			let in_commitments: Vec<_> = tx.inputs.iter().map(|i| i.commitment.clone()).collect();
-			let out_commitments: Vec<_> = tx.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
-			if !crate::lattice::LWECommitment::verify_balance(&in_commitments, &out_commitments, tx.fee) {
-				return Err("Déséquilibre monétaire détecté dans une transaction !".to_string());
+				return Err("Signature WOTS+ invalide.".to_string()); 
 			}
 
 			// Anti-Double Dépense
 			for input in &tx.inputs {
-				if self.spent_key_images.contains(&input.pq_ring_signature.key_image) || 
-				   !block_key_images.insert(input.pq_ring_signature.key_image.clone()) {
+				if self.spent_key_images.contains(&input.mpc_ring.key_image) || 
+				   !block_key_images.insert(input.mpc_ring.key_image.clone()) {
 					return Err("Tentative de double-dépense détectée !".to_string());
 				}
 			}
@@ -668,7 +757,7 @@ impl Blockchain {
 			if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
 				let secret_bytes = hex::decode(secret).unwrap_or_default();
 				let provided_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
-				if provided_hash != tx.dilithium_signature {
+				if provided_hash != tx.public_key {
 					return Err("❌ HTLC Claim : secret invalide".into());
 				}
 			}
@@ -699,7 +788,6 @@ impl Blockchain {
 			final_block.header.target_hex = format!("{:0>64}", self.target.to_str_radix(16));
 		}
 		self.chain.push(final_block);
-		self.prune_old_signatures();
 		self.update_target();
 
 		println!("✅ Bloc {} validé. Masse monétaire intègre.", current_height);

@@ -3,6 +3,9 @@ use rand::{Rng, SeedableRng, RngCore};
 use rand::rngs::StdRng;
 
 // 🧮 MODULE LATTICE (Learning With Errors)
+// Uniquement pour la confidentialité des montants (LWE Commitments).
+// Les mathématiques de base sont les mêmes que Kyber/Dilithium (Standard NIST).
+
 pub const LATTICE_Q: u32 = 8380417; // Module premier (Idem Kyber)
 pub const LATTICE_DIM: usize = 4;   // Dimension vectorielle
 
@@ -27,9 +30,8 @@ impl LWECommitment {
             for j in 0..LATTICE_DIM {
                 sum += (a_matrix[i][j] as u64 * blinding_factor[j] as u64) % LATTICE_Q as u64;
             }
-            // LWE Error (Bruit gaussien simulé par petite plage)
             let error_term = rng.gen_range(0..5); 
-            // Encodage du montant sur la composante principale
+            // On encode le message dans la première composante
             let message_term = if i == 0 { (amount * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64 } else { 0 };
             
             t_vector[i] = ((sum + error_term as u64 + message_term) % LATTICE_Q as u64) as u32;
@@ -38,7 +40,7 @@ impl LWECommitment {
         LWECommitment { a_matrix_seed, t_vector }
     }
 
-    /// 🛠️ Génération déterministe de la Matrice Publique
+    /// 🔄 Génération déterministe de la matrice A via la graine publique
     pub fn generate_matrix(seed: [u8; 32]) -> Vec<Vec<u32>> {
         let mut a_matrix = vec![vec![0u32; LATTICE_DIM]; LATTICE_DIM];
         let mut seed_rng = StdRng::from_seed(seed);
@@ -48,31 +50,29 @@ impl LWECommitment {
         a_matrix
     }
 
-    /// ⚖️ Validation Homomorphe (Vérifie Input_Sum == Output_Sum) (Nœud)
-	pub fn verify_balance(inputs: &[LWECommitment], outputs: &[LWECommitment], fee: u64) -> bool {
-		let mut sum_in = 0u64;
-		let mut sum_out = 0u64;
-		
-		// On additionne les composantes t[0] (là où le message est encodé)
-		for i in inputs { sum_in = (sum_in + i.t_vector[0] as u64) % LATTICE_Q as u64; }
-		for o in outputs { sum_out = (sum_out + o.t_vector[0] as u64) % LATTICE_Q as u64; }
-		
-		// Le montant des frais est encodé de la même manière que les messages (m * Q/2)
-		let fee_encoded = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
-		let expected_out = (sum_out + fee_encoded) % LATTICE_Q as u64;
+    /// ⚖️ Validation Homomorphe (Vérifie Input_Sum == Output_Sum + Frais) (Nœud)
+    pub fn verify_balance(inputs: &[LWECommitment], outputs: &[LWECommitment], fee: u64) -> bool {
+        let mut sum_in = 0u64;
+        let mut sum_out = 0u64;
+        
+        // On additionne les composantes t[0] (là où le message est encodé)
+        for i in inputs { sum_in = (sum_in + i.t_vector[0] as u64) % LATTICE_Q as u64; }
+        for o in outputs { sum_out = (sum_out + o.t_vector[0] as u64) % LATTICE_Q as u64; }
+        
+        // Le montant des frais est encodé de la même manière que les messages
+        let fee_encoded = (fee * (LATTICE_Q as u64 / 2)) % LATTICE_Q as u64;
+        let expected_out = (sum_out + fee_encoded) % LATTICE_Q as u64;
 
-		// Calcul de la distance sur le cercle du modulo Q
-		let diff = if sum_in > expected_out {
-			let d = sum_in - expected_out;
-			std::cmp::min(d, LATTICE_Q as u64 - d)
-		} else {
-			let d = expected_out - sum_in;
-			std::cmp::min(d, LATTICE_Q as u64 - d)
-		};
+        let diff = if sum_in > expected_out {
+            let d = sum_in - expected_out;
+            std::cmp::min(d, LATTICE_Q as u64 - d)
+        } else {
+            let d = expected_out - sum_in;
+            std::cmp::min(d, LATTICE_Q as u64 - d)
+        };
 
-		// Tolérance : On accepte une dérive liée au bruit e. 
-		// Plus il y a d'inputs/outputs, plus le bruit augmente.
-		let noise_threshold = (inputs.len() + outputs.len()) as u64 * 10; 
-		diff < noise_threshold
-	}
- }
+        // Tolérance d'erreur due au "bruit" des mathématiques LWE
+        let noise_threshold = (inputs.len() + outputs.len()) as u64 * 10; 
+        diff < noise_threshold
+    }
+}

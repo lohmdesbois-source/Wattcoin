@@ -37,7 +37,8 @@ pub async fn start_api_server(
     chain: Arc<Mutex<Blockchain>>, 
     known_peers: crate::SharedPeers, 
     dex_pool: SharedPool,
-    active_peers: crate::network::ActivePeers
+    active_peers: crate::network::ActivePeers,
+	l2_db_file: String
 ) {
     // 💡 PURISME CYPHERPUNK : On lit le VRAI prix directement depuis le marbre de la blockchain !
     {
@@ -65,6 +66,7 @@ pub async fn start_api_server(
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
     let peers_filter = warp::any().map(move || Arc::clone(&known_peers));
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
+	let l2_file_filter = warp::any().map(move || l2_db_file.clone());
 	
 	// ===================== TRACKING HTLC BTC (pour atomic swap) =====================
 	let btc_htlcs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -121,8 +123,13 @@ pub async fn start_api_server(
 										 active_peers: crate::network::ActivePeers,
 										 btc_htlcs: Arc<Mutex<HashSet<String>>>| {
             
-            if tx.fee < 1000 && tx.tx_type != crate::transaction::TransactionType::Coinbase {
-                return warp::reply::with_status(warp::reply::json(&"❌ Frais de réseau insuffisants (Min: 1000)"), warp::http::StatusCode::BAD_REQUEST);
+            // 💡 ROUTAGE DOMAINE : Est-ce une transaction 100% L2 ?
+            let is_pure_l2 = tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
+            let min_fee = if is_pure_l2 { 100 } else { 1000 };
+
+            if tx.fee < min_fee && tx.tx_type != crate::transaction::TransactionType::Coinbase {
+                let err_msg = format!("❌ Frais de réseau insuffisants (Min: {} Flames)", min_fee);
+                return warp::reply::with_status(warp::reply::json(&err_msg), warp::http::StatusCode::BAD_REQUEST);
             }
 
             {
@@ -156,9 +163,9 @@ pub async fn start_api_server(
                 let pool_lock = mempool.lock().unwrap();
 
                 for input in &tx.inputs {
-                    let ki = &input.pq_ring_signature.key_image;
+                    let ki = &input.mpc_ring.key_image;
                     if chain_lock.spent_key_images.contains(ki) { return warp::reply::with_status(warp::reply::json(&"❌ Fonds déjà dépensés"), warp::http::StatusCode::BAD_REQUEST); }
-                    if pool_lock.iter().any(|m_tx| m_tx.inputs.iter().any(|m_in| &m_in.pq_ring_signature.key_image == ki)) { return warp::reply::with_status(warp::reply::json(&"❌ TX déjà en attente"), warp::http::StatusCode::BAD_REQUEST); }
+                    if pool_lock.iter().any(|m_tx| m_tx.inputs.iter().any(|m_in| &m_in.mpc_ring.key_image == ki)) { return warp::reply::with_status(warp::reply::json(&"❌ TX déjà en attente"), warp::http::StatusCode::BAD_REQUEST); }
                 }
             }
             
@@ -180,8 +187,6 @@ pub async fn start_api_server(
                 
                 if !timeout_passed { return warp::reply::with_status(warp::reply::json(&"⏳ Délai non expiré"), warp::http::StatusCode::BAD_REQUEST); }
             }
-
-            //println!("📥 [MEMPOOL] Nouvelle TX reçue via API sur le RELAY ! (propagée via P2P)");
 			
 			let mut pool = mempool.lock().unwrap();
             pool.push(tx.clone());
@@ -189,29 +194,56 @@ pub async fn start_api_server(
             let tx_clone = tx.clone();
             tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
             
-			println!("✅ Transaction acceptée et propagée (type: {:?})", tx.tx_type);
+			println!("✅ [MEMPOOL] Transaction acceptée et propagée (type: {:?})", tx.tx_type);
             warp::reply::with_status(warp::reply::json(&"✅ TX acceptée par le réseau"), warp::http::StatusCode::OK)
         });
     
-    // Dans api.rs (remplace la route all_transactions actuelle)
+    // route all_transactions du wallet
 	let get_all_txs = warp::get()
-		.and(warp::path("all_transactions"))
-		.and(chain_filter.clone())
-		.map(|chain_arc: Arc<Mutex<Blockchain>>| {
-			let chain_lock = chain_arc.lock().unwrap();
-			let mut enriched_txs = Vec::new();
-			
-			for block in &chain_lock.chain {
-				for tx in &block.transactions {
-					enriched_txs.push(serde_json::json!({
-						"height": block.header.index,
-						"timestamp": block.header.timestamp,
-						"transaction": tx
-					}));
-				}
-			}
-			warp::reply::json(&enriched_txs)
-		});
+        .and(warp::path("all_transactions"))
+        .and(chain_filter.clone())
+        .and(l2_file_filter.clone())
+        .map(|chain_arc: Arc<Mutex<Blockchain>>, l2_file: String| {
+            let chain_lock = chain_arc.lock().unwrap();
+            let mut enriched_txs = Vec::new();
+            
+            // Un petit dictionnaire pour retrouver la hauteur L1 à partir de son hash
+            let mut hash_to_height = std::collections::HashMap::new();
+
+            // 1. Lecture de la chaîne L1 (en RAM)
+            for block in &chain_lock.chain {
+                hash_to_height.insert(block.header.hash.clone(), block.header.index);
+                for tx in &block.transactions {
+                    enriched_txs.push(serde_json::json!({
+                        "height": block.header.index,
+                        "timestamp": block.header.timestamp,
+                        "transaction": tx,
+                        "is_l2": false
+                    }));
+                }
+            }
+
+            // 2. Lecture de la chaîne L2 (sur le Disque Dur)
+            if let Ok(data) = std::fs::read_to_string(&l2_file) {
+                if let Ok(l2_chain) = serde_json::from_str::<Vec<crate::block::MicroBlock>>(&data) {
+                    for mb in l2_chain {
+                        // On retrouve l'index du bloc L1 parent
+                        let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
+                        
+                        for tx in &mb.transactions {
+                            enriched_txs.push(serde_json::json!({
+                                "height": parent_height,
+                                "timestamp": mb.timestamp,
+                                "transaction": tx,
+                                "is_l2": true // ⚡ Permettra au Wallet de les différencier visuellement !
+                            }));
+                        }
+                    }
+                }
+            }
+
+            warp::reply::json(&enriched_txs)
+        });
         
     let get_decoys = warp::get()
         .and(warp::path!("get_decoys" / usize))
@@ -288,7 +320,7 @@ pub async fn start_api_server(
                 "blocks": chain_lock.chain.len(), 
                 "connected_peers": peers.lock().unwrap().len(),
                 "last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed), 
-                "version": "Wattcoin V2.1.8",
+                "version": "Wattcoin V2.1.11",
                 "difficulty_decimal": difficulty_decimal,
                 "target_hex": target_hex
             }))
@@ -539,7 +571,8 @@ pub async fn start_api_server(
 		} else {
 			// MODE PROD : Tor complet (ton code original intact)
 			Client::builder()
-				.proxy(reqwest::Proxy::all("socks5h://127.0.0.1:9150").unwrap())
+				// ✅ On utilise le port 9050 (démon Tor Linux classique)
+				.proxy(reqwest::Proxy::all("socks5h://127.0.0.1:9050").unwrap())
 				.timeout(Duration::from_secs(60))
 				.build()
 				.unwrap()

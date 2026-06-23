@@ -12,6 +12,8 @@ pub mod blockchain;
 pub mod transaction;
 pub mod network;
 pub mod api;
+pub mod wots;
+pub mod merkle_ring;
 pub mod lattice;
 
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 

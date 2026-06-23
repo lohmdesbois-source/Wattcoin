@@ -1,11 +1,10 @@
 use serde::{Serialize, Deserialize};
+use sha2::{Sha512, Digest};
+use crate::wots::WotsSignature;
 use crate::lattice::LWECommitment;
-use sha2::Digest;
+use crate::merkle_ring::MpcRingSignature;
 
-const LATTICE_Q: u32 = 8380417;
-const LATTICE_DIM: usize = 4;
-
-// ==================== SWAP CONTRACT (sécurisé) ====================
+// ==================== SWAP CONTRACT ====================
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapContract {
     pub buyer_watt_address: String,   
@@ -22,41 +21,32 @@ pub struct SwapContract {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransactionType {
     Coinbase,
+	MicroCoinbase,
     Standard,
     HTLCLock { hash: String, timeout_block: u64 },
     HTLCClaim { secret: String },
     HTLCRefund { hash: String },
-    DexSettlement { 
-        clearing_price_sats: u64, 
-        total_volume_flames: u64, 
-        swaps: Vec<SwapContract> 
-    },
+    DexSettlement { clearing_price_sats: u64, total_volume_flames: u64, swaps: Vec<SwapContract> },
     HTLCLottery { target_block: u64, player_pubkey: String },
     LotteryPayout { target_block: u64, winner_pubkey: String },
+	MiningShare { miner_address: String, nonce: u64, hash: String, timestamp: i64 },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PQLatticeRingSignature {
-    pub key_image: String,          
-    pub c0: String,                 
-    pub z_responses: Vec<Vec<u32>>, 
-    pub p_keys: Vec<Vec<u32>>, 
-}
-
+// 🛡️ L'Input Anonyme (MPC Ring Signature + Montant Masqué)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
-    pub pq_ring_inputs: Vec<String>,
-    pub pq_ring_signature: PQLatticeRingSignature,
-    pub commitment: LWECommitment,
-	pub source_height: u64,
+    pub mpc_ring: MpcRingSignature, 
+    pub commitment: LWECommitment,  
+    pub source_height: u64,
 }
 
+// 🛡️ L'Output Masqué (Capsule Kyber + Montant Masqué)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionOutput {
     pub stealth_address: String,      
     pub kyber_capsule: String,        
     pub aes_vault: String,            
-    pub lattice_commitment: LWECommitment,
+    pub lattice_commitment: LWECommitment, 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,89 +55,58 @@ pub struct Transaction {
     pub inputs: Vec<TransactionInput>,
     pub outputs: Vec<TransactionOutput>,
     pub fee: u64,
-    pub dilithium_signature: String,
+    pub wots_signature: Option<WotsSignature>, 
+    pub public_key: String, 
 }
 
 impl Transaction {
-    pub fn is_valid(&self) -> bool {
-        //println!("🔍 [VALIDATION] TX reçue → Type: {:?} | Dilithium: {} | Fee: {}", self.tx_type, self.dilithium_signature, self.fee);
+    pub fn hash_data(&self) -> [u8; 64] {
+        let mut hasher = Sha512::new();
+        let tx_data = format!("{:?}{:?}{}", self.tx_type, self.outputs, self.fee);
+        hasher.update(tx_data.as_bytes());
+        let result = hasher.finalize();
+        let mut hash_arr = [0u8; 64];
+        hash_arr.copy_from_slice(&result);
+        hash_arr
+    }
 
-                // ✅ 100% ATOMIC HTLC – plus de bypass dangereux
+    pub fn is_valid(&self) -> bool {
         if matches!(self.tx_type,
             TransactionType::Coinbase 
+			| TransactionType::MicroCoinbase
             | TransactionType::DexSettlement { .. } 
-            | TransactionType::LotteryPayout { .. }) 
-            || self.dilithium_signature == "PRUNED" {
+            | TransactionType::LotteryPayout { .. }
+			| TransactionType::MiningShare { .. }
+			) {
             return true;
         }
 
-        // HTLC réel : vérification cryptographique stricte
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
-			if secret.is_empty() { return false; }
-			let secret_bytes = hex::decode(secret).unwrap_or_default();
-			let real_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
-			return real_hash == self.dilithium_signature;
-		}
-
-        if let TransactionType::HTLCLock { hash, timeout_block } = &self.tx_type {
-            if hash.len() != 64 || *timeout_block == 0 { return false; }
+            if secret.is_empty() { return false; }
+            let secret_bytes = hex::decode(secret).unwrap_or_default();
+            let real_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
+            return real_hash == self.public_key; 
         }
 
-        if let TransactionType::HTLCRefund { hash } = &self.tx_type {
-            if hash.len() != 64 || self.inputs.is_empty() { return false; }
-        }
-
-        // 💡 Sécurité du Ticket de Loterie
-        if let TransactionType::HTLCLottery { .. } = &self.tx_type {
-            if self.outputs.is_empty() || self.outputs[0].stealth_address != "LOTTERY_RESERVE" { return false; }
-            if self.outputs[0].aes_vault != "10000000000" { return false; } // Le ticket DOIT coûter 10 WATT
-        }
-
-        // =================================================================
-        // ⚖️ 2. LE MASQUAGE POST-QUANTIQUE (LWE)
-        // =================================================================
+        // 1. Vérification Homomorphe des Montants (Lattice LWE)
         let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
         let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
-
-        if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { return false; }
-
-        // =================================================================
-        // 🌀 3. L'ÉPREUVE DU CERCLE LATTICE
-        // =================================================================
-        let tx_data = format!("{:?}{}", self.outputs, self.fee);
-
-        for input in &self.inputs {
-            let n = input.pq_ring_inputs.len();
-            let pq_ring = &input.pq_ring_signature;
-            
-            if n == 0 || pq_ring.z_responses.len() != n || pq_ring.p_keys.len() != n { return false; }
-
-            let mut current_c = hex::decode(&pq_ring.c0).unwrap_or_default();
-
-            for i in 0..n {
-                let pk_hex = &input.pq_ring_inputs[i];
-                let z_vec = &pq_ring.z_responses[i];
-                let p_vector = &pq_ring.p_keys[i]; 
-
-                let c_i = u32::from_le_bytes(current_c[0..4].try_into().unwrap_or([0;4])) % LATTICE_Q;
-
-                let mut r_i = vec![0u32; LATTICE_DIM];
-                for j in 0..LATTICE_DIM {
-                    let base_g = (j as u32 + 1) * 1337; 
-                    let part1 = (z_vec[j] as u64 * base_g as u64) % LATTICE_Q as u64;
-                    let part2 = (c_i as u64 * p_vector[j] as u64) % LATTICE_Q as u64;
-                    r_i[j] = ((part1 + part2) % LATTICE_Q as u64) as u32;
-                }
-
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(tx_data.as_bytes());
-                hasher.update(pk_hex.as_bytes()); 
-                for val in r_i { hasher.update(&val.to_le_bytes()); }
-                current_c = hasher.finalize().as_bytes().to_vec();
-            }
-
-            if hex::encode(&current_c) != pq_ring.c0 { return false; }
+        if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { 
+            return false; 
         }
-        true 
+
+        let tx_hash = self.hash_data();
+
+        // 2. Vérification de l'Anonymat de l'Expéditeur (MPC)
+        for input in &self.inputs {
+            if !input.mpc_ring.verify(&tx_hash) { return false; }
+        }
+
+        // 3. Vérification de la signature WOTS+ finale
+        if let Some(sig) = &self.wots_signature {
+            crate::wots::WotsKeyPair::verify(&self.public_key, sig, &tx_hash)
+        } else {
+            false
+        }
     }
 }
