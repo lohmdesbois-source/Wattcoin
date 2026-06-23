@@ -1,0 +1,34 @@
+name: Build Windows Wallet
+
+# Permet de lancer la compilation manuellement depuis GitHub
+on:
+  workflow_dispatch: 
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Installation des dépendances Frontend
+        run: npm install
+
+      - name: Build Tauri App (Génération du .msi / .exe)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # On laisse Tauri gérer la target MSVC native
+          args: ''
