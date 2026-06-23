@@ -14,7 +14,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24' # 🟢 FIX 1 : On passe à Node 24 pour éviter l'avertissement
+          node-version: '24'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -22,15 +22,17 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Installation des dépendances Frontend
-        # 🔴 FIX 2 : Mets le vrai nom de ton dossier ici (ex: Wattcoin-wallet)
         working-directory: ./desktop-wallet
         run: npm install
 
       - name: Build Tauri App (Génération du .msi)
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # 🔴 FIX 3 : Et remets exactement le même nom ici
           projectPath: ./desktop-wallet
           args: ''
+
+      - name: Upload l'installeur Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: ./desktop-wallet/target/release/bundle/msi/*.msi
