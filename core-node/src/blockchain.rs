@@ -15,9 +15,9 @@ const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
 const EMISSION_DECAY_SHIFT: u32 = 18;   // Ajusté pour ~21 ans
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
 pub const LOTTERY_TIME_BLOCK: u64 = 10; // 720 blocks pour un jour
-// 💡 Changement de Dataset tous les 255 blocs pour tuer les ASICs !
+// Changement de Dataset tous les 255 blocs pour tuer les ASICs !
 pub const EPOCH_BLOCKS: u64 = 255;  // toutes les 8H30 (8,5 Heures = 255 blocks)
-const MONTANT_STAKE: u64 = 1; // 10 000 Pour la prod (840 $)
+const MONTANT_STAKE: u64 = 100; // 10 000 Pour la prod (840 $)
 
 
 pub struct Blockchain {
