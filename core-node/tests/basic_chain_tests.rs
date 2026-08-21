@@ -5,7 +5,7 @@
 use wattcoin_core::block::{BlockHeader, Block};
 use wattcoin_core::blockchain::Blockchain;
 use wattcoin_core::transaction::{Transaction, TransactionType, TransactionOutput};
-use wattcoin_core::lattice::LWECommitment;
+use wattcoin_core::lattice::{LWECommitment, LATTICE_DIM}; // ⚡ FIX: Import de LATTICE_DIM
 
 
 #[test]
@@ -30,8 +30,8 @@ fn test_get_next_base_reward_decay_and_tail() {
 #[test]
 fn test_prepare_block_template_no_inflation() {
     let mut chain = Blockchain::new();
-    // ⚡ FIX: On récupère aussi les clés L2 (_l2_keys) renvoyées par la fonction
-    let (block, _target, _l2_keys) = chain.prepare_block_template(vec![], "test_miner");
+    // ⚡ FIX: On ajoute le 3ème argument "None" (l2_db_path)
+    let (block, _target, _l2_keys) = chain.prepare_block_template(vec![], "test_miner", None);
     assert_eq!(block.transactions.len(), 1);
     let reward: u64 = block.transactions[0].outputs[0].aes_vault.parse().unwrap();
     assert!(reward > 0 && reward <= 25_000_000_000);
@@ -48,7 +48,7 @@ fn test_spent_key_images_prevents_double_spend() {
 #[test]
 fn test_total_supply() {
     let mut chain = Blockchain::new();
-    // Ajout d’un vrai coinbase (structure réelle)
+    
     let coinbase = Transaction {
         tx_type: TransactionType::Coinbase,
         inputs: vec![],
@@ -56,16 +56,16 @@ fn test_total_supply() {
             stealth_address: "COINBASE_test".to_string(),
             kyber_capsule: "test".to_string(),
             aes_vault: "15000000000".to_string(),
+            // ⚡ FIX: Mise à jour de la structure LWECommitment (1024 dimensions en u64)
             lattice_commitment: LWECommitment {
-                a_matrix_seed: [0u8; 32],
-                t_vector: vec![0u32; 4],
+                t_vector: vec![0u64; LATTICE_DIM],
             },
         }],
         fee: 0,
-        // ⚡ FIX: Utilisation de WOTS+ et public_key
         public_key: "COINBASE_SIG".to_string(),
         wots_signature: None,
     };
+    
     let header = BlockHeader {
         index: 1,
         timestamp: chrono::Utc::now().timestamp(),
@@ -73,10 +73,14 @@ fn test_total_supply() {
         hash: "test".to_string(),
         nonce: 0,
         target_hex: "00".repeat(32),
-        // ⚡ FIX: Ajout de l'ancrage L2
         l2_root: String::from("NO_L2_FOR_TESTS"),
+        tx_root: String::new(), // ⚡ FIX: Ajout du tx_root manquant
     };
-    chain.chain.push(wattcoin_core::block::Block { header, transactions: vec![coinbase] });
+    
+    let mut block = Block { header, transactions: vec![coinbase] };
+    block.header.tx_root = block.calculate_tx_root(); // On calcule proprement la racine
+    
+    chain.chain.push(block);
     assert!(chain.get_total_supply() >= 15_000_000_000);
 }
 
@@ -84,7 +88,6 @@ fn test_total_supply() {
 fn test_validate_rejects_block_with_two_coinbases() {
     let mut chain = Blockchain::new();
 
-    // Deux coinbases valides (structure réelle)
     let coinbase1 = Transaction {
         tx_type: TransactionType::Coinbase,
         inputs: vec![],
@@ -92,13 +95,12 @@ fn test_validate_rejects_block_with_two_coinbases() {
             stealth_address: "COINBASE_test1".to_string(),
             kyber_capsule: "test1".to_string(),
             aes_vault: "15000000000".to_string(),
+            // ⚡ FIX: Mise à jour structure LWECommitment
             lattice_commitment: LWECommitment {
-                a_matrix_seed: [0u8; 32],
-                t_vector: vec![0u32; 4],
+                t_vector: vec![0u64; LATTICE_DIM],
             },
         }],
         fee: 0,
-        // ⚡ FIX: Utilisation de WOTS+ et public_key
         public_key: "COINBASE_SIG".to_string(),
         wots_signature: None,
     };
@@ -110,18 +112,16 @@ fn test_validate_rejects_block_with_two_coinbases() {
             stealth_address: "COINBASE_test2".to_string(),
             kyber_capsule: "test2".to_string(),
             aes_vault: "15000000000".to_string(),
+            // ⚡ FIX: Mise à jour structure LWECommitment
             lattice_commitment: LWECommitment {
-                a_matrix_seed: [0u8; 32],
-                t_vector: vec![0u32; 4],
+                t_vector: vec![0u64; LATTICE_DIM],
             },
         }],
         fee: 0,
-        // ⚡ FIX: Utilisation de WOTS+ et public_key
         public_key: "COINBASE_SIG".to_string(),
         wots_signature: None,
     };
 
-    // Bloc avec 2 coinbases (index 1 pour être juste après le genesis)
     let header = BlockHeader {
         index: 1,
         timestamp: chrono::Utc::now().timestamp(),
@@ -129,14 +129,18 @@ fn test_validate_rejects_block_with_two_coinbases() {
         hash: "fake_hash_for_test".to_string(),
         nonce: 0,
         target_hex: "00".repeat(32),
-        // ⚡ FIX: Ajout de l'ancrage L2
         l2_root: String::from("NO_L2_FOR_TESTS"),
+        tx_root: String::new(), // ⚡ FIX: Ajout du tx_root manquant
     };
 
-    let bad_block = Block {
+    let mut bad_block = Block {
         header,
         transactions: vec![coinbase1, coinbase2],
     };
+    
+    // On calcule la racine pour qu'elle passe le premier bouclier Merkle,
+    // afin de s'assurer que c'est bien la règle des "2 coinbases" qui le fait rejeter !
+    bad_block.header.tx_root = bad_block.calculate_tx_root();
 
     let result = chain.validate_and_add_external_block(bad_block);
     assert!(result.is_err(), "Le node doit rejeter un bloc avec 2 coinbases");
@@ -146,7 +150,8 @@ fn test_validate_rejects_block_with_two_coinbases() {
         err_msg.contains("Coinbase") 
         || err_msg.contains("Preuve de travail") 
         || err_msg.contains("Hash frauduleux")
-        || err_msg.contains("Index de bloc invalide"),
+        || err_msg.contains("Index de bloc invalide")
+        || err_msg.contains("Un bloc doit contenir exactement une Coinbase"), // Ajout du vrai message d'erreur possible
         "Le node doit rejeter le bloc (erreur actuelle : {})", err_msg
     );
 }

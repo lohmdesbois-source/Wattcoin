@@ -1,0 +1,5 @@
+[app]
+name = "wattcoin-wallet"
+stylized-name = "WattcoinWallet"
+domain = "ohm.com"
+template-pack = "egui"

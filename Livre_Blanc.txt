@@ -1,0 +1,32 @@
+📢 Le Manifeste Wattcoin : L'Anonymat à l'Épreuve du Temps
+Le monde de la blockchain est devenu un casino institutionnalisé. Nous avons échangé la promesse de la souveraineté financière contre des Smart Contracts vulnérables, des frais de gaz absurdes et une cryptographie qui sera obsolète à la seconde où l'informatique quantique s'éveillera.
+
+On nous a dit que l'anonymat post-quantique (ZK-STARKs) nécessitait des serveurs d'entreprise. On nous a dit que la cryptographie post-quantique et le routage Tor natif étaient trop lourds pour un simple téléphone. On nous a dit qu'un DEX On-Chain asynchrone était impossible sans "Liquidity Pools" exploitables par des bots MEV.
+
+Ils avaient tort. Wattcoin est la preuve du contraire.
+
+Wattcoin n'est pas un token de plus. C'est une architecture de base de données UTXO repensée de zéro en Rust, construite avec un seul objectif : la survie par la furtivité absolue.
+
+Nos Postulats :
+1) La cryptographie standard est morte : ECDSA tombera. Wattcoin utilise exclusivement des signatures WOTS+ (Hash-based) et des engagements matriciels de type Learning With Errors (LWE). C'est léger, c'est homomorphe, et ça résiste aux algorithmes de Shor.
+
+2) L'anonymat ne se négocie pas : Pas d'adresses publiques. MPC Ring Signatures (minimum 64 leurres), Stealth Addresses, et "Drip UTXO" forcé. Le protocole fragmente les montants en billets standards. Ta monnaie rendue est indiscernable de ton paiement.
+
+3) Les Smart Contracts sont des pièges : La complexité est l'ennemie de la sécurité. Nous n'avons pas d'EVM. Le DEX (Frequent Batch Auctions), les échanges atomiques cross-chain (HTLC), et la coopérative de minage (P2Pool) sont hardcodés dans le consensus L1. Zéro faille logique possible par un tiers.
+
+4) La décentralisation doit tenir dans une poche : Nous refusons l'élitisme matériel. Le portefeuille hybride (Tauri/Rust) exécute la cryptographie post-quantique et le routage Tor nativement, y compris sur Android.
+
+5) Le Layer 2 appartient au protocole : Les Rollups gérés par des VCs sont une hérésie. Le L2 de Wattcoin est un séquenceur asynchrone intégré au cœur du nœud. 128 micro-blocs par minute, ancrés cryptographiquement dans le PoW RandomX principal.
+
+6) Enregistrer ses DATA sur un réseau transparent peut avoir ses avantages mais aussi ses inconvénients, wattcoin propose justement de corriger ses inconvénients.
+
+
+
+Appel aux Armes (White-Hats & Cryptographes)
+Nous n'avons pas de financements VC, pas de pre-mine, pas d'ICO, et nous ne croyons pas aux audits payés à prix d'or qui tamponnent des passoires. Nous avons fait des choix cryptographiques radicaux et expérimentaux que la littérature académique juge "impossibles" ou "trop marginaux".
+
+Le Testnet est ouvert. Les sources sont sur GitHub (GPLv3).
+
+Venez casser nos matrices LWE. Venez désanonymiser nos anneaux WOTS+. Venez inonder notre Séquenceur L2. Tuez le réseau.
+
+C'est dans le feu que l'on forge l'acier. Bienvenue sur le Wattcoin Network.

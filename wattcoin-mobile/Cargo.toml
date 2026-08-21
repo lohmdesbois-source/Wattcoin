@@ -1,0 +1,80 @@
+[package]
+name = "wattcoin-wallet"
+version = "2.1.14"
+authors = ["ohm"]
+edition = "2024"
+resolver = "2"
+description = "Le portefeuille officiel du réseau Wattcoin"
+license = "GPLv3"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "wattcoin-wallet"
+path = "gen/bin/desktop.rs"
+
+[package.metadata.cargo-android]
+# 👇 On force le nom sans underscore pour correspondre à ton JNI !
+package-name = "com.ohm.wattcoin" 
+apk-label = "Wattcoin Wallet"
+res = "res"
+icon = "@mipmap/ic_launcher"
+app-dependencies = [
+    "com.google.android.material:material:1.8.0",
+]
+project-dependencies = [ "org.jetbrains.kotlin:kotlin-gradle-plugin:1.6.21" ]
+app-plugins = [ "org.jetbrains.kotlin.android" ]
+app-theme-parent = "Theme.MaterialComponents.DayNight.DarkActionBar"
+
+[package.metadata.deb]
+assets = [
+    # On indique à cargo-deb où prendre le binaire et où le mettre dans Linux
+    ["target/release/wattcoin-wallet", "usr/bin/wattcoin-wallet", "755"],
+    ["assets/logo_wattcoin.png", "usr/share/pixmaps/wattcoin.png", "644"],
+    ["assets/wattcoin.desktop", "usr/share/applications/", "644"]
+]
+
+[dependencies]
+eframe = { version = "0.29.0", features = ["default", "android-native-activity"] }
+egui_extras = { version = "0.29.0", features = ["all_loaders"] }
+image = { version = "0.24.9", features = ["png", "jpeg"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bip39 = { version = "2.0.0", features = ["french"] }
+hex = "0.4.3"
+rand = "0.8.5"
+bitcoin = { version = "0.32.0", features = ["std", "base64", "rand"] }
+aes-gcm = "0.10.3"
+pbkdf2 = "0.12.2"
+sha2 = "0.10.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "rustls-tls"] }
+pqc_kyber = "0.7.1"
+arti-client = { version = "0.22.0", default-features = false, features = ["tokio", "rustls", "onion-service-client"] }
+tor-rtcompat = { version = "0.22.0", default-features = false, features = ["tokio", "rustls"] }
+once_cell = "1.19.0"
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+unicode-normalization = "0.1"
+base64 = "0.22.1"
+qrcode = "0.14.1"
+rqrr = "0.10.1"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+log = "0.4.33"
+arboard = "3.2"
+wattcoin_core = { path = "../core-node" }
+wattcoin_name_service = { path = "../../wattcoin_name_service/core-node" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = "0.30"
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.13.1"
+jni = "0.21" # 👈 Le pont Java n'est compilé QUE sur Android !
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.9"
+rfd = "0.14"
+
+[profile.dev]
+opt-level = 3 # Optimise l'application à fond, comme en mode Release !

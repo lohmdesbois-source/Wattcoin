@@ -4,20 +4,21 @@ use std::fs;
 use num_bigint::BigUint;
 use std::collections::HashSet;
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXVM};
-use rand::seq::SliceRandom;
 use crate::WattError;
 use sha2::Digest;  
 
 const FLAME: u64 = 1_000_000_000;
-const MATURITY_BLOCKS: u64 = 3; // 100
+const MATURITY_BLOCKS: u64 = 3; // 12 Prod
 const EXPECTED_BLOCK_TIME: u64 = 120;    // 2 mins (120 s)
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
 const EMISSION_DECAY_SHIFT: u32 = 18;   // Ajusté pour ~21 ans
 const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
 pub const LOTTERY_TIME_BLOCK: u64 = 10; // 720 blocks pour un jour
-// 💡 Changement de Dataset tous les 51 blocs pour tuer les ASICs !
+// 💡 Changement de Dataset tous les 255 blocs pour tuer les ASICs !
 pub const EPOCH_BLOCKS: u64 = 255;  // toutes les 8H30 (8,5 Heures = 255 blocks)
+const MONTANT_STAKE: u64 = 1; // 10 000 Pour la prod (840 $)
+
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
@@ -41,16 +42,20 @@ impl Blockchain {
     
     // 💡 Trouve la graine RandomX appropriée pour une hauteur de bloc donnée
     pub fn get_epoch_seed(&self, height: u64) -> String {
-        if height <= EPOCH_BLOCKS {
-            return self.chain[0].header.hash.clone(); // Ère 0 : On utilise le Genesis
-        }
-        let target_block = ((height - 1) / EPOCH_BLOCKS) * EPOCH_BLOCKS;
-        if (target_block as usize) < self.chain.len() {
-            self.chain[target_block as usize].header.hash.clone()
-        } else {
-            self.chain[0].header.hash.clone() // Fallback sécurité
-        }
-    }
+		if height <= EPOCH_BLOCKS {
+			return self.chain[0].header.hash.clone(); // Ère 0 : On utilise le Genesis
+		}
+		let epoch = (height - 1) / EPOCH_BLOCKS;
+		// 💡 FIX : On recule de 11 blocs dans l'époque précédente pour être SÛR 
+		// que le bloc est déjà miné par tout le monde lors du warm-up !
+		let target_block = (epoch * EPOCH_BLOCKS).saturating_sub(11);
+		
+		if (target_block as usize) < self.chain.len() {
+			self.chain[target_block as usize].header.hash.clone()
+		} else {
+			self.chain[0].header.hash.clone() // Fallback sécurité
+		}
+	}
 
     pub fn load_from_disk(path: &str) -> Result<Self, WattError> {
         let path_obj = std::path::Path::new(path);
@@ -176,87 +181,246 @@ impl Blockchain {
         supply
     }
 
-    // 💡 Calcul du Jackpot en cours - VERSION PERSISTANTE (rollover automatique)
-    pub fn get_jackpot_info(&self, target_height: u64) -> (u64, Vec<(String, String)>) {
-		let mut tickets = Vec::new();
-		let mut pot = 0u64;
+    // On ajoute le paramètre `l2_db_path` pour faire le pont avec le disque
+    pub fn get_jackpot_info(&self, _target_height: u64, l2_db_path: Option<&str>) -> (u64, Vec<(String, String)>) {
+        let mut tickets = Vec::new();
+        let mut pot = 0u64;
 
-		// 💡 OPTIMISATION ARCHITECTE : On lit la blockchain à l'envers (.rev())
-		for block in self.chain.iter().rev() {
-			for tx in &block.transactions {
-				
-				// 1. On récupère les tickets joués pour CE tirage précis
-				if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
-					if *target_block == target_height && !tx.outputs.is_empty() {
-						let ticket_id = tx.outputs[0].kyber_capsule.clone();
-						tickets.push((ticket_id, player_pubkey.clone()));
-					}
-				}
+        // 💡 NOUVEAU : On garde une trace des blocs L1 "récents" (post-tirage) pour filtrer le L2
+        let mut valid_l1_hashes = std::collections::HashSet::new();
 
-				// 2. On ajoute l'argent à la cagnotte (Taxes + Prix des tickets)
-				if tx.tx_type == TransactionType::Coinbase || matches!(tx.tx_type, TransactionType::HTLCLottery { .. }) {
-					for out in &tx.outputs {
-						if out.stealth_address == "LOTTERY_RESERVE" {
-							pot += out.aes_vault.parse::<u64>().unwrap_or(0);
-						}
-					}
-				}
+        // 1. Lecture robuste du L1 (KISS)
+        'block_loop: for block in self.chain.iter().rev() {
+            // On enregistre ce bloc dans la liste blanche
+            valid_l1_hashes.insert(block.header.hash.clone()); 
+            
+            for tx in &block.transactions {
+                // On prend TOUS les tickets trouvés
+                if let TransactionType::HTLCLottery { player_pubkey, .. } = &tx.tx_type {
+                    if !tx.outputs.is_empty() {
+                        let ticket_id = tx.outputs[0].kyber_capsule.clone();
+                        tickets.push((ticket_id, player_pubkey.clone()));
+                    }
+                }
+                
+                if tx.tx_type == TransactionType::Coinbase || matches!(tx.tx_type, TransactionType::HTLCLottery { .. }) {
+                    for out in &tx.outputs {
+                        if out.stealth_address == "LOTTERY_RESERVE" {
+                            pot += out.aes_vault.parse::<u64>().unwrap_or(0);
+                        }
+                    }
+                }
+                
+                // 🛑 LE FREIN : Dès qu'on tombe sur le PRÉCÉDENT tirage, on arrête de remonter le temps !
+                if let TransactionType::LotteryPayout { .. } = &tx.tx_type {
+                    break 'block_loop; 
+                }
+            }
+        }
 
-				// 3. 🛑 LE STOP OPTIMISÉ : On croise le dernier paiement du Loto !
-				// Cela signifie que la cagnotte des blocs précédents a déjà été vidée. On arrête de remonter le temps.
-				if let TransactionType::LotteryPayout { .. } = &tx.tx_type {
-					tickets.sort_by(|a, b| a.0.cmp(&b.0));
-					return (pot, tickets);
-				}
-			}
-		}
+        // 2. ⚡ Aspiration L2 (Corrigée avec le filtre chronologique)
+        if let Some(path) = l2_db_path {
+            if let Ok(data) = std::fs::read_to_string(path) {
+                if let Ok(l2_chain) = serde_json::from_str::<Vec<crate::block::MicroBlock>>(&data) {
+                    for mb in l2_chain {
+                        // 💡 LE FILTRE EST ICI : On ignore les micro-blocs ancrés à un vieux bloc L1 (déjà purgé)
+                        if valid_l1_hashes.contains(&mb.l1_parent_hash) {
+                            for tx in &mb.transactions {
+                                if tx.tx_type == TransactionType::MicroCoinbase {
+                                    for out in &tx.outputs {
+                                        if out.stealth_address == "LOTTERY_RESERVE" {
+                                            pot += out.aes_vault.parse::<u64>().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-		tickets.sort_by(|a, b| a.0.cmp(&b.0));
-		(pot, tickets)
-	}
+        // On trie pour garantir un gagnant déterministe
+        tickets.sort_by(|a, b| a.0.cmp(&b.0));
+        (pot, tickets)
+    }
 
-    pub fn get_current_jackpot(&self) -> (u64, Vec<(String, String)>) {
+    pub fn get_current_jackpot(&self, l2_db_path: Option<&str>) -> (u64, Vec<(String, String)>) {
 		let current_height = self.chain.len() as u64;
-		// Calcul du prochain palier 
 		let next_draw = current_height + (LOTTERY_TIME_BLOCK - (current_height % LOTTERY_TIME_BLOCK));
 		
-		// On réutilise la vraie logique de calcul !
-		self.get_jackpot_info(next_draw)
+		self.get_jackpot_info(next_draw, l2_db_path)
 	}
 
-    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str) -> (Block, BigUint, Vec<crate::wots::WotsKeyPair>) {
+    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str, l2_db_path: Option<&str>) -> (Block, BigUint, Vec<crate::wots::WotsKeyPair>) {
         let current_height = self.chain.len() as u64;
         println!("\n⏳ Préparation du Bloc {}...", current_height);
 
         let mut valid_transactions = Vec::new();
         let mut l1_total_fees = 0;
         let mut temp_spent_images = self.spent_key_images.clone(); 
-
+		
+		// ====================================================================
+        // BOUCLIER DE MATURITÉ NODE-SIDE (Infaillible)
+        // Le Nœud calcule lui-même les clés immatures en scannant les derniers blocs.
+        // On ne fait plus confiance au Wallet !
         // ====================================================================
-        // 🧱 TRAITEMENT DU MEMPOOL CLASSIQUE (L1 + L2)
-        // ====================================================================
-        for tx in &transactions {
-            if tx.is_valid() {
-                let mut immature = false;
-                if tx.tx_type != TransactionType::Coinbase {
-                    for input in &tx.inputs {
-                        if input.source_height > 0 {
-                            let confirmations = current_height.saturating_sub(input.source_height);
-                            if confirmations < MATURITY_BLOCKS {
-                                immature = true;
-                                println!("⛔ Input immature : {} confirmations < {}", confirmations, MATURITY_BLOCKS);
-                                break;
-                            }
+        let mut immature_pubkeys = std::collections::HashSet::new();
+        let scan_limit = current_height.saturating_sub(MATURITY_BLOCKS);
+        
+        for block in self.chain.iter().rev() {
+            if block.header.index <= scan_limit { break; }
+            for past_tx in &block.transactions {
+                if matches!(past_tx.tx_type, TransactionType::Coinbase | TransactionType::LotteryPayout { .. }) {
+                    for out in &past_tx.outputs {
+                        if out.stealth_address.starts_with("COINBASE_") {
+                            immature_pubkeys.insert(out.stealth_address.replace("COINBASE_", ""));
+                        } else if out.stealth_address.starts_with("JACKPOT_") {
+                            immature_pubkeys.insert(out.stealth_address.replace("JACKPOT_", ""));
                         }
                     }
                 }
-                if immature { continue; }
+            }
+        }
+
+        // ====================================================================
+        // TRAITEMENT DU MEMPOOL CLASSIQUE (L1 + L2)
+        // ====================================================================
+        for tx in &transactions {
+            if tx.is_valid() {
+                
+                // BOUCLIER : On laisse les TX pures L2 au Séquenceur !
+                let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
+                if is_pure_l2 && tx.tx_type != TransactionType::MicroCoinbase {
+                    continue; // Le L1 l'ignore, elle reste dans le mempool pour le L2
+                }
+				
+                let mut immature = false;
+                if tx.tx_type != TransactionType::Coinbase {
+                    for input in &tx.inputs {
+                        for decoy in &input.mpc_ring.ring_decoys {
+                            if immature_pubkeys.contains(decoy) {
+                                immature = true;
+                                break;
+                            }
+                        }
+                        if immature { break; }
+                    }
+                }
+                if immature { 
+                    println!("⛔ Rejet : Tentative de dépense d'une récompense immature (Coinbase/Loto < {} blocs) !", MATURITY_BLOCKS);
+                    continue; 
+                }
 
                 if matches!(tx.tx_type, TransactionType::LotteryPayout { .. }) {
                     valid_transactions.push(tx.clone()); continue;
                 }
+				
+				// BOUCLIER HTLC
+                if let TransactionType::HTLCRefund { hash } = &tx.tx_type {
+                    let mut timeout = 0;
+                    let mut lock_found = false;
+                    
+                    for b in self.chain.iter().rev() {
+                        for past_tx in &b.transactions {
+                            if let TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
+                                if lock_hash == hash {
+                                    timeout = *timeout_block;
+                                    lock_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if lock_found { break; }
+                    }
+                    
+                    if !lock_found {
+                        println!("⛔ HTLCRefund : Contrat d'origine introuvable !");
+                        continue; // On rejette
+                    }
+                    if current_height < timeout {
+                        println!("⛔ HTLCRefund : Délai temporel non expiré (Actuel: {} < Requis: {}).", current_height, timeout);
+                        continue; // On rejette
+                    }
+                }
+				
+				// BOUCLIER MINEUR L1 : Vérification stricte du Staking L2
+				if let TransactionType::L2Stake { l2_name, .. } = &tx.tx_type {
+					if tx.outputs.is_empty() {
+						println!("⛔ Rejet : Un L2Stake doit contenir un output de verrouillage !");
+						continue; // Utilise 'return Err(...)' dans validate_and_add_external_block
+					}
+					let stake_amount: u64 = tx.outputs[0].aes_vault.parse().unwrap_or(0);
+					let required_stake = MONTANT_STAKE * FLAME;
+					
+					if stake_amount < required_stake {
+						println!("⛔ Rejet : Le staking pour '{}' est insuffisant (Requis: {} WATT) !", l2_name, MONTANT_STAKE);
+						continue;
+					}
+					if !tx.outputs[0].stealth_address.starts_with("L2_STAKE_") {
+						println!("⛔ Rejet : L'adresse de destination du Staking est invalide !");
+						continue;
+					}
 
-                let mut double_spend = false;
+					// 🛡️ VÉRIFICATION HOMOMORPHE ABSOLUE (Analyse du bruit post-quantique)
+					// Comme le Blinding Factor est nul, la valeur est juste (montant + bruit).
+					// On vérifie que la déviation ne dépasse pas l'amplitude théorique du bruit CBD (24 max).
+					let mut is_valid_math = true;
+					for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
+						let expected = if i == 0 { stake_amount } else { 0 };
+						let diff = val.wrapping_sub(expected);
+						if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
+							is_valid_math = false; break;
+						}
+					}
+					
+					if !is_valid_math {
+						println!("⛔ Rejet : Fraude mathématique ! L'engagement Lattice ne correspond pas au montant déclaré.");
+						continue;
+					}
+				}
+				
+				// On vérifie la transaction du bridge
+				if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
+					if tx.outputs.is_empty() {
+						println!("⛔ Rejet : Un L2BridgeLock doit contenir un output de verrouillage !");
+						continue; // 💡 REMPLACE PAR `return Err(...)` dans validate_and_add_external_block
+					}
+
+					let official_bridge_address = format!("BRIDGE_L2_{}", l2_target_name.to_uppercase());
+					
+					if tx.outputs[0].stealth_address != official_bridge_address {
+						println!("⛔ Rejet : Les fonds doivent être envoyés au contrat L2 strict : {}", official_bridge_address);
+						continue;
+					}
+
+					let bridge_amount: u64 = tx.outputs[0].aes_vault.parse().unwrap_or(0);
+					
+					if bridge_amount == 0 {
+						println!("⛔ Rejet : Le montant du bridge est invalide ou nul !");
+						continue;
+					}
+
+					// 🛡️ LE BOUCLIER LATTICE POUR LE BRIDGE (La pièce manquante !)
+					let mut is_valid_math = true;
+					for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
+						let expected = if i == 0 { bridge_amount } else { 0 };
+						let diff = val.wrapping_sub(expected);
+						if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
+							is_valid_math = false; break;
+						}
+					}
+					
+					if !is_valid_math {
+						println!("⛔ Rejet : Fraude mathématique ! L'engagement Lattice du Bridge ne correspond pas au montant déclaré.");
+						continue; // 💡 REMPLACE PAR `return Err(...)` dans validate_and_add_external_block
+					}
+
+					println!("🌉 [BRIDGE L2] {} Flames verrouillés publiquement pour le réseau {}", bridge_amount, l2_target_name);
+				}
+
+                // ANTI-DOUBLE DÉPENSE
+				let mut double_spend = false;
                 if tx.tx_type != TransactionType::Coinbase {
                     for input in &tx.inputs {
                         if temp_spent_images.contains(&input.mpc_ring.key_image) {
@@ -265,7 +429,8 @@ impl Blockchain {
                     }
                 }
                 
-                if !double_spend {
+                // VALIDATION FINALE : On ajoute la transaction au bloc
+				if !double_spend {
                     l1_total_fees += tx.fee; 
                     valid_transactions.push(tx.clone()); 
                     for input in &tx.inputs { temp_spent_images.insert(input.mpc_ring.key_image.clone()); }
@@ -287,104 +452,144 @@ impl Blockchain {
         if current_height > 1 { println!("⚙️  Dernier bloc miné en {}s", time_taken); }
         println!("🎯 Difficulté cible : {}.{:02}x", diff_int, diff_dec);
 
-        // 🛡️ CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
+        // CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
         let mut expected_subsidy = INITIAL_REWARD;
         for _ in 0..current_height {
             expected_subsidy = Blockchain::get_next_base_reward(expected_subsidy);
         }
 
-        // 🛡️ BOUCLIER ANTI-FERMES DE MINAGE ("L'Effet Robin des Bois")
-        let mut slashed_for_jackpot = 0;
         let mut allowed_subsidy = expected_subsidy;
+		
+        // 1. La récompense de base (Subvention pure)
+        if allowed_subsidy < TAIL_EMISSION { allowed_subsidy = TAIL_EMISSION; }
+        println!("📉 Émission monétaire : {:.9} Watts", (allowed_subsidy as f64) / (FLAME as f64));
 
-        // On ne punit qu'APRÈS la phase de calibrage de la difficulté (ex: après 17 blocs)
+        // BOUCLIER ANTI-FERMES DE MINAGE ("L'Effet Robin des Bois")
+        let mut slashed_for_jackpot = 0;
+
+        // 2. On punit le mineur en tapant dans sa subvention ACTUELLE (même si c'est la Tail Emission)
         if current_height > 17 && time_taken < 30 {
             let time_penalty_ratio = time_taken as f64 / 30.0;
-            allowed_subsidy = (expected_subsidy as f64 * time_penalty_ratio) as u64;
-            slashed_for_jackpot = expected_subsidy.saturating_sub(allowed_subsidy);
             
-            println!("🚨 [ANTI-FARM] Hashrate extrême détecté ! (Bloc trouvé en {}s), Pénalité de {}.", time_taken, allowed_subsidy );
+            // On calcule le slash sur `allowed_subsidy` !
+            let penalty_subsidy = (allowed_subsidy as f64 * time_penalty_ratio) as u64;
+            slashed_for_jackpot = allowed_subsidy.saturating_sub(penalty_subsidy);
+            allowed_subsidy = penalty_subsidy; // La nouvelle limite autorisée
+            
+            println!("🚨 [ANTI-FARM] Hashrate extrême détecté ! (Bloc trouvé en {}s).", time_taken);
             println!("🎰 [ROBIN DES BOIS] Pénalité appliquée : {} WATT confisqués et envoyés au Jackpot L1 !", slashed_for_jackpot as f64 / 1_000_000_000.0);
         }
 
         // Note : expected_subsidy intègre DÉJÀ la vérification du TAIL_EMISSION
         // grâce à notre fonction get_next_base_reward() !
-        // 💡 Taxe loterie TOUJOURS collectée (1% des frais)
+        // Taxe loterie TOUJOURS collectée (1% des frais)
         // On ne la conditionne plus → le pot peut s'accumuler normalement
-        // 💡 DISTRIBUTION DES FRAIS ET DE LA LOTERIE
-		// 💡 Les taxes de base + l'argent confisqué aux gros mineurs vont dans la Loterie !
+        // DISTRIBUTION DES FRAIS ET DE LA LOTERIE
+		// Les taxes de base + l'argent confisqué aux gros mineurs vont dans la Loterie !
         let l1_lottery_tax = l1_total_fees / 100;
         let l1_miner_fees = l1_total_fees - l1_lottery_tax;
         let total_lottery_tax = l1_lottery_tax + slashed_for_jackpot; 
 
-        // La récompense qui reste à partager (Base autorisée + Frais)
-        if allowed_subsidy < TAIL_EMISSION { allowed_subsidy = TAIL_EMISSION; }
-		let calculated_reward = allowed_subsidy + l1_miner_fees;
-
-        println!("📉 Émission monétaire : {:.9} Watts", (expected_subsidy as f64) / (FLAME as f64));
-        println!("📉 Le mineur L1 gagne : {:.9} Watts (Frais L1 {:.9})", (calculated_reward as f64) / (FLAME as f64), l1_miner_fees);
+        
+        println!("📉 Le mineur L1 gagne (100% des frais restants) : {:.9} Watts", (l1_miner_fees as f64) / (FLAME as f64));
 		
-		// ⚡ RÉPARTITION ÉQUITABLE (80/20) P2POOL NATIF
+		// RÉPARTITION ÉQUITABLE (80/20) P2POOL NATIF SUR LA SUBVENTION UNIQUEMENT
         let mut coinbase_outputs = Vec::new();
         let mut valid_shares = Vec::new();
 
-        // On récupère un maximum de 50 parts de minage pour éviter de saturer le bloc
+        // OPTIMISATION ZÉRO-DAY : On vérifie s'il y a des parts avant de charger RandomX !
+        let mut has_shares = false;
         for tx in &transactions {
-            if let TransactionType::MiningShare { .. } = &tx.tx_type {
-                if valid_shares.len() < 50 { valid_shares.push(tx.clone()); }
+            if matches!(tx.tx_type, TransactionType::MiningShare { .. }) {
+                has_shares = true;
+                break;
+            }
+        }
+
+        // On n'allume la lourde Machine Virtuelle QUE si c'est nécessaire
+        if has_shares {
+            // On initialise une VM légère pour valider les parts !
+            let share_height = current_height.saturating_sub(1);
+            let share_prev_hash = if self.chain.len() >= 2 {
+                self.chain[self.chain.len() - 2].header.hash.clone()
+            } else {
+                self.chain[0].header.hash.clone()
+            };
+            let share_seed = self.get_epoch_seed(share_height);
+
+            let flags = randomx_rs::RandomXFlag::get_recommended_flags();
+            let cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).unwrap();
+            let vm = randomx_rs::RandomXVM::new(flags, Some(cache), None).unwrap();
+
+            for tx in &transactions {
+                if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = &tx.tx_type {
+                    let parts: Vec<&str> = tx.public_key.split('_').collect();
+                    let l2_root = parts.get(0).cloned().unwrap_or("");
+                    let tx_root = parts.get(1).cloned().unwrap_or("");
+                    
+                    // On valide avec les paramètres temporels du bloc précédent
+                    let header_data = format!("{}{}{}{}{}{}", share_height, timestamp, share_prev_hash, nonce, l2_root, tx_root);
+                    
+                    if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
+                        if hex::encode(&hash_bytes) == *hash {
+                            if valid_shares.len() < 50 { valid_shares.push(tx.clone()); }
+                        }
+                    }
+                }
             }
         }
 
         if !valid_shares.is_empty() {
-			let finder_reward = calculated_reward * 20 / 100; 
-			
-			// 💡 FIX 1: On soustrait le finder_reward au lieu de recalculer 80% 
-			// pour ne pas perdre la décimale du split.
-			let total_community_reward = calculated_reward - finder_reward; 
-			
-			let share_reward = total_community_reward / valid_shares.len() as u64; 
-			
-			// 💡 FIX 2: On calcule le reste de la division (le modulo)
-			let remainder = total_community_reward % valid_shares.len() as u64;
-			
-			// 💡 On donne les poussières (Flames restants) au validateur pour ne rien perdre !
-			let final_finder_reward = finder_reward + remainder;
+            // 1. Calcul de la part théorique globale de la communauté (80% de la SUBVENTION SEULEMENT)
+            let base_community_reward = allowed_subsidy * 80 / 100; 
+            
+            // 2. Calcul de la part individuelle (division entière)
+            let share_reward = base_community_reward / valid_shares.len() as u64; 
+            
+            // 3. Recalcul EXACT de ce qui sera réellement distribué
+            let exact_community_reward = share_reward * valid_shares.len() as u64; 
+            
+            // 4. Le validateur prend le reste de la subvention (20% + poussière) + 100% DES FRAIS L1
+            let final_finder_reward = (allowed_subsidy - exact_community_reward) + l1_miner_fees;
 
-			println!("🤝 [P2POOL] Répartition : Validateur ({:.9} Watts), Communauté ({:.9} Watts).", 
+            println!("🤝 [P2POOL] Répartition : Validateur (Base {:.9}  + Frais {:.9}  = {:.9} Watts).\nCommunauté ({:.9} Watts).", 
+                ((allowed_subsidy - exact_community_reward)  as f64) / (FLAME as f64),
+				(l1_miner_fees as f64) / (FLAME as f64),
 				(final_finder_reward as f64) / (FLAME as f64),
-				(total_community_reward as f64) / (FLAME as f64)
-			);
+                (exact_community_reward as f64) / (FLAME as f64)
+            );
             println!("🤝 [P2POOL] Chacun des {} petits mineurs reçoit : {:.9} Watts", 
                 valid_shares.len(), 
                 (share_reward as f64) / (FLAME as f64)
             );
 
-            // 1. Output pour le trouveur (20%)
+            // 1. Output pour le trouveur (Subvention 20% + TOUS les frais)
             coinbase_outputs.push(crate::transaction::TransactionOutput {
-				stealth_address: format!("COINBASE_{}", miner_address), 
-				kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
-				aes_vault: final_finder_reward.to_string(), // <- ICI
-				lattice_commitment: crate::lattice::LWECommitment::commit(final_finder_reward, [0, 0, 0, 0]),
-			});
+                stealth_address: format!("COINBASE_{}", miner_address), 
+                kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
+                aes_vault: final_finder_reward.to_string(), 
+                lattice_commitment: crate::lattice::LWECommitment::commit(final_finder_reward, &[0u64; crate::lattice::LATTICE_DIM]),
+            });
 
-            // 2. Outputs pour la communauté (80%)
+            // 2. Outputs pour la communauté
             for (i, share_tx) in valid_shares.iter().enumerate() {
                 if let TransactionType::MiningShare { miner_address: share_addr, .. } = &share_tx.tx_type {
                     coinbase_outputs.push(crate::transaction::TransactionOutput {
                         stealth_address: format!("COINBASE_{}", share_addr), 
                         kyber_capsule: format!("SHARE_CAPSULE_{}_{}", current_height, i),
                         aes_vault: share_reward.to_string(), 
-                        lattice_commitment: crate::lattice::LWECommitment::commit(share_reward, [0, 0, 0, 0]),
+                        lattice_commitment: crate::lattice::LWECommitment::commit(share_reward, &[0u64; crate::lattice::LATTICE_DIM]),
                     });
                 }
             }
         } else {
-            // S'il est tout seul sur le réseau, il prend les 100% de la récompense autorisée
+            // S'il est tout seul sur le réseau, il prend les 100% de la subvention + 100% des frais
+            let total_solo_reward = allowed_subsidy + l1_miner_fees;
             coinbase_outputs.push(crate::transaction::TransactionOutput {
                 stealth_address: format!("COINBASE_{}", miner_address), 
                 kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
-                aes_vault: calculated_reward.to_string(), 
-                lattice_commitment: crate::lattice::LWECommitment::commit(calculated_reward, [0, 0, 0, 0]),
+                aes_vault: total_solo_reward.to_string(), 
+                lattice_commitment: crate::lattice::LWECommitment::commit(total_solo_reward, &[0u64; crate::lattice::LATTICE_DIM]),
             });
         }
 
@@ -394,27 +599,62 @@ impl Blockchain {
                 stealth_address: "LOTTERY_RESERVE".to_string(), 
                 kyber_capsule: format!("TAX_CAPSULE_{}", current_height),
                 aes_vault: total_lottery_tax.to_string(), 
-                lattice_commitment: crate::lattice::LWECommitment::commit(total_lottery_tax, [0, 0, 0, 0]),
+                lattice_commitment: crate::lattice::LWECommitment::commit(total_lottery_tax, &[0u64; crate::lattice::LATTICE_DIM]),
             });
         }
 		
 		// ===================== LOTERIE L1 =====================
-        // ✅ On s'assure juste de ne pas tirer au bloc 0
-		if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
-            let (jackpot_amount, tickets) = self.get_jackpot_info(current_height);
+        // On s'assure juste de ne pas tirer au bloc 0
+        if current_height % LOTTERY_TIME_BLOCK == 0 && current_height > 0 {
+            // On récupère l'historique...
+            let (mut jackpot_amount, mut tickets) = self.get_jackpot_info(current_height, l2_db_path);
+            
+            // On inclut les tickets du bloc courant (ceux du mempool validés)
+            for tx in &valid_transactions {
+                if let TransactionType::HTLCLottery { target_block, player_pubkey } = &tx.tx_type {
+                    if *target_block == current_height && !tx.outputs.is_empty() {
+                        let ticket_id = tx.outputs[0].kyber_capsule.clone();
+                        tickets.push((ticket_id, player_pubkey.clone()));
+                        
+                        // On ajoute le prix de ce ticket à la cagnotte immédiate
+                        for out in &tx.outputs {
+                            if out.stealth_address == "LOTTERY_RESERVE" {
+                                jackpot_amount += out.aes_vault.parse::<u64>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // On trie à nouveau pour garantir un ordre déterministe avant le VRF
+            tickets.sort_by(|a, b| a.0.cmp(&b.0));
             
             if !tickets.is_empty() {
-                let winner_ticket = &tickets[0];
+                
+                // TRIBUNAL VRF POUR LE LOTO (L'entropie vient du hash du bloc précédent)
+                let last_block_hash = &previous_block.header.hash;
+                let mut vrf_hasher = sha2::Sha256::new();
+                vrf_hasher.update(last_block_hash.as_bytes());
+                vrf_hasher.update(b"LOTTERY"); // Séparation de domaine
+                let vrf_hash = vrf_hasher.finalize();
+                
+                let mut hash_bytes = [0u8; 8];
+                hash_bytes.copy_from_slice(&vrf_hash[0..8]);
+                let random_number = u64::from_be_bytes(hash_bytes);
+                
+                // Le tirage au sort cryptographique absolu !
+                let winner_index = (random_number as usize) % tickets.len();
+                let winner_ticket = &tickets[winner_index];
                 let winner_pubkey = winner_ticket.1.clone();
 
-                println!("🎰 [LOTO L1] Le ticket {} remporte le Jackpot de {} Flames !", 
+                println!("🎰 [LOTO VRF] Le ticket {} remporte le Jackpot de {} Flames !", 
                          winner_ticket.0, jackpot_amount);
 
                 let payout_output = crate::transaction::TransactionOutput {
                     stealth_address: format!("JACKPOT_{}", winner_pubkey),
                     kyber_capsule: format!("JACKPOT_PAYOUT_{}", current_height),
                     aes_vault: jackpot_amount.to_string(),
-                    lattice_commitment: crate::lattice::LWECommitment::commit(jackpot_amount, [0, 0, 0, 0]),
+                    lattice_commitment: crate::lattice::LWECommitment::commit(jackpot_amount, &[0u64; crate::lattice::LATTICE_DIM]),
                 };
 
                 let lottery_payout_tx = Transaction {
@@ -442,13 +682,39 @@ impl Blockchain {
         };
         valid_transactions.insert(0, coinbase_tx);
 		
-		// ⚡ GÉNÉRATION DU TROUSSEAU L2 (128 clés WOTS+ pour 2 minutes de L2)
-        let mut l2_keys = Vec::new();
-        let mut l2_pubkeys = Vec::new();
-        for _ in 0..128 {
-            let keys = crate::wots::WotsKeyPair::generate();
-            l2_pubkeys.push(keys.public_key.clone());
-            l2_keys.push(keys);
+		// GÉNÉRATION DU TROUSSEAU L2 (128 clés WOTS+ pour 2 minutes de L2)
+        // OPTIMISATION MULTI-THREAD DYNAMIQUE : S'adapte au CPU de l'utilisateur
+        // On détecte le nombre de cœurs logiques de la machine
+        let available_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        
+        // On laisse toujours 1 cœur libre pour l'OS et Tokio (Réseau) pour éviter les micro-freezes
+        let num_threads = if available_cores > 2 { available_cores - 1 } else { 1 }; 
+        
+        let mut handles = Vec::new();
+        let mut keys_left = 128;
+
+        for i in 0..num_threads {
+            // Répartition mathématique équitable des 128 clés sur les cœurs disponibles
+            let chunk_size = if i == num_threads - 1 { keys_left } else { 128 / num_threads };
+            keys_left -= chunk_size;
+
+            handles.push(std::thread::spawn(move || {
+                let mut chunk_keys = Vec::with_capacity(chunk_size);
+                for _ in 0..chunk_size {
+                    chunk_keys.push(crate::wots::WotsKeyPair::generate());
+                }
+                chunk_keys
+            }));
+        }
+        
+        let mut l2_keys = Vec::with_capacity(128);
+        let mut l2_pubkeys = Vec::with_capacity(128);
+        for handle in handles {
+            let keys = handle.join().expect("Erreur critique dans le thread WOTS+");
+            for k in keys {
+                l2_pubkeys.push(k.public_key.clone());
+                l2_keys.push(k);
+            }
         }
 
         // Création de l'arbre de Merkle simple pour la racine
@@ -465,9 +731,14 @@ impl Blockchain {
             nonce: 0,
             target_hex: format!("{:0>64}", self.target.to_str_radix(16)),
             l2_root, // La racine est ancrée dans le L1 !
+			tx_root: String::new(), // Sera calculé juste après
         };
 
-        let block = Block { header: new_header, transactions: valid_transactions };
+        let mut block = Block { header: new_header, transactions: valid_transactions };
+		
+		// Calcul et injection de la racine de Merkle
+        block.header.tx_root = block.calculate_tx_root();
+		
         (block, self.target.clone(), l2_keys) // On retourne les clés L2 !
     }
     
@@ -476,7 +747,7 @@ impl Blockchain {
 
         let flags = RandomXFlag::get_recommended_flags();
         
-        // 💡 FIX : On utilise le bon Dataset !
+        // On utilise le bon Dataset !
         let mut current_seed = self.get_epoch_seed(new_chain[1].header.index);
         let mut cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
         let mut vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap(); 
@@ -486,7 +757,9 @@ impl Blockchain {
             let current_block = &new_chain[i];
             if current_block.header.previous_hash != previous_block.header.hash { return false; }
             
-            // Si on change d'époque pendant le fork, on change la VM légère !
+            // Vérification Merkle pendant le fork
+            if current_block.header.tx_root != current_block.calculate_tx_root() { return false; }
+
             let needed_seed = self.get_epoch_seed(current_block.header.index);
             if needed_seed != current_seed {
                 current_seed = needed_seed;
@@ -494,14 +767,21 @@ impl Blockchain {
                 vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
             }
 
-            let header_data = format!("{}{}{}{}{}", current_block.header.index, current_block.header.timestamp, current_block.header.previous_hash, current_block.header.nonce, current_block.header.l2_root);
-            let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
+            let header_data = format!("{}{}{}{}{}{}", 
+                current_block.header.index, 
+                current_block.header.timestamp, 
+                current_block.header.previous_hash, 
+                current_block.header.nonce, 
+                current_block.header.l2_root,
+                current_block.header.tx_root 
+            );
+			let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
             let expected_hash = hex::encode(&hash_bytes);
 
             if current_block.header.hash != expected_hash { return false; }
         }
 
-        // 🛡️ BOUCLIER ANTI-51% (MESS) POUR LES REORGANISATIONS TOTALES
+        // BOUCLIER ANTI-51% (MESS) POUR LES REORGANISATIONS TOTALES
         let my_work = Blockchain::calculate_total_work(&self.chain);
         let mut new_work = Blockchain::calculate_total_work(&new_chain);
 
@@ -572,43 +852,91 @@ impl Blockchain {
 		// Construction sécurisée de la chaîne théorique
 		let end = std::cmp::min(ancestor_index + 1, self.chain.len());
 		let mut theoretical_chain = self.chain[0..end].to_vec();
+
+		// On initialise le curseur AVANT de fusionner les nouveaux blocs !
+		let mut last_verified_timestamp = theoretical_chain.last()
+			.map(|b| b.header.timestamp)
+			.unwrap_or(0);
+
+		// MAINTENANT on peut ajouter les nouveaux blocs
 		theoretical_chain.extend(new_blocks.clone());
 
         // Petite fonction interne pour lire la graine sur la chaîne théorique
         let get_theoretical_seed = |height: u64, t_chain: &[Block]| -> String {
-            if height <= EPOCH_BLOCKS {
-                return t_chain[0].header.hash.clone();
-            }
-            let target_block = ((height - 1) / EPOCH_BLOCKS) * EPOCH_BLOCKS;
-            if (target_block as usize) < t_chain.len() {
-                t_chain[target_block as usize].header.hash.clone()
-            } else {
-                t_chain[0].header.hash.clone()
-            }
-        };
+			if height <= EPOCH_BLOCKS {
+				return t_chain[0].header.hash.clone();
+			}
+			let epoch = (height - 1) / EPOCH_BLOCKS;
+			let target_block = (epoch * EPOCH_BLOCKS).saturating_sub(11);
+			if (target_block as usize) < t_chain.len() {
+				t_chain[target_block as usize].header.hash.clone()
+			} else {
+				t_chain[0].header.hash.clone()
+			}
+		};
+		
+        // ====================================================================
+		// ⏱️ PARAMÈTRES DU BOUCLIER TEMPOREL (Anti-Time Warp)
+		// ====================================================================
+		let current_time = chrono::Utc::now().timestamp();
+		let max_future_tolerance = 7200; // Tolérance de 2 heures
 
-        // 2. Le Tribunal RandomX
-        let flags = RandomXFlag::get_recommended_flags();
-        let mut current_seed = get_theoretical_seed(new_blocks[0].header.index, &theoretical_chain);
-        let mut cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
-        let mut vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap(); 
+		// 2. Le Tribunal RandomX et de Cohérence Temporelle
+		let flags = RandomXFlag::get_recommended_flags();
+		let mut current_seed = get_theoretical_seed(new_blocks[0].header.index, &theoretical_chain);
+		let mut cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
+		let mut vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap(); 
+		
+		for block in &new_blocks {
+			// ====================================================================
+			// 🛡️ APPLICATION DU BOUCLIER TEMPOREL SUR LE FORK
+			// ====================================================================
+			if block.header.timestamp > current_time + max_future_tolerance {
+				println!(
+					"❌ [FORK] FRAUDE TEMPORELLE : Le bloc {} est trop loin dans le futur ! (Timestamp: {}, Actuel: {})", 
+					block.header.index, block.header.timestamp, current_time
+				);
+				return false;
+			}
 
-        for block in &new_blocks {
-            let needed_seed = get_theoretical_seed(block.header.index, &theoretical_chain);
-            if needed_seed != current_seed {
-                current_seed = needed_seed;
-                cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
-                vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
-            }
+			if block.header.timestamp <= last_verified_timestamp {
+				println!(
+					"❌ [FORK] FRAUDE TEMPORELLE : Le temps ne peut pas stagner ou reculer au bloc {} ! ({} <= {})", 
+					block.header.index, block.header.timestamp, last_verified_timestamp
+				);
+				return false;
+			}
 
-            let header_data = format!("{}{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce, block.header.l2_root);
-            let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
-            
-            if hex::encode(&hash_bytes) != block.header.hash { 
-                println!("❌ [FORK] La nouvelle branche contient un bloc frauduleux (Index {})", block.header.index);
-                return false; 
-            }
-        }
+			// Le bloc est temporellement sain, on met à jour notre curseur
+			last_verified_timestamp = block.header.timestamp;
+			// ====================================================================
+
+			// Vérification Merkle pendant le fork partiel
+			if block.header.tx_root != block.calculate_tx_root() { return false; }
+
+			let needed_seed = get_theoretical_seed(block.header.index, &theoretical_chain);
+			if needed_seed != current_seed {
+				current_seed = needed_seed;
+				cache = RandomXCache::new(flags, current_seed.as_bytes()).unwrap();
+				vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
+			}
+
+			let header_data = format!("{}{}{}{}{}{}", 
+				block.header.index, 
+				block.header.timestamp, 
+				block.header.previous_hash, 
+				block.header.nonce, 
+				block.header.l2_root,
+				block.header.tx_root 
+			);
+			
+			let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
+			
+			if hex::encode(&hash_bytes) != block.header.hash { 
+				println!("❌ [FORK] La nouvelle branche contient un bloc frauduleux (Index {})", block.header.index);
+				return false; 
+			}
+		}
 
         // 3. Pesée des deux chaînes (Preuve de travail) et Bouclier MESS
         let my_work = Blockchain::calculate_total_work(&self.chain);
@@ -616,7 +944,7 @@ impl Blockchain {
 
         let reorg_depth = self.chain.len().saturating_sub(ancestor_index + 1);
 
-        // 🛡️ BOUCLIER ANTI-51% (Modified Exponential Subjective Scoring)
+        // BOUCLIER ANTI-51% (Modified Exponential Subjective Scoring)
         if reorg_depth > 10 {
             let penalty_shift = std::cmp::min((reorg_depth - 10) as u32, 256); // Limite anti-overflow
             println!("🛡️ [MESS] 🚨 ALERTE : Tentative de réorganisation profonde détectée (Profondeur: {} blocs) !", reorg_depth);
@@ -624,7 +952,7 @@ impl Blockchain {
             new_work = new_work >> penalty_shift;
         }
 
-        if new_work > my_work || (new_work == my_work && new_blocks.last().unwrap().header.timestamp < self.chain.last().unwrap().header.timestamp) {
+        if new_work > my_work {
             println!("✅ [FORK] Nouvelle chaîne adoptée ! On recule de {} blocs et on en applique {}.", 
                      self.chain.len() - ancestor_index - 1, new_blocks.len());
             
@@ -653,12 +981,33 @@ impl Blockchain {
 	pub fn validate_and_add_external_block(&mut self, block: Block) -> Result<(), String> {
 		let last_block = self.chain.last().unwrap();
 		
+		// =========================================================
+		// BOUCLIER ANTI-RETOUR VERS LE FUTUR (Time Warp Attack)
+		// =========================================================
+		let current_time = chrono::Utc::now().timestamp();
+		let max_future_tolerance = 7200; // Tolérance de 2h (7200 secondes)
+		
+		if block.header.timestamp > current_time + max_future_tolerance {
+			return Err(format!("❌ FRAUDE TEMPORELLE : Ce bloc vient du futur ! (Timestamp: {}, Actuel: {})", block.header.timestamp, current_time));
+		}
+		
+		// Le temps doit avancer, ou du moins ne pas reculer par rapport au dernier bloc
+		if block.header.timestamp <= last_block.header.timestamp {
+			return Err("❌ FRAUDE TEMPORELLE : Le temps ne peut pas reculer ou stagner par rapport au bloc précédent.".to_string());
+		}
+		// =========================================================
+
 		// 1. Vérifications de base de la structure
 		if block.header.index != last_block.header.index + 1 { 
 			return Err("Index de bloc invalide.".to_string()); 
 		}
 		if block.header.previous_hash != last_block.header.hash { 
 			return Err("Rupture de la chaîne.".to_string()); 
+		}
+		
+		// BOUCLIER MERKLE : On recalcule l'arbre et on rejette si ça ne matche pas !
+		if block.header.tx_root != block.calculate_tx_root() {
+			return Err("❌ FRAUDE : La racine de Merkle (tx_root) est invalide ou falsifiée !".to_string());
 		}
 
 		// 2. Le Tribunal RandomX (Vérification du PoW)
@@ -667,13 +1016,14 @@ impl Blockchain {
 		let cache = randomx_rs::RandomXCache::new(flags, seed.as_bytes()).map_err(|_| "Erreur Cache")?;
 		let vm = randomx_rs::RandomXVM::new(flags, Some(cache), None).map_err(|_| "Erreur VM")?;
 
-		// 🛡️ L2 ANCHORING
-		let header_data = format!("{}{}{}{}{}", 
+		// L2 ANCHORING
+		let header_data = format!("{}{}{}{}{}{}", 
 			block.header.index, 
 			block.header.timestamp, 
 			block.header.previous_hash, 
 			block.header.nonce,
-			block.header.l2_root
+			block.header.l2_root,
+			block.header.tx_root // Verrouille l'intégrité des transactions !
 		);
 		
 		let hash_bytes = vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur calcul")?;
@@ -692,8 +1042,34 @@ impl Blockchain {
 		let mut total_block_fees = 0u64;
 		let mut block_key_images = HashSet::new();
 		let current_height = block.header.index;
+		
+		// ====================================================================
+		// BOUCLIER DE MATURITÉ NODE-SIDE (Infaillible)
+		// On calcule les clés immatures en scannant les derniers blocs.
+		// On inclut Coinbase (L1), MicroCoinbase (L2) et Jackpot (Loto)
+		// ====================================================================
+		let mut immature_pubkeys = std::collections::HashSet::new();
+		let scan_limit = current_height.saturating_sub(MATURITY_BLOCKS);
+		
+		for b in self.chain.iter().rev() {
+			if b.header.index <= scan_limit { break; }
+			for past_tx in &b.transactions {
+				if matches!(past_tx.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::LotteryPayout { .. }) {
+					for out in &past_tx.outputs {
+						if out.stealth_address.starts_with("COINBASE_") {
+							immature_pubkeys.insert(out.stealth_address.replace("COINBASE_", ""));
+						} else if out.stealth_address.starts_with("JACKPOT_") {
+							immature_pubkeys.insert(out.stealth_address.replace("JACKPOT_", ""));
+						} else if out.kyber_capsule.starts_with("MICRO_COINBASE_") && out.stealth_address.starts_with("L2_WATT_") {
+							immature_pubkeys.insert(out.stealth_address.replace("L2_WATT_", ""));
+						}
+					}
+				}
+			}
+		}
+		// ====================================================================
 
-		// 🛡️ CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
+		// CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
         let mut expected_subsidy = INITIAL_REWARD;
         for _ in 0..current_height {
             expected_subsidy = Blockchain::get_next_base_reward(expected_subsidy);
@@ -705,6 +1081,11 @@ impl Blockchain {
 				coinbase_count += 1;
 				continue;
 			}
+			
+			// BOUCLIER STRICT : Une MicroCoinbase L2 n'a STRICTEMENT RIEN à faire dans un bloc L1 !
+			if tx.tx_type == TransactionType::MicroCoinbase {
+				return Err("❌ FRAUDE : Présence d'une MicroCoinbase L2 dans un bloc L1 !".to_string());
+			}
 
 			// Mise à jour prix DEX
 			if let TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
@@ -712,33 +1093,50 @@ impl Blockchain {
 				continue;
 			}
 
-			// === MATURITÉ (seulement pour les inputs venant d'une coinbase) ===
-			for input in &tx.inputs {
-				if input.source_height > 0 {  // Cet input dépense une récompense de minage
-					let confirmations = current_height.saturating_sub(input.source_height);
-					if confirmations < MATURITY_BLOCKS {
-						return Err(format!(
-							"Input immature ! Seulement {} confirmations (minimum requis : {})", 
-							confirmations, MATURITY_BLOCKS
-						));
+			// === MATURITÉ (Vérification cryptographique in-hackable) ===
+			if tx.tx_type != TransactionType::Coinbase {
+				for input in &tx.inputs {
+					for decoy in &input.mpc_ring.ring_decoys {
+						if immature_pubkeys.contains(decoy) {
+							return Err(format!(
+								"❌ FRAUDE : Tentative de dépense d'une récompense immature (Coinbase/MicroCoinbase/Loto < {} blocs) !", 
+								MATURITY_BLOCKS
+							));
+						}
 					}
 				}
 			}
 			
-			// 🛡️ VÉRIFICATION STRICTE DES PARTS DE MINAGE (Anti-Triche P2Pool)
-			if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = &tx.tx_type {
-				let header_data = format!("{}{}{}{}", current_height, timestamp, block.header.previous_hash, nonce);
-				let hash_bytes = vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur VM P2Pool")?;
-				
-				if hex::encode(&hash_bytes) != *hash { 
-					return Err("❌ MiningShare: Hash falsifié !".into()); 
-				}
-				
-				let hash_bigint = num_bigint::BigUint::parse_bytes(hash.as_bytes(), 16).unwrap_or_default();
-				if hash_bigint > (&self.target * 20u32) { 
-					return Err("❌ MiningShare: Preuve de travail insuffisante !".into()); 
-				}
-			}
+			// VÉRIFICATION STRICTE DES PARTS DE MINAGE (Anti-Triche P2Pool)
+            if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = &tx.tx_type {
+                
+                // Voyage dans le temps. On pointe sur les données d'il y a 1 bloc.
+                let share_height = current_height.saturating_sub(1);
+                let share_prev_hash = last_block.header.previous_hash.clone(); // Le previous du previous !
+                
+                // On initialise une VM propre pour la part au cas où on a passé une époque
+                let share_seed = self.get_epoch_seed(share_height);
+                let share_cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).map_err(|_| "Erreur Cache Part")?;
+                let share_vm = randomx_rs::RandomXVM::new(flags, Some(share_cache), None).map_err(|_| "Erreur VM Part")?;
+
+                // Décodage des métadonnées
+                let parts: Vec<&str> = tx.public_key.split('_').collect();
+                let l2_root = parts.get(0).cloned().unwrap_or("");
+                let tx_root = parts.get(1).cloned().unwrap_or("");
+                
+                // Reconstitution
+                let header_data = format!("{}{}{}{}{}{}", share_height, timestamp, share_prev_hash, nonce, l2_root, tx_root);
+                let hash_bytes = share_vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur VM P2Pool")?;
+                
+                if hex::encode(&hash_bytes) != *hash { 
+                    return Err("❌ MiningShare: Hash falsifié, l2_root ou tx_root corrompus !".into()); 
+                }
+                
+                let hash_bigint = num_bigint::BigUint::parse_bytes(hash.as_bytes(), 16).unwrap_or_default();
+                if hash_bigint > (&self.target * 20u32) { 
+                    return Err("❌ MiningShare: Preuve de travail insuffisante !".into()); 
+                }
+            }
 
 			// Validité intrinsèque
 			if !tx.is_valid() { 
@@ -753,7 +1151,7 @@ impl Blockchain {
 				}
 			}
 
-			// ✅ VRAI ATOMIC SWAP – vérification SHA256 (compatible Bitcoin HTLC)
+			// VRAI ATOMIC SWAP – vérification SHA256 (compatible Bitcoin HTLC)
 			if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
 				let secret_bytes = hex::decode(secret).unwrap_or_default();
 				let provided_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
@@ -761,6 +1159,151 @@ impl Blockchain {
 					return Err("❌ HTLC Claim : secret invalide".into());
 				}
 			}
+
+            // BOUCLIER : Validation du délai pour un HTLCRefund entrant
+            if let TransactionType::HTLCRefund { hash } = &tx.tx_type {
+                let mut timeout = 0;
+                let mut lock_found = false;
+                for b in self.chain.iter().rev() {
+                    for past_tx in &b.transactions {
+                        if let TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
+                            if lock_hash == hash {
+                                timeout = *timeout_block;
+                                lock_found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if lock_found { break; }
+                }
+                if !lock_found || current_height < timeout {
+                    return Err(format!("❌ FRAUDE : HTLCRefund invalide ou délai non expiré ! (Actuel: {}, Timeout: {})", current_height, timeout));
+                }
+            }
+			
+			// LE TRIBUNAL DES SÉQUENCEURS EXTERNES (L2 ANCHORING)
+			// BOUCLIER MINEUR L1 : Vérification stricte du Staking L2
+			if let TransactionType::L2Stake { l2_name, .. } = &tx.tx_type {
+				if tx.outputs.is_empty() {
+					return Err("❌ FRAUDE : Un L2Stake doit contenir un output de verrouillage !".into());
+				}
+				let stake_amount: u64 = tx.outputs[0].aes_vault.parse().unwrap_or(0);
+				let required_stake = MONTANT_STAKE * FLAME;
+				
+				if stake_amount < required_stake {
+					return Err(format!("❌ FRAUDE : Le staking pour '{}' est insuffisant (Requis: {} WATT) !", l2_name, MONTANT_STAKE));
+				}
+				if !tx.outputs[0].stealth_address.starts_with("L2_STAKE_") {
+					return Err("❌ FRAUDE : L'adresse de destination du Staking est invalide !".into());
+				}
+
+				// 🛡️ VÉRIFICATION HOMOMORPHE ABSOLUE
+				let mut is_valid_math = true;
+				for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
+					let expected = if i == 0 { stake_amount } else { 0 };
+					let diff = val.wrapping_sub(expected);
+					if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
+						is_valid_math = false; break;
+					}
+				}
+				
+				if !is_valid_math {
+					return Err("❌ FRAUDE : Fraude mathématique ! L'engagement Lattice ne correspond pas au montant déclaré.".into());
+				}
+			}
+			
+			// On vérifie la transaction du bridge
+			if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
+				if tx.outputs.is_empty() {
+					println!("⛔ Rejet : Un L2BridgeLock doit contenir un output de verrouillage !");
+					continue; // 💡 REMPLACE PAR `return Err(...)` dans validate_and_add_external_block
+				}
+
+				let official_bridge_address = format!("BRIDGE_L2_{}", l2_target_name.to_uppercase());
+				
+				if tx.outputs[0].stealth_address != official_bridge_address {
+					println!("⛔ Rejet : Les fonds doivent être envoyés au contrat L2 strict : {}", official_bridge_address);
+					continue;
+				}
+
+				let bridge_amount: u64 = tx.outputs[0].aes_vault.parse().unwrap_or(0);
+				
+				if bridge_amount == 0 {
+					println!("⛔ Rejet : Le montant du bridge est invalide ou nul !");
+					continue;
+				}
+
+				// 🛡️ LE BOUCLIER LATTICE POUR LE BRIDGE (La pièce manquante !)
+				let mut is_valid_math = true;
+				for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
+					let expected = if i == 0 { bridge_amount } else { 0 };
+					let diff = val.wrapping_sub(expected);
+					if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
+						is_valid_math = false; break;
+					}
+				}
+				
+				if !is_valid_math {
+					println!("⛔ Rejet : Fraude mathématique ! L'engagement Lattice du Bridge ne correspond pas au montant déclaré.");
+					continue; // 💡 REMPLACE PAR `return Err(...)` dans validate_and_add_external_block
+				}
+
+				println!("🌉 [BRIDGE L2] {} Flames verrouillés publiquement pour le réseau {}", bridge_amount, l2_target_name);
+			}
+			
+            if let TransactionType::L2Anchor { l2_name, state_root, sequencer_signature, .. } = &tx.tx_type {
+                let mut active_sequencers: std::collections::HashSet<String> = std::collections::HashSet::new();
+                
+                // 1. On liste tous les candidats
+                for b in self.chain.iter() {
+                    for past_tx in &b.transactions {
+                        if let TransactionType::L2Stake { l2_name: staked_name, sequencer_pubkey } = &past_tx.tx_type {
+                            if staked_name == l2_name { active_sequencers.insert(sequencer_pubkey.clone()); }
+                        }
+                        if let TransactionType::L2Unstake { l2_name: unstaked_name } = &past_tx.tx_type {
+                            if unstaked_name == l2_name { active_sequencers.clear(); }
+                        }
+                    }
+                }
+
+                if active_sequencers.is_empty() {
+                    return Err(format!("❌ FRAUDE : La L2 '{}' n'a aucun staker actif !", l2_name));
+                }
+
+                // 2. TRIBUNAL VRF : Qui a le droit de parler ce tour-ci ?
+                let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
+                candidates.sort(); 
+
+                // Le hash du bloc précédent détermine le gagnant
+                let last_block_hash = &self.chain.last().unwrap().header.hash;
+                
+                let mut vrf_hasher = sha2::Sha256::new();
+                vrf_hasher.update(last_block_hash.as_bytes());
+                vrf_hasher.update(l2_name.as_bytes());
+                let vrf_hash = vrf_hasher.finalize();
+
+                let mut hash_bytes = [0u8; 8];
+                hash_bytes.copy_from_slice(&vrf_hash[0..8]);
+                let winner_index = (u64::from_be_bytes(hash_bytes) as usize) % candidates.len();
+                let legit_sequencer = &candidates[winner_index];
+
+                // 3. Vérification de l'Usurpation
+                if let Ok(sig) = serde_json::from_str::<crate::wots::WotsSignature>(sequencer_signature) {
+                    let mut hasher = sha2::Sha512::new();
+                    hasher.update(state_root.as_bytes());
+                    let mut hash_array = [0u8; 64];
+                    hash_array.copy_from_slice(&hasher.finalize());
+                    
+                    // On vérifie que la signature appartient bien au GAGNANT DU VRF !
+                    if !crate::wots::WotsKeyPair::verify(legit_sequencer, &sig, &hash_array) {
+                        return Err(format!("❌ FRAUDE VRF : Le Séquenceur a soumis un bloc, mais il a perdu la loterie de ce tour !"));
+                    }
+                } else {
+                    return Err(format!("❌ Signature illisible pour la L2 '{}'", l2_name));
+                }
+                
+                println!("🔗 [INTEROPÉRABILITÉ] État '{}' ancré par le Séquenceur VRF légitime ! (Root: {})", l2_name, state_root);
+            }
 
 			total_block_fees += tx.fee;
 		}
@@ -798,7 +1341,7 @@ impl Blockchain {
         let current_len = self.chain.len(); 
         if current_len < 2 { return; }
 
-        let window_size = 17; // 💡 Fenêtre glissante (Inspiré de Monero/Zcash) prod 144 (24h)
+        let window_size = 17; // Fenêtre glissante (Inspiré de Monero/Zcash) prod 144 (24h)
         let start_idx = if current_len > window_size { current_len - window_size } else { 0 };
         
         let mut total_time = 0;
@@ -809,7 +1352,7 @@ impl Blockchain {
             let curr = &self.chain[i];
             let mut time_taken = curr.header.timestamp - prev.header.timestamp;
             
-            // 🛡️ Bornes de sécurité : Empêche un pirate de truquer son horloge pour faire chuter la difficulté
+            // Bornes de sécurité : Empêche un pirate de truquer son horloge pour faire chuter la difficulté
             if time_taken > (EXPECTED_BLOCK_TIME * 3) as i64 { time_taken = (EXPECTED_BLOCK_TIME * 3) as i64; }
             if time_taken <= 0 { time_taken = 1; } 
             
@@ -895,19 +1438,41 @@ impl Blockchain {
     }
     
     pub fn get_random_decoys(&self, count: usize) -> Vec<String> {
-        let mut all_stealth = Vec::new();
-        for block in &self.chain {
-            for tx in &block.transactions {
-                if tx.tx_type != TransactionType::Coinbase {
-                    for out in &tx.outputs {
-                        all_stealth.push(out.stealth_address.clone());
-                    }
-                }
-            }
-        }
-        if all_stealth.is_empty() { return vec![]; }
-        let mut rng = rand::thread_rng();
-        all_stealth.shuffle(&mut rng);
-        all_stealth.into_iter().take(count).collect()
-    }
+		let mut all_pubkeys = Vec::new();
+		for block in &self.chain {
+			for tx in &block.transactions {
+				if tx.tx_type != TransactionType::Coinbase {
+					// 💡 FIX : On utilise la clé publique WOTS+ de l'expéditeur, 
+					// pas l'adresse furtive du destinataire !
+					all_pubkeys.push(tx.public_key.clone());
+				}
+			}
+		}
+		
+		// On dé-duplique toutes les clés disponibles sur la blockchain
+		let unique_pubkeys: Vec<String> = all_pubkeys.into_iter()
+			.collect::<std::collections::HashSet<_>>()
+			.into_iter()
+			.collect();
+			
+		let len = unique_pubkeys.len();
+		if len == 0 { return vec![]; }
+		if len <= count { return unique_pubkeys; } 
+
+		let mut rng = rand::thread_rng();
+		let mut selected = std::collections::HashSet::new();
+		use rand::Rng;
+
+		// On garantit que le nœud renverra un set 100% unique
+		while selected.len() < count {
+			let idx1 = rng.gen_range(0..len);
+			let idx2 = rng.gen_range(0..len);
+			let idx3 = rng.gen_range(0..len);
+			
+			let chosen_idx = idx1.max(idx2).max(idx3); // Biais vers la nouveauté
+			selected.insert(unique_pubkeys[chosen_idx].clone());
+		}
+
+		selected.into_iter().collect()
+	}
 }

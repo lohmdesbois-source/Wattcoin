@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde::{Serialize, Deserialize};
 use sha2::{Sha512, Digest};
 use crate::wots::{WotsKeyPair, WotsSignature};
@@ -24,13 +25,23 @@ impl MpcRingSignature {
     }
 
     /// ✍️ Le Wallet génère la signature d'anneau (Exécution < 5ms sur mobile)
-    pub fn sign(secret_key: &[Vec<u8>], tx_hash: &[u8; 64], decoys: &[String], real_index: usize, real_capsule: &str) -> Self {
-        // 1. Calcul de la vraie signature WOTS+ sur la transaction
-        let real_wots_sig = WotsKeyPair::sign(secret_key, tx_hash);
+    pub fn sign(secret_key: &[Vec<u8>], tx_hash: &[u8; 64], decoys: &[String], real_index: usize, real_capsule: &str, kyber_secret: &[u8]) -> Self {
+        
+        // 💡 EXTRACTION DU POIVRE : On récupère le public_seed depuis la clé publique
+        let my_pubkey = &decoys[real_index];
+        let parts: Vec<&str> = my_pubkey.split('_').collect();
+        let mut public_seed = [0u8; 32];
+        if parts.len() == 2 {
+            let seed_bytes = hex::decode(parts[0]).unwrap_or_default();
+            if seed_bytes.len() == 32 {
+                public_seed.copy_from_slice(&seed_bytes);
+            }
+        }
+
+        // 1. Calcul de la vraie signature WOTS+ sur la transaction avec le poivre
+        let real_wots_sig = WotsKeyPair::sign(secret_key, &public_seed, tx_hash);
         
         // 2. Création de l'Arbre de Merkle de l'anneau (KISS)
-        // Note: Dans une vraie implémentation, on ferait un arbre binaire complet.
-        // Ici, on fait un "hash chain" simple pour l'exemple de l'anneau.
         let mut current_root = decoys[0].clone();
         let mut merkle_proof = Vec::new();
         
@@ -41,12 +52,10 @@ impl MpcRingSignature {
             current_root = Self::hash_nodes(&current_root, &decoys[i]);
         }
 
-        // 3. Le Key Image (Anti-double dépense)
-        // Il doit être unique à cette capsule, mais intraçable sans la clé secrète
+        // 3. Le Key Image (VRAI Anti-double dépense)
         let mut ki_hasher = Sha512::new();
         ki_hasher.update(real_capsule.as_bytes());
-        // On lie le premier bloc de la clé secrète WOTS pour garantir la propriété univoque
-        ki_hasher.update(&secret_key[0]); 
+        ki_hasher.update(kyber_secret); // ON UTILISE LE SECRET PERMANENT !
         let key_image = hex::encode(ki_hasher.finalize());
 
         MpcRingSignature {
@@ -60,6 +69,22 @@ impl MpcRingSignature {
 
     /// ⚖️ Le Nœud vérifie que l'expéditeur appartient à l'anneau
     pub fn verify(&self, tx_hash: &[u8; 64]) -> bool {
+        // REGLE CYPERPUNK PROD : Au moins 64 leurres obligatoires !
+        if self.ring_decoys.len() < 64 {
+            println!("❌ [CONSENSUS] Rejet : L'anneau d'anonymat est trop faible ({} < 64)", self.ring_decoys.len());
+            return false;
+        }
+
+        // =========================================================
+        // 🛡️ BOUCLIER ANTI-DUPLICATION (Attaque Sybil sur l'anonymat)
+        // =========================================================
+        let unique_decoys: std::collections::HashSet<_> = self.ring_decoys.iter().collect();
+        if unique_decoys.len() != self.ring_decoys.len() {
+            println!("❌ [CONSENSUS] Rejet : L'anneau contient des leurres dupliqués ! Tentative de désanonymisation bloquée.");
+            return false;
+        }
+        // =========================================================
+
         let mut computed_root = self.ring_decoys[0].clone();
         let mut real_pubkey_found = false;
 

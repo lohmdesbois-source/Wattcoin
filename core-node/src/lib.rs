@@ -15,11 +15,18 @@ pub mod api;
 pub mod wots;
 pub mod merkle_ring;
 pub mod lattice;
+pub mod dht;
+pub mod mixnet;
 
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
 
+
+pub const SEED_NODES: &[&str] = &[
+    "80.78.26.243:8100", // L'IP DU SERVEUR RACINE
+];
+
 // ===================================================================
-// 🔥 SWITCH LOCAL / PROD (tu changes juste cette ligne)
+// SWITCH LOCAL / PROD (tu changes juste cette ligne)
 //pub const LOCAL_DEV_MODE: bool = true;   // ← true = local (127.0.0.1, sans Tor, ultra rapide)
 pub const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
 // ===================================================================

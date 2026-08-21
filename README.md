@@ -34,6 +34,15 @@ Le nœud embarque `arti-client` (Rust native Tor). Tout le trafic P2P peut être
 ### 5. ⚡ Layer 2 (L2) Intégré au Core
 Architecture d'un environnement d'exécution L2 directement dans le nœud, visant des **blocs de 1 seconde** pour des micro-transactions instantanées.
 
+### 6. 🤝 Minage P2Pool Natif (Anti-Fermes)
+Le protocole intègre la coopérative de minage au cœur du consensus. Lorsqu'un bloc est trouvé, le "Finder" reçoit rigoureusement 20 % de la récompense, et les 80 % restants sont distribués de manière équitable et exacte aux autres mineurs ayant soumis des preuves de travail partielles. Les fermes de minage sont pénalisées algorithmiquement en cas de hashrate abusif (Effet Robin des Bois).
+
+### 7. 🎰 Cyber-Jackpot L1 Intégré
+Une taxe inaltérable de 1 % sur tous les frais du réseau (L1 et L2) alimente une cagnotte commune. Tous les 720 blocs, le protocole tire au sort un ticket (achetable on-chain) et redistribue les fonds de manière autonome via une transaction LotteryPayout générée par le consensus.
+
+### 8. 💧 UTXO Drip (Furtivité Absolue)
+Pour empêcher l'analyse des montants, chaque transaction et chaque monnaie rendue (change) est automatiquement découpée en coupures standards (billets). Il est impossible de distinguer un paiement d'un retour de monnaie.
+
 ## 🚀 Installation & Lancement
 
 ### Prérequis
@@ -43,5 +52,8 @@ Architecture d'un environnement d'exécution L2 directement dans le nœud, visan
 ### Compilation
 ```bash
 git clone [https://github.com/lohmdesbois-source/wattcoin.git](https://github.com/lohmdesbois-source/wattcoin.git)
-cd wattcoin
+cd wattcoin/core-node
 cargo build --release
+
+cd ../desktop-wallet
+npm run build:linux

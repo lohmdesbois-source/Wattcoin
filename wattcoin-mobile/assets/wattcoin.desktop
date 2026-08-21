@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Wattcoin Wallet
+Comment=Portefeuille Cypherpunk Wattcoin Network
+Exec=wattcoin-wallet
+Icon=wattcoin
+Terminal=false
+Type=Application
+Categories=Finance;Utility;Network;
+StartupWMClass=wattcoin
