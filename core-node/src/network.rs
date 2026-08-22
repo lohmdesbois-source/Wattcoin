@@ -98,6 +98,18 @@ pub fn start_peer_connection(
     tokio::spawn(async move {
         let mut actual_peer_id = temp_peer_id.clone();
 
+        // Le "Hello" immédiat ! Dès qu'on se connecte, on annonce notre hauteur.
+        let (my_height, my_genesis) = {
+            let chain = blockchain.lock().unwrap();
+            (chain.chain.len() as u64, chain.chain[0].header.hash.clone())
+        };
+        send_message_to_channel(&tx, P2PMessage::Handshake { 
+            genesis_hash: my_genesis, 
+            current_height: my_height, 
+            sender_port: my_port.clone() 
+        }).await;
+
+        // La boucle d'écoute existante...
         while let Some(message) = read_p2p_message(&mut reader).await {
             match message {
                 P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
@@ -198,14 +210,20 @@ pub fn start_peer_connection(
 				},
 
                 P2PMessage::NewBlock { block, sender_port } => {
-                    let is_rejected = {
+                    let reject_info = {
                         let mut chain = blockchain.lock().unwrap();
-                        chain.validate_and_add_external_block(block.clone()).is_err()
+                        if let Err(_) = chain.validate_and_add_external_block(block.clone()) {
+                            Some((chain.chain[0].header.hash.clone(), chain.chain.len() as u64))
+                        } else { None }
                     };
 
-                    if is_rejected {
-                        // Au lieu d'un Handshake qui rend le réseau aveugle aux forks de même taille,
-                        // on force instantanément un SyncRequest pour récupérer l'embranchement et comparer le PoW !
+                    if let Some((my_genesis, my_height)) = reject_info {
+                        // On fait les DEUX (Handshake + SyncRequest)
+                        
+                        // 1. On avertit l'autre de notre hauteur (Pour que le retardataire se mette à jour)
+                        send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
+                        
+                        // 2. On demande son historique (Pour résoudre les forks à hauteur égale)
                         let locator_hashes = {
                             let chain = blockchain.lock().unwrap();
                             let mut locators = Vec::new();
@@ -226,7 +244,6 @@ pub fn start_peer_connection(
                             }
                             locators
                         };
-                        
                         send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port.clone() }).await;
                     } else {
                         // Log enrichi pour le serveur TCP
