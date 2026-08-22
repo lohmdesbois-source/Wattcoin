@@ -813,6 +813,19 @@ impl Blockchain {
             }
         }
         self.spent_key_images = new_spent;
+		
+		// On met à jour le prix en RAM après une réorganisation !
+        for block in self.chain.iter().rev() {
+            let mut found_price = false;
+            for tx in block.transactions.iter().rev() {
+                if let TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
+                    crate::api::LAST_PRICE_SATS.store(*clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
+                    found_price = true;
+                    break;
+                }
+            }
+            if found_price { break; }
+        }
 
         true
     }
@@ -971,6 +984,20 @@ impl Blockchain {
                 }
             }
             self.spent_key_images = new_spent;
+			
+			// ON LIT S IL Y A MATCH, QUAND ON A ADOPTÉ LA NOUVELLE CHAÎNE !
+            for block in self.chain.iter().rev() {
+                let mut found_price = false;
+                for tx in block.transactions.iter().rev() {
+                    if let TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
+                        crate::api::LAST_PRICE_SATS.store(*clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
+                        found_price = true;
+                        break;
+                    }
+                }
+                if found_price { break; }
+            }
+			
             return true;
         }
         
