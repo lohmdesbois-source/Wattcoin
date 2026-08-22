@@ -1986,7 +1986,7 @@ impl eframe::App for WattcoinApp {
 								ui.checkbox(&mut self.notary_use_l2, "Ancrer sur le réseau L2 (Plus rapide)");
 								ui.add_space(10.0);
 
-								if ui.add_sized([300.0, 40.0], egui::Button::new("⚖️ Graver dans le Marbre Numérique")).clicked() {
+								if ui.add_sized([300.0, 40.0], egui::Button::new("⚖ Graver dans le Marbre Numérique")).clicked() {
 									if let Some(keys) = &self.wallet_keys {
 										self.sync_message = "Notarisation en cours...".to_string();
 										let tx = self.tx.clone();

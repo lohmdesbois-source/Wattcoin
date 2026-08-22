@@ -198,17 +198,38 @@ pub fn start_peer_connection(
 				},
 
                 P2PMessage::NewBlock { block, sender_port } => {
-                    let reject_info = {
+                    let is_rejected = {
                         let mut chain = blockchain.lock().unwrap();
-                        if let Err(_) = chain.validate_and_add_external_block(block.clone()) {
-                            Some((chain.chain[0].header.hash.clone(), chain.chain.len() as u64))
-                        } else { None }
+                        chain.validate_and_add_external_block(block.clone()).is_err()
                     };
 
-                    if let Some((my_genesis, my_height)) = reject_info {
-                        send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
+                    if is_rejected {
+                        // Au lieu d'un Handshake qui rend le réseau aveugle aux forks de même taille,
+                        // on force instantanément un SyncRequest pour récupérer l'embranchement et comparer le PoW !
+                        let locator_hashes = {
+                            let chain = blockchain.lock().unwrap();
+                            let mut locators = Vec::new();
+                            let len = chain.chain.len();
+                            
+                            if len > 0 {
+                                locators.push(chain.chain[len - 1].header.hash.clone());
+                                if len > 1 { locators.push(chain.chain[len - 2].header.hash.clone()); }
+                                
+                                let mut idx = len.saturating_sub(2).saturating_sub(5);
+                                while idx > 0 && locators.len() < 10 {
+                                    locators.push(chain.chain[idx].header.hash.clone());
+                                    idx = idx.saturating_sub(5);
+                                }
+                                if locators.last() != Some(&chain.chain[0].header.hash) {
+                                    locators.push(chain.chain[0].header.hash.clone()); 
+                                }
+                            }
+                            locators
+                        };
+                        
+                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port.clone() }).await;
                     } else {
-                        // 💡 NOUVEAU : Log enrichi pour le serveur TCP
+                        // Log enrichi pour le serveur TCP
                         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                         let tx_count = block.transactions.len();
                         let tx_detail = if tx_count == 1 { "1 Coinbase".to_string() } else { format!("1 Coinbase + {} Publique/Swap", tx_count - 1) };

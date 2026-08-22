@@ -39,3 +39,12 @@ rustflags = [
     '-Clink-arg=-llog',
     '-Clink-arg=-lOpenSLES',
 ]
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = [
+    "-C", "link-arg=-lstdc++",
+    "-C", "link-arg=-static-libstdc++",
+    "-C", "link-arg=-static-libgcc",
+    "-C", "link-arg=-ladvapi32"
+]

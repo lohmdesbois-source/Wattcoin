@@ -78,3 +78,5 @@ rfd = "0.14"
 
 [profile.dev]
 opt-level = 3 # Optimise l'application à fond, comme en mode Release !
+
+
