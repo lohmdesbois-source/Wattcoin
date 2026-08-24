@@ -429,8 +429,13 @@ async fn main() {
                 let mut last_share_time = 0;
                 
                 loop {
-                    if candidate_block.header.nonce % 20 == 0 {
-                        let chain = miner_chain.lock().unwrap();
+					if candidate_block.header.nonce % 20 == 0 {
+						// LECTURE DU KILL SWITCH (0 latence)
+						if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= candidate_block.header.index {
+							println!("🛑 [ALERTE RAPIDE] Un bloc concurrent a été détecté ! Arrêt immédiat.");
+							break;
+						}
+						let chain = miner_chain.lock().unwrap();
                         if chain.chain.len() as u64 > candidate_block.header.index {
                             println!("🛑 [ALERTE] Le réseau a trouvé le Bloc {} avant nous ! Annulation du minage.", candidate_block.header.index);
                             break; 

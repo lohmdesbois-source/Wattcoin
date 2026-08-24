@@ -2,6 +2,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
@@ -15,6 +16,7 @@ use crate::mixnet::OnionPacket;
 
 
 pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
+pub static HIGHEST_KNOWN_BLOCK: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum P2PMessage {
@@ -229,6 +231,8 @@ pub fn start_peer_connection(
 				},
 
                 P2PMessage::NewBlock { block, sender_port } => {
+					// DÉCLENCHEMENT DU KILL SWITCH
+					crate::network::HIGHEST_KNOWN_BLOCK.fetch_max(block.header.index, Ordering::Relaxed);
                     // 1. Clones pour envoyer dans le thread d'arrière-plan
                     let bc_clone = Arc::clone(&blockchain);
                     let block_clone = block.clone();

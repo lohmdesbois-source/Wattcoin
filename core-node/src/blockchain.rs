@@ -1041,7 +1041,7 @@ impl Blockchain {
 		let flags = randomx_rs::RandomXFlag::get_recommended_flags();
 		let seed = self.get_epoch_seed(block.header.index);
 		let cache = randomx_rs::RandomXCache::new(flags, seed.as_bytes()).map_err(|_| "Erreur Cache")?;
-		let vm = randomx_rs::RandomXVM::new(flags, Some(cache), None).map_err(|_| "Erreur VM")?;
+		let vm = randomx_rs::RandomXVM::new(flags, Some(cache.clone()), None).map_err(|_| "Erreur VM")?;
 
 		// L2 ANCHORING
 		let header_data = format!("{}{}{}{}{}{}", 
@@ -1107,9 +1107,13 @@ impl Blockchain {
         let share_prev_hash = last_block.header.previous_hash.clone();
         let share_seed = self.get_epoch_seed(share_height);
         
-        // On initialise le cache lourd hors de la boucle
-        let share_cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).map_err(|_| "Erreur Cache Part")?;
-        let share_vm = randomx_rs::RandomXVM::new(flags, Some(share_cache), None).map_err(|_| "Erreur VM Part")?;
+        let share_vm = if seed == share_seed {
+            // OPTIMISATION : On recycle le cache déjà calculé
+            randomx_rs::RandomXVM::new(flags, Some(cache.clone()), None).map_err(|_| "Erreur VM Part")?
+        } else {
+            let new_share_cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).map_err(|_| "Erreur Cache Part")?;
+            randomx_rs::RandomXVM::new(flags, Some(new_share_cache), None).map_err(|_| "Erreur VM Part")?
+        };
 
         // Premier passage : validation
         for tx in &block.transactions {
