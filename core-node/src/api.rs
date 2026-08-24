@@ -133,11 +133,22 @@ pub async fn start_api_server(
 						// Le Nœud L1 fait la requête HTTP POST à la place de l'utilisateur !
 						tokio::spawn(async move {
 							let client = reqwest::Client::new();
-							let _ = client.post(&target_url)
+							match client.post(&target_url)
 								.header("Content-Type", "application/json")
 								.body(payload)
 								.send()
-								.await;
+								.await {
+                                Ok(res) => {
+                                    let status = res.status();
+                                    let text = res.text().await.unwrap_or_default();
+                                    if status.is_success() {
+                                        println!("✅ [MIXNET] TX routée et acceptée par l'API locale !");
+                                    } else {
+                                        println!("❌ [MIXNET] L'API locale a refusé la TX. Code: {}, Raison: {}", status, text);
+                                    }
+                                }
+                                Err(e) => println!("❌ [MIXNET] Erreur de connexion locale vers l'API : {}", e),
+                            }
 						});
 						
 					} else if !hop_payload.next_hop_address.is_empty() {

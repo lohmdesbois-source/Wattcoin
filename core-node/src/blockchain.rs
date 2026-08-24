@@ -559,7 +559,7 @@ impl Blockchain {
             // 4. Le validateur prend le reste de la subvention (20% + poussière) + 100% DES FRAIS L1
             let final_finder_reward = (allowed_subsidy - exact_community_reward) + l1_miner_fees;
 
-            println!("🤝 [P2POOL] Répartition : Validateur (Base {:.9}  + Frais {:.9}  = {:.9} Watts).\nCommunauté ({:.9} Watts).", 
+            println!("🤝 [P2POOL] Répartition :\nMineur (Base {:.9}  + Frais {:.9}  = {:.9} Watts).\nCommunauté ({:.9} Watts).", 
                 ((allowed_subsidy - exact_community_reward)  as f64) / (FLAME as f64),
 				(l1_miner_fees as f64) / (FLAME as f64),
 				(final_finder_reward as f64) / (FLAME as f64),

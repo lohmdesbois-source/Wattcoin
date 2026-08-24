@@ -763,9 +763,12 @@ async fn main() {
                     
                     let mut mp = miner_mempool.lock().unwrap();
                     mp.retain(|tx| {
-                        !candidate_block.transactions.iter().any(|mined_tx| {
+                        let not_in_block = !candidate_block.transactions.iter().any(|mined_tx| {
                             mined_tx.public_key == tx.public_key
-                        })
+                        });
+                        // PURGE : Le bloc est miné, on brûle les parts de minage restantes
+                        let is_not_old_share = !matches!(tx.tx_type, TransactionType::MiningShare { .. });
+                        not_in_block && is_not_old_share
                     });
                 }
             }

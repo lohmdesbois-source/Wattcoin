@@ -224,7 +224,12 @@ pub fn start_peer_connection(
 					if chain.resolve_partial_fork(blocks.clone()) { 
 						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
 						let mut mp = mempool.lock().unwrap();
-						mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key)) });
+						mp.retain(|tx| { 
+                            let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
+                            // PURGE : On détruit les parts périmées
+                            let is_not_old_share = !matches!(tx.tx_type, TransactionType::MiningShare { .. });
+                            not_in_block && is_not_old_share
+                        });
 					} else {
 						println!("❌ [SYNC] Échec de la fusion !");
 					}
@@ -307,7 +312,10 @@ pub fn start_peer_connection(
                                 println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
                                 
                                 mempool_clone.lock().unwrap().retain(|t| { 
-                                    !block.transactions.iter().any(|mined_tx| mined_tx.public_key == t.public_key) 
+                                    let not_in_block = !block.transactions.iter().any(|mined_tx| mined_tx.public_key == t.public_key);
+                                    // PURGE : On détruit impitoyablement toutes les vieilles parts de minage
+                                    let is_not_old_share = !matches!(t.tx_type, TransactionType::MiningShare { .. });
+                                    not_in_block && is_not_old_share
                                 });
                                 
                                 dex_pool_clone.lock().unwrap().clear();
@@ -372,7 +380,7 @@ pub fn start_peer_connection(
 						// Filtre Anti-Exhaustion CPU
 						{
 							let pool = mempool.lock().unwrap();
-							if pool.iter().filter(|t| matches!(t.tx_type, TransactionType::MiningShare { .. })).count() > 100 {
+							if pool.iter().filter(|t| matches!(t.tx_type, TransactionType::MiningShare { .. })).count() > 500 {
 								continue; 
 							}
 						}
