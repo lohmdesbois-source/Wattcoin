@@ -341,44 +341,53 @@ pub fn start_peer_connection(
                 },
 
                 P2PMessage::BroadcastTransaction { tx: in_tx } => {
-					// 1. 🛡️ REJET DES TRANSACTIONS SYSTÈMES EN P2P
+					// 1. REJET DES TRANSACTIONS SYSTÈMES EN P2P
 					if matches!(in_tx.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::DexSettlement { .. } | TransactionType::LotteryPayout { .. }) {
 						println!("🚨 [SÉCURITÉ] Tentative d'injection d'une transaction système via P2P. Bloquée.");
 						continue; 
 					}
 
-					// 2. 🛡️ LE BOUCLIER QUALITATIF (P2Pool Mining Share)
+					// 2. LE BOUCLIER QUALITATIF (P2Pool Mining Share)
 					if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = in_tx.tx_type.clone() {
 						
 						let (target, current_height, previous_hash, seed) = {
-							let chain = blockchain.lock().unwrap(); // Ou bc_clone dans la boucle Tor
+							let chain = blockchain.lock().unwrap();
 							let height = chain.chain.len() as u64;
 							let prev_hash = if height > 0 { chain.chain.last().unwrap().header.hash.clone() } else { String::new() };
 							(chain.target.clone(), height, prev_hash, chain.get_epoch_seed(height))
 						};
 
+						// KILL SWITCH 1 : Si la part appartient à un vieux bloc, on la jette sans calcul !
+						let highest_known = crate::network::HIGHEST_KNOWN_BLOCK.load(Ordering::Relaxed);
+						if current_height < highest_known {
+							continue; 
+						}
+
 						// Filtre Mathématique ultra-rapide (Instant Kill)
 						let hash_bigint = num_bigint::BigUint::parse_bytes(hash.as_bytes(), 16).unwrap_or_default();
 						if hash_bigint > (&target * 20u32) {
-							// Un hacker a envoyé une part avec un hash qui n'est même pas gagnant
 							continue;
 						}
 
-						// Filtre Anti-Exhaustion CPU (On limite le travail d'expertise)
+						// Filtre Anti-Exhaustion CPU
 						{
-							let pool = mempool.lock().unwrap(); // Ou mp_clone dans la boucle Tor
+							let pool = mempool.lock().unwrap();
 							if pool.iter().filter(|t| matches!(t.tx_type, TransactionType::MiningShare { .. })).count() > 100 {
 								continue; 
 							}
 						}
 
-						// Expertise RandomX (Déportée en arrière-plan pour ne pas bloquer le réseau P2P)
 						let tx_clone = in_tx.clone();
-						let mp_clone_bg = Arc::clone(&mempool); // Ou mp_clone.clone() dans la boucle Tor
-						let ap_clone_bg = Arc::clone(&active_peers); // Ou ap_clone.clone() dans la boucle Tor
+						let mp_clone_bg = Arc::clone(&mempool);
+						let ap_clone_bg = Arc::clone(&active_peers);
 						let actual_peer_id_clone = actual_peer_id.clone(); 
 
 						tokio::task::spawn_blocking(move || {
+							// KILL SWITCH 2 : Juste avant de lancer le hachage lourd, on revérifie si le bloc a changé !
+							if crate::network::HIGHEST_KNOWN_BLOCK.load(Ordering::Relaxed) > current_height {
+								return; // On avorte la tâche pour libérer le CPU
+							}
+
 							let parts: Vec<&str> = tx_clone.public_key.split('_').collect();
 							let l2_root = parts.get(0).cloned().unwrap_or("");
 							let tx_root = parts.get(1).cloned().unwrap_or("");
@@ -386,11 +395,9 @@ pub fn start_peer_connection(
 							let header_data = format!("{}{}{}{}{}{}", current_height, timestamp, previous_hash, nonce, l2_root, tx_root);
 							
 							let flags = randomx_rs::RandomXFlag::get_recommended_flags();
-							// Initialisation légère du VM (Sans dataset = moins de RAM, idéal pour valider)
 							if let Ok(cache) = randomx_rs::RandomXCache::new(flags, seed.as_bytes()) {
 								if let Ok(vm) = randomx_rs::RandomXVM::new(flags, Some(cache), None) {
 									if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
-										
 										if hex::encode(&hash_bytes) == *hash {
 											let mut pool = mp_clone_bg.lock().unwrap();
 											if !pool.iter().any(|t| t.public_key == tx_clone.public_key) {
@@ -415,7 +422,7 @@ pub fn start_peer_connection(
 							}
 						});
 						
-						continue; // On passe à l'écoute du message P2P suivant
+						continue;
 					}
 
 					// 3. TRAITEMENT CLASSIQUE POUR LES AUTRES TRANSACTIONS (HTLC, Envoi Classique...)

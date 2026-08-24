@@ -868,7 +868,7 @@ impl Blockchain {
 		};
 		
         // ====================================================================
-		// ⏱️ PARAMÈTRES DU BOUCLIER TEMPOREL (Anti-Time Warp)
+		// PARAMÈTRES DU BOUCLIER TEMPOREL (Anti-Time Warp)
 		// ====================================================================
 		let current_time = chrono::Utc::now().timestamp();
 		let max_future_tolerance = 7200; // Tolérance de 2 heures
@@ -881,7 +881,7 @@ impl Blockchain {
 		
 		for block in &new_blocks {
 			// ====================================================================
-			// 🛡️ APPLICATION DU BOUCLIER TEMPOREL SUR LE FORK
+			// APPLICATION DU BOUCLIER TEMPOREL SUR LE FORK
 			// ====================================================================
 			if block.header.timestamp > current_time + max_future_tolerance {
 				println!(
