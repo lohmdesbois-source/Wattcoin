@@ -293,7 +293,18 @@ async fn main() {
             let mut current_sequencer_task: Option<tokio::task::JoinHandle<()>> = None;
         
             loop {
-                // 💡 0. LE MOTEUR DEX (FBA) ON-CHAIN - VERSION SÉCURISÉE
+                // BOUCLIER ANTI-SPINLOCK
+                // Si le kill switch est activé, on attend que le réseau finisse de valider
+                let current_height = { miner_chain.lock().unwrap().chain.len() as u64 };
+                let highest_known = wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed);
+                
+                if highest_known >= current_height {
+                    // On dort 100ms pour laisser 100% du CPU et du Mutex au validateur réseau
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue; // On reboucle silencieusement sans rien calculer
+                }
+
+                // 0. LE MOTEUR DEX (FBA) ON-CHAIN - VERSION SÉCURISÉE
                 let mut dex_settlement_tx = None;
                 {
                     let mut p = miner_dex_pool.lock().unwrap();

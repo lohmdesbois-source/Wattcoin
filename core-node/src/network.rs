@@ -284,6 +284,11 @@ pub fn start_peer_connection(
                         // 4. Gestion du résultat réseau
                         match validation_result {
                             Err((my_genesis, my_height, locator_hashes)) => {
+                                // SI LE BLOC EST INVALIDE, ON RELÂCHE LE KILL SWITCH POUR LE MINEUR !
+                                // ASTUCE : my_height contient DÉJÀ la longueur de la chaîne (renvoyée par le closure) !
+                                // Zéro latence, pas besoin de refaire un lock() sur bc_clone.
+                                crate::network::HIGHEST_KNOWN_BLOCK.store(my_height.saturating_sub(1), Ordering::Relaxed);
+
                                 // On envoie sans cooldown ici pour l'instant (laissons le réseau se corriger)
                                 send_message_to_channel(&tx_clone, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() }).await;
                                 send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port_clone.clone() }).await;
