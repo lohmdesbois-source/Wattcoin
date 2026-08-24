@@ -763,12 +763,11 @@ async fn main() {
                     
                     let mut mp = miner_mempool.lock().unwrap();
                     
-                    // LA RÈGLE D'OR : On récupère l'heure de l'avant-dernier bloc
-                    let cutoff_time = {
-                        let chain = miner_chain.lock().unwrap();
-                        if chain.chain.len() >= 2 {
-                            chain.chain[chain.chain.len() - 2].header.timestamp
-                        } else { 0 }
+                    // On utilise `chain` qui est déjà verrouillé plus haut !
+                    let cutoff_time = if chain.chain.len() >= 2 {
+                        chain.chain[chain.chain.len() - 2].header.timestamp
+                    } else { 
+                        0 
                     };
 
                     mp.retain(|tx| {
@@ -782,11 +781,11 @@ async fn main() {
                         };
                         not_in_block && is_valid_share
                     });
-                }
+                } // Le verrou `chain` est enfin relâché proprement ici !
             }
         });
 
-        // 💡 CRITIQUE : Puisque le minage est parti dans un thread d'arrière-plan,
+        // Puisque le minage est parti dans un thread d'arrière-plan,
         // on demande à notre programme principal d'attendre indéfiniment sans s'éteindre.
         std::future::pending::<()>().await;
     }
