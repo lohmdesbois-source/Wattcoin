@@ -762,13 +762,25 @@ async fn main() {
                     }
                     
                     let mut mp = miner_mempool.lock().unwrap();
+                    
+                    // LA RÈGLE D'OR : On récupère l'heure de l'avant-dernier bloc
+                    let cutoff_time = {
+                        let chain = miner_chain.lock().unwrap();
+                        if chain.chain.len() >= 2 {
+                            chain.chain[chain.chain.len() - 2].header.timestamp
+                        } else { 0 }
+                    };
+
                     mp.retain(|tx| {
                         let not_in_block = !candidate_block.transactions.iter().any(|mined_tx| {
                             mined_tx.public_key == tx.public_key
                         });
-                        // PURGE : Le bloc est miné, on brûle les parts de minage restantes
-                        let is_not_old_share = !matches!(tx.tx_type, TransactionType::MiningShare { .. });
-                        not_in_block && is_not_old_share
+                        // PURGE KISS : On détruit mathématiquement les parts du bloc précédent
+                        let is_valid_share = match &tx.tx_type {
+                            TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+                            _ => true
+                        };
+                        not_in_block && is_valid_share
                     });
                 }
             }

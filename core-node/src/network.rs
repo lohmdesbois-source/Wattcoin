@@ -223,12 +223,18 @@ pub fn start_peer_connection(
 					
 					if chain.resolve_partial_fork(blocks.clone()) { 
 						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
-						let mut mp = mempool.lock().unwrap();
+						
+                        let cutoff_time = if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 };
+
+                        let mut mp = mempool.lock().unwrap();
 						mp.retain(|tx| { 
                             let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
-                            // PURGE : On détruit les parts périmées
-                            let is_not_old_share = !matches!(tx.tx_type, TransactionType::MiningShare { .. });
-                            not_in_block && is_not_old_share
+                            // PURGE KISS
+                            let is_valid_share = match &tx.tx_type {
+                                TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+                                _ => true
+                            };
+                            not_in_block && is_valid_share
                         });
 					} else {
 						println!("❌ [SYNC] Échec de la fusion !");
@@ -252,8 +258,9 @@ pub fn start_peer_connection(
                     tokio::spawn(async move {
                         
                         // 3. On isole la lourde cryptographie sur un cœur du CPU
+                        let bc_clone_blocking = Arc::clone(&bc_clone); 
                         let validation_result = tokio::task::spawn_blocking(move || {
-                            let mut chain = bc_clone.lock().unwrap();
+                            let mut chain = bc_clone_blocking.lock().unwrap(); 
                             let current_height = chain.chain.len() as u64;
                             
                             // Anti-doublon ultra-rapide avant la grosse validation
@@ -309,13 +316,22 @@ pub fn start_peer_connection(
                                 println!("🔗 Hash    : {}", block.header.hash);
                                 println!("📝 Contenu : {} transactions incluses ({})", tx_count, tx_detail);
                                 println!("====================================================================");
-                                println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
+								println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
                                 
+                                // LA RÈGLE D'OR : On récupère l'heure de l'avant-dernier bloc
+                                let cutoff_time = {
+                                    let chain = bc_clone.lock().unwrap(); 
+                                    if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 }
+                                };
+
                                 mempool_clone.lock().unwrap().retain(|t| { 
                                     let not_in_block = !block.transactions.iter().any(|mined_tx| mined_tx.public_key == t.public_key);
-                                    // PURGE : On détruit impitoyablement toutes les vieilles parts de minage
-                                    let is_not_old_share = !matches!(t.tx_type, TransactionType::MiningShare { .. });
-                                    not_in_block && is_not_old_share
+                                    // PURGE KISS : On détruit les parts périmées
+                                    let is_valid_share = match &t.tx_type {
+                                        TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+                                        _ => true
+                                    };
+                                    not_in_block && is_valid_share
                                 });
                                 
                                 dex_pool_clone.lock().unwrap().clear();
