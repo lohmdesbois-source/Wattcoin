@@ -1095,15 +1095,24 @@ impl Blockchain {
 			}
 		}
 		// ====================================================================
-
+		
 		// CALCUL MATHÉMATIQUE STRICT DE L'ÉMISSION (Indépendant des UTXOs)
         let mut expected_subsidy = INITIAL_REWARD;
         for _ in 0..current_height {
             expected_subsidy = Blockchain::get_next_base_reward(expected_subsidy);
         }
 
-		// Premier passage : validation
-		for tx in &block.transactions {
+        // On prépare la VM pour les parts P2Pool UNE SEULE FOIS !
+        let share_height = current_height.saturating_sub(1);
+        let share_prev_hash = last_block.header.previous_hash.clone();
+        let share_seed = self.get_epoch_seed(share_height);
+        
+        // On initialise le cache lourd hors de la boucle
+        let share_cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).map_err(|_| "Erreur Cache Part")?;
+        let share_vm = randomx_rs::RandomXVM::new(flags, Some(share_cache), None).map_err(|_| "Erreur VM Part")?;
+
+        // Premier passage : validation
+        for tx in &block.transactions {
 			if tx.tx_type == TransactionType::Coinbase {
 				coinbase_count += 1;
 				continue;
@@ -1137,15 +1146,6 @@ impl Blockchain {
 			// VÉRIFICATION STRICTE DES PARTS DE MINAGE (Anti-Triche P2Pool)
             if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = &tx.tx_type {
                 
-                // Voyage dans le temps. On pointe sur les données d'il y a 1 bloc.
-                let share_height = current_height.saturating_sub(1);
-                let share_prev_hash = last_block.header.previous_hash.clone(); // Le previous du previous !
-                
-                // On initialise une VM propre pour la part au cas où on a passé une époque
-                let share_seed = self.get_epoch_seed(share_height);
-                let share_cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).map_err(|_| "Erreur Cache Part")?;
-                let share_vm = randomx_rs::RandomXVM::new(flags, Some(share_cache), None).map_err(|_| "Erreur VM Part")?;
-
                 // Décodage des métadonnées
                 let parts: Vec<&str> = tx.public_key.split('_').collect();
                 let l2_root = parts.get(0).cloned().unwrap_or("");
@@ -1153,6 +1153,8 @@ impl Blockchain {
                 
                 // Reconstitution
                 let header_data = format!("{}{}{}{}{}{}", share_height, timestamp, share_prev_hash, nonce, l2_root, tx_root);
+                
+                // On utilise la share_vm créée avant la boucle ! (Instantané)
                 let hash_bytes = share_vm.calculate_hash(header_data.as_bytes()).map_err(|_| "Erreur VM P2Pool")?;
                 
                 if hex::encode(&hash_bytes) != *hash { 

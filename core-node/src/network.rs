@@ -137,7 +137,7 @@ pub fn start_peer_connection(
                     if !genesis_valid { break; }
 
                     if is_behind {
-                        // ⚡ GÉNÉRATION DU LOCATOR (1, 2, puis de 5 en 5)
+                        // GÉNÉRATION DU LOCATOR (1, 2, puis de 5 en 5)
                         let locator_hashes = {
                             let chain = blockchain.lock().unwrap(); 
                             let mut locators = Vec::new();
@@ -171,7 +171,7 @@ pub fn start_peer_connection(
                         let chain = blockchain.lock().unwrap(); 
                         let mut found_idx = 0; // Par défaut, on remonte au Genesis
                         
-                        // ⚡ RECHERCHE DYNAMIQUE DE L'ANCÊTRE
+                        // RECHERCHE DYNAMIQUE DE L'ANCÊTRE
                         for locator in locator_hashes {
                             if let Some(pos) = chain.chain.iter().position(|b| b.header.hash == locator) {
                                 found_idx = pos;
@@ -198,8 +198,27 @@ pub fn start_peer_connection(
 						println!("⚠️ [SYNC] Lot de blocs vide reçu, ignoré.");
 						continue;
 					}
-					println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, blocks.last().unwrap().header.index);
+					
+					let incoming_last = blocks.last().unwrap();
 					let mut chain = blockchain.lock().unwrap(); 
+					let current_height = chain.chain.len() as u64;
+
+					// ====================================================================
+					// BOUCLIER ANTI-SPAM & ANTI-FAUX POSITIF MESS
+					// Si on a déjà dépassé cet index ET que le hash correspond à ce qu'on a,
+					// c'est un lot en double. On le détruit silencieusement.
+					// ====================================================================
+					if incoming_last.header.index < current_height {
+						let our_hash = &chain.chain[incoming_last.header.index as usize].header.hash;
+						if our_hash == &incoming_last.header.hash {
+							// Optionnel : Tu peux décommenter la ligne dessous pour voir le bouclier agir
+							// println!("🛡️ [SYNC] Lot doublon intercepté et détruit (Index {}).", incoming_last.header.index);
+							continue;
+						}
+					}
+
+					println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, incoming_last.header.index);
+					
 					if chain.resolve_partial_fork(blocks.clone()) { 
 						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
 						let mut mp = mempool.lock().unwrap();
@@ -210,77 +229,94 @@ pub fn start_peer_connection(
 				},
 
                 P2PMessage::NewBlock { block, sender_port } => {
-                    let reject_info = {
-                        let mut chain = blockchain.lock().unwrap();
-                        if let Err(_) = chain.validate_and_add_external_block(block.clone()) {
-                            Some((chain.chain[0].header.hash.clone(), chain.chain.len() as u64))
-                        } else { None }
-                    };
+                    // 1. Clones pour envoyer dans le thread d'arrière-plan
+                    let bc_clone = Arc::clone(&blockchain);
+                    let block_clone = block.clone();
+                    let my_port_clone = my_port.clone();
+                    let tx_clone = tx.clone();
+                    let mempool_clone = Arc::clone(&mempool);
+                    let dex_pool_clone = Arc::clone(&dex_pool);
+                    let active_peers_clone = Arc::clone(&active_peers);
+                    let actual_peer_id_clone = actual_peer_id.clone();
 
-                    if let Some((my_genesis, my_height)) = reject_info {
-                        // On fait les DEUX (Handshake + SyncRequest)
+                    // 2. On libère IMMÉDIATEMENT le port TCP (le réseau respire)
+                    tokio::spawn(async move {
                         
-                        // 1. On avertit l'autre de notre hauteur (Pour que le retardataire se mette à jour)
-                        send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
-                        
-                        // 2. On demande son historique (Pour résoudre les forks à hauteur égale)
-                        let locator_hashes = {
-                            let chain = blockchain.lock().unwrap();
-                            let mut locators = Vec::new();
-                            let len = chain.chain.len();
+                        // 3. On isole la lourde cryptographie sur un cœur du CPU
+                        let validation_result = tokio::task::spawn_blocking(move || {
+                            let mut chain = bc_clone.lock().unwrap();
+                            let current_height = chain.chain.len() as u64;
                             
-                            if len > 0 {
-                                locators.push(chain.chain[len - 1].header.hash.clone());
-                                if len > 1 { locators.push(chain.chain[len - 2].header.hash.clone()); }
-                                
-                                let mut idx = len.saturating_sub(2).saturating_sub(5);
-                                while idx > 0 && locators.len() < 10 {
-                                    locators.push(chain.chain[idx].header.hash.clone());
-                                    idx = idx.saturating_sub(5);
-                                }
-                                if locators.last() != Some(&chain.chain[0].header.hash) {
-                                    locators.push(chain.chain[0].header.hash.clone()); 
+                            // Anti-doublon ultra-rapide avant la grosse validation
+                            if block_clone.header.index < current_height {
+                                let our_hash = &chain.chain[block_clone.header.index as usize].header.hash;
+                                if our_hash == &block_clone.header.hash {
+                                    return Ok(()); // Déjà connu, on ignore
                                 }
                             }
-                            locators
-                        };
-                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port.clone() }).await;
-                    } else {
-                        // Log enrichi pour le serveur TCP
-                        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let tx_count = block.transactions.len();
-                        let tx_detail = if tx_count == 1 { "1 Coinbase".to_string() } else { format!("1 Coinbase + {} Publique/Swap", tx_count - 1) };
 
-                        println!("\n====================================================================");
-                        println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU VIA P2P ! (Source: {})", block.header.index, sender_port);
-                        println!("🕒 Reçu le : {}", now);
-                        println!("🔗 Hash    : {}", block.header.hash);
-                        println!("📝 Contenu : {} transactions incluses ({})", tx_count, tx_detail);
-                        println!("====================================================================");
-                        println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
-                        
-                        
-                        
-                        mempool.lock().unwrap().retain(|t| { 
-                            !block.transactions.iter().any(|mined_tx| {
-                                mined_tx.public_key == t.public_key
-                            }) 
-                        });
-                        
-                        dex_pool.lock().unwrap().clear();
-                        println!("🧹 [DEX] Nouveau bloc reçu : La session FBA est clôturée, Dark Pool vidé.");
-						
-                        let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port.clone() };
-                        let mut json_str = serde_json::to_string(&env).unwrap();
-                        json_str.push('\n');
-                        
-                        let ap = active_peers.lock().unwrap().clone();
-                        for (peer_id, sender) in ap.iter() {
-                            if peer_id != &actual_peer_id {
-                                let _ = sender.try_send(json_str.clone());
+                            if let Err(_) = chain.validate_and_add_external_block(block_clone) {
+                                // Préparation des locators pour la synchro en cas de rejet
+                                let mut locators = Vec::new();
+                                let len = chain.chain.len();
+                                if len > 0 {
+                                    locators.push(chain.chain[len - 1].header.hash.clone());
+                                    if len > 1 { locators.push(chain.chain[len - 2].header.hash.clone()); }
+                                    let mut idx = len.saturating_sub(2).saturating_sub(5);
+                                    while idx > 0 && locators.len() < 10 {
+                                        locators.push(chain.chain[idx].header.hash.clone());
+                                        idx = idx.saturating_sub(5);
+                                    }
+                                    if locators.last() != Some(&chain.chain[0].header.hash) {
+                                        locators.push(chain.chain[0].header.hash.clone()); 
+                                    }
+                                }
+                                Err((chain.chain[0].header.hash.clone(), len as u64, locators))
+                            } else {
+                                Ok(())
+                            }
+                        }).await.unwrap();
+
+                        // 4. Gestion du résultat réseau
+                        match validation_result {
+                            Err((my_genesis, my_height, locator_hashes)) => {
+                                // On envoie sans cooldown ici pour l'instant (laissons le réseau se corriger)
+                                send_message_to_channel(&tx_clone, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() }).await;
+                                send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port_clone.clone() }).await;
+                            },
+                            Ok(()) => {
+                                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                let tx_count = block.transactions.len();
+                                let tx_detail = if tx_count == 1 { "1 Coinbase".to_string() } else { format!("1 Coinbase + {} Publique/Swap", tx_count - 1) };
+
+                                println!("\n====================================================================");
+                                println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU VIA P2P ! (Source: {})", block.header.index, sender_port);
+                                println!("🕒 Reçu le : {}", now);
+                                println!("🔗 Hash    : {}", block.header.hash);
+                                println!("📝 Contenu : {} transactions incluses ({})", tx_count, tx_detail);
+                                println!("====================================================================");
+                                println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
+                                
+                                mempool_clone.lock().unwrap().retain(|t| { 
+                                    !block.transactions.iter().any(|mined_tx| mined_tx.public_key == t.public_key) 
+                                });
+                                
+                                dex_pool_clone.lock().unwrap().clear();
+                                println!("🧹 [DEX] Nouveau bloc reçu : La session FBA est clôturée, Dark Pool vidé.");
+                                
+                                let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port_clone };
+                                let mut json_str = serde_json::to_string(&env).unwrap();
+                                json_str.push('\n');
+                                
+                                let ap = active_peers_clone.lock().unwrap().clone();
+                                for (peer_id, sender) in ap.iter() {
+                                    if peer_id != &actual_peer_id_clone {
+                                        let _ = sender.try_send(json_str.clone());
+                                    }
+                                }
                             }
                         }
-                    }
+                    });
                 },
 
                 P2PMessage::WhisperTransaction { tx: in_tx } => {
@@ -431,124 +467,125 @@ pub fn start_peer_connection(
                 },
 				
 				P2PMessage::BroadcastMicroBlock { micro_block } => {
-                    let (current_l1_hash, current_l2_root) = {
-                        let chain = blockchain.lock().unwrap();
-                        let last_block = chain.chain.last().unwrap();
-                        (last_block.header.hash.clone(), last_block.header.l2_root.clone())
-                    };
+                    let bc_clone = Arc::clone(&blockchain);
+                    let mp_clone = Arc::clone(&mempool);
+                    let ap_clone = Arc::clone(&active_peers);
+                    let actual_peer_id_clone = actual_peer_id.clone();
+                    let l2_db_file_clone = l2_db_file.clone();
 
-                    if micro_block.l1_parent_hash == current_l1_hash && micro_block.merkle_proof.len() == 128 {
-                        let mut calculated_root = micro_block.merkle_proof[0].clone();
-                        for i in 1..128 {
-                            calculated_root = crate::merkle_ring::MpcRingSignature::hash_nodes(&calculated_root, &micro_block.merkle_proof[i]);
+                    // On passe en asynchrone pour pouvoir patienter sans bloquer le réseau
+                    tokio::spawn(async move {
+                        let mut parent_l1_block = None;
+                        
+                        // BOUCLIER DE LATENCE : On patiente jusqu'à 5 secondes que le bloc L1 soit validé
+                        for _ in 0..10 {
+                            {
+                                let chain = bc_clone.lock().unwrap();
+                                // On cherche dans les 10 derniers blocs au cas où on avance très vite
+                                parent_l1_block = chain.chain.iter().rev().take(10).find(|b| b.header.hash == micro_block.l1_parent_hash).cloned();
+                            }
+                            if parent_l1_block.is_some() { break; }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         }
-                                        
-                        // 💡 FIX : On utilise key_index pour vérifier l'appartenance à l'arbre !
-                        if calculated_root == current_l2_root && micro_block.merkle_proof[micro_block.key_index as usize] == micro_block.sequencer_pubkey {
+
+                        if let Some(parent_block) = parent_l1_block {
+                            let current_l2_root = parent_block.header.l2_root.clone();
+
+                            if micro_block.merkle_proof.len() == 128 {
+                                let mut calculated_root = micro_block.merkle_proof[0].clone();
+                                for i in 1..128 {
+                                    calculated_root = crate::merkle_ring::MpcRingSignature::hash_nodes(&calculated_root, &micro_block.merkle_proof[i]);
+                                }
+                                                
+                                if calculated_root == current_l2_root && micro_block.merkle_proof[micro_block.key_index as usize] == micro_block.sequencer_pubkey {
+                                    
+                                    // On hache avec key_index
+                                    let mb_data = format!("{}{}{}{}", micro_block.l1_parent_hash, micro_block.micro_index, micro_block.key_index, micro_block.timestamp);
+                                    let mut hasher = sha2::Sha512::new();
+                                    use sha2::Digest;
+                                    hasher.update(mb_data.as_bytes());
+                                    let mut hash_arr = [0u8; 64];
+                                    hash_arr.copy_from_slice(&hasher.finalize());
+
+                                    if crate::wots::WotsKeyPair::verify(&micro_block.sequencer_pubkey, &micro_block.sequencer_sig, &hash_arr) {
+                                                        
+                                        // 1. TRIBUNAL DES FRAIS
+                                        if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
+                                            println!("❌ [L2 REJETÉ] Le séquenceur a oublié la MicroCoinbase !");
+                                            return;
+                                        }
+                                        let expected_fees = (micro_block.transactions.len() - 1) as u64 * 100;
+                                        let actual_fees: u64 = micro_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
+                                                        
+                                        if actual_fees > expected_fees {
+                                            println!("❌ [L2 REJETÉ] Le séquenceur tente d'imprimer de l'argent !");
+                                            return;
+                                        }
+
+                                        // 1.5 TRIBUNAL DES TRANSACTIONS L2
+                                        let mut all_valid = true;
+                                        let mut temp_spent = std::collections::HashSet::new();
+
+                                        {
+                                            let chain_lock = bc_clone.lock().unwrap(); 
                                             
-                            // 💡 FIX : On hache avec key_index
-                            let mb_data = format!("{}{}{}{}", micro_block.l1_parent_hash, micro_block.micro_index, micro_block.key_index, micro_block.timestamp);
-                            let mut hasher = sha2::Sha512::new();
-                            use sha2::Digest;
-                            hasher.update(mb_data.as_bytes());
-                            let mut hash_arr = [0u8; 64];
-                            hash_arr.copy_from_slice(&hasher.finalize());
-
-                            if crate::wots::WotsKeyPair::verify(&micro_block.sequencer_pubkey, &micro_block.sequencer_sig, &hash_arr) {
+                                            for (idx, tx) in micro_block.transactions.iter().enumerate() {
+                                                if idx == 0 { continue; } 
+                                                if !tx.is_valid() { all_valid = false; break; }
                                                 
-                                // 1. TRIBUNAL DES FRAIS (Anti-Triche du Séquenceur)
-                                if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
-                                    println!("❌ [L2 REJETÉ] Le séquenceur a oublié la MicroCoinbase !");
-                                    continue;
-                                }
-                                let expected_fees = (micro_block.transactions.len() - 1) as u64 * 100;
-                                let actual_fees: u64 = micro_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
-                                                
-                                if actual_fees > expected_fees {
-                                    println!("❌ [L2 REJETÉ] Le séquenceur tente d'imprimer de l'argent ({} vs {}) !", actual_fees, expected_fees);
-                                    continue;
-                                }
-
-                                println!("⚡ [L2 VERIFIÉ] MicroBloc {}/128 sauvegardé ! ({} TXs instantanées validées)", 
-                                            micro_block.micro_index, micro_block.transactions.len() - 1);
-                                                
-                                // =======================================================================
-								// 1.5 TRIBUNAL DES TRANSACTIONS L2 (La protection manquante !)
-								// =======================================================================
-								let mut all_valid = true;
-								let mut temp_spent = std::collections::HashSet::new();
-
-								{
-									// Utilise bc_clone.lock().unwrap() pour la boucle Tor, 
-									// ou blockchain.lock().unwrap() pour la boucle TCP.
-									let chain_lock = blockchain.lock().unwrap(); 
-									
-									for (idx, tx) in micro_block.transactions.iter().enumerate() {
-										if idx == 0 { continue; } // On ignore la MicroCoinbase (déjà vérifiée)
-										
-										// a) La transaction est-elle cryptographiquement valide ? (ZKP, Ring Signature, etc.)
-										if !tx.is_valid() {
-											println!("❌ [L2 REJETÉ] Le Séquenceur a inclus une transaction non valide cryptographiquement !");
-											all_valid = false;
-											break;
-										}
-										
-										// b) Anti-Double Dépense strict (L1 + L2)
-										let mut double_spend = false;
-										for input in &tx.inputs {
-											let ki = &input.mpc_ring.key_image;
-											// On vérifie sur la blockchain L1 et dans les transactions précédentes de CE microbloc
-											if chain_lock.spent_key_images.contains(ki) || temp_spent.contains(ki) {
-												double_spend = true;
-												break;
-											}
-											temp_spent.insert(ki.clone());
-										}
-										
-										if double_spend {
-											println!("❌ [L2 REJETÉ] Le Séquenceur tente de valider une double-dépense !");
-											all_valid = false;
-											break;
-										}
-									}
-								}
-
-								if !all_valid {
-									println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux ignoré. Le séquenceur a perdu sa crédibilité.");
-									continue; // On rejette brutalement tout le MicroBloc !
-								}
-								// =======================================================================
-								
-								// 2. MISE À JOUR DE L'ÉTAT L1/L2 UNIFIÉ (Anti-Double Dépense)
-                                {
-                                    let mut chain = blockchain.lock().unwrap();
-                                    for tx in &micro_block.transactions {
-                                        if tx.tx_type != TransactionType::MicroCoinbase {
-                                            for input in &tx.inputs {
-                                                chain.spent_key_images.insert(input.mpc_ring.key_image.clone());
+                                                let mut double_spend = false;
+                                                for input in &tx.inputs {
+                                                    let ki = &input.mpc_ring.key_image;
+                                                    if chain_lock.spent_key_images.contains(ki) || temp_spent.contains(ki) {
+                                                        double_spend = true;
+                                                        break;
+                                                    }
+                                                    temp_spent.insert(ki.clone());
+                                                }
+                                                if double_spend { all_valid = false; break; }
                                             }
                                         }
-                                    }
-                                    // Sauvegarde directe sur HDD !
-                                    crate::blockchain::Blockchain::save_microblock_to_disk(&l2_db_file, &micro_block);
-                                }
 
-                                // 3. NETTOYAGE DU MEMPOOL
-                                {
-                                    let mut mp = mempool.lock().unwrap();
-                                    mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.public_key == tx.public_key));
-                                }
-								
-                                let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };
-                                let mut json_str = serde_json::to_string(&envelope).unwrap();
-                                json_str.push('\n');
-                                let ap = active_peers.lock().unwrap().clone();
-                                for (peer_id, sender) in ap.iter() {
-                                    if peer_id != &actual_peer_id { let _ = sender.try_send(json_str.clone()); }
+                                        if !all_valid {
+                                            println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux ignoré.");
+                                            return;
+                                        }
+
+                                        println!("⚡ [L2 VERIFIÉ] MicroBloc {}/128 sauvegardé !", micro_block.micro_index);
+                                        
+                                        // 2. SAUVEGARDE L1/L2 UNIFIÉE
+                                        {
+                                            let mut chain = bc_clone.lock().unwrap();
+                                            for tx in &micro_block.transactions {
+                                                if tx.tx_type != TransactionType::MicroCoinbase {
+                                                    for input in &tx.inputs {
+                                                        chain.spent_key_images.insert(input.mpc_ring.key_image.clone());
+                                                    }
+                                                }
+                                            }
+                                            crate::blockchain::Blockchain::save_microblock_to_disk(&l2_db_file_clone, &micro_block);
+                                        }
+
+                                        // 3. NETTOYAGE DU MEMPOOL
+                                        {
+                                            let mut mp = mp_clone.lock().unwrap();
+                                            mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.public_key == tx.public_key));
+                                        }
+                                        
+                                        let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };
+                                        let mut json_str = serde_json::to_string(&envelope).unwrap();
+                                        json_str.push('\n');
+                                        let ap = ap_clone.lock().unwrap().clone();
+                                        for (peer_id, sender) in ap.iter() {
+                                            if peer_id != &actual_peer_id_clone { let _ = sender.try_send(json_str.clone()); }
+                                        }
+                                    }
                                 }
                             }
+                        } else {
+                            println!("⚠️ [L2] Microbloc orphelin reçu (Hash L1 '{}' inconnu ou non validé à temps). Rejeté.", micro_block.l1_parent_hash);
                         }
-                    }
+                    });
                 },
 				
 				P2PMessage::RelayOnion { packet } => {

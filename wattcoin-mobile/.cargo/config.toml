@@ -43,8 +43,9 @@ rustflags = [
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 rustflags = [
-    "-C", "link-arg=-lstdc++",
-    "-C", "link-arg=-static-libstdc++",
-    "-C", "link-arg=-static-libgcc",
+    "-C", "link-arg=-static",             # La massue : Force absolument TOUT en statique (y compris pthread)
+    "-C", "link-arg=-static-libgcc",      # Confirme pour libgcc
+    "-C", "link-arg=-static-libstdc++",   # Confirme pour libstdc++
+    "-C", "link-arg=-lstdc++",            # Maintenant on peut l'appeler, il sera statique !
     "-C", "link-arg=-ladvapi32"
 ]
