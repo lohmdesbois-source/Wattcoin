@@ -134,7 +134,7 @@ impl Blockchain {
         }
     }
 	
-	/// 💡 OPTIMISATION PRO (O(1)) : Calcule la récompense directement 
+	/// OPTIMISATION PRO (O(1)) : Calcule la récompense directement 
     /// à partir de la récompense de base du bloc précédent.
     pub fn get_next_base_reward(prev_base_reward: u64) -> u64 {
         let decay = prev_base_reward >> EMISSION_DECAY_SHIFT;
@@ -147,7 +147,7 @@ impl Blockchain {
         }
     }
 	
-    // 💡 Calcul de la Supply Totale (Précision Absolue)
+    // Calcul de la Supply Totale (Précision Absolue)
     pub fn get_total_supply(&self) -> u64 {
         let mut supply = 0;
         
@@ -186,7 +186,7 @@ impl Blockchain {
         let mut tickets = Vec::new();
         let mut pot = 0u64;
 
-        // 💡 NOUVEAU : On garde une trace des blocs L1 "récents" (post-tirage) pour filtrer le L2
+        // On garde une trace des blocs L1 "récents" (post-tirage) pour filtrer le L2
         let mut valid_l1_hashes = std::collections::HashSet::new();
 
         // 1. Lecture robuste du L1 (KISS)
@@ -211,19 +211,19 @@ impl Blockchain {
                     }
                 }
                 
-                // 🛑 LE FREIN : Dès qu'on tombe sur le PRÉCÉDENT tirage, on arrête de remonter le temps !
+                // LE FREIN : Dès qu'on tombe sur le PRÉCÉDENT tirage, on arrête de remonter le temps !
                 if let TransactionType::LotteryPayout { .. } = &tx.tx_type {
                     break 'block_loop; 
                 }
             }
         }
 
-        // 2. ⚡ Aspiration L2 (Corrigée avec le filtre chronologique)
+        // 2. Aspiration L2 (avec le filtre chronologique)
         if let Some(path) = l2_db_path {
             if let Ok(data) = std::fs::read_to_string(path) {
                 if let Ok(l2_chain) = serde_json::from_str::<Vec<crate::block::MicroBlock>>(&data) {
                     for mb in l2_chain {
-                        // 💡 LE FILTRE EST ICI : On ignore les micro-blocs ancrés à un vieux bloc L1 (déjà purgé)
+                        // LE FILTRE EST ICI : On ignore les micro-blocs ancrés à un vieux bloc L1 (déjà purgé)
                         if valid_l1_hashes.contains(&mb.l1_parent_hash) {
                             for tx in &mb.transactions {
                                 if tx.tx_type == TransactionType::MicroCoinbase {
@@ -252,7 +252,7 @@ impl Blockchain {
 		self.get_jackpot_info(next_draw, l2_db_path)
 	}
 
-    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str, l2_db_path: Option<&str>) -> (Block, BigUint, Vec<crate::wots::WotsKeyPair>) {
+    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str, l2_db_path: Option<&str>, l2_keys: Vec<crate::wots::WotsKeyPair>) -> (Block, BigUint, Vec<crate::wots::WotsKeyPair>) {
         let current_height = self.chain.len() as u64;
         println!("\n⏳ Préparation du Bloc {}...", current_height);
 
@@ -362,7 +362,7 @@ impl Blockchain {
 						continue;
 					}
 
-					// 🛡️ VÉRIFICATION HOMOMORPHE ABSOLUE (Analyse du bruit post-quantique)
+					// VÉRIFICATION HOMOMORPHE ABSOLUE (Analyse du bruit post-quantique)
 					// Comme le Blinding Factor est nul, la valeur est juste (montant + bruit).
 					// On vérifie que la déviation ne dépasse pas l'amplitude théorique du bruit CBD (24 max).
 					let mut is_valid_math = true;
@@ -401,7 +401,7 @@ impl Blockchain {
 						continue;
 					}
 
-					// 🛡️ LE BOUCLIER LATTICE POUR LE BRIDGE (La pièce manquante !)
+					// LE BOUCLIER LATTICE POUR LE BRIDGE
 					let mut is_valid_math = true;
 					for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
 						let expected = if i == 0 { bridge_amount } else { 0 };
@@ -439,8 +439,15 @@ impl Blockchain {
         }
 
         let previous_block = self.chain.last().unwrap();
-        let mut time_taken = chrono::Utc::now().timestamp() - previous_block.header.timestamp;
-        if time_taken <= 0 { time_taken = 1; } 
+        
+        // Tolérance de synchronisation d'horloge
+        let mut new_timestamp = chrono::Utc::now().timestamp();
+        if new_timestamp <= previous_block.header.timestamp {
+            new_timestamp = previous_block.header.timestamp + 1;
+        }
+        
+        let mut time_taken = new_timestamp - previous_block.header.timestamp;
+        if time_taken <= 0 { time_taken = 1; }
         
         let max_target = BigUint::from_bytes_be(&[0xFF; 32]);
         let initial_target = &max_target >> INITIAL_DIFFICULTY_SHIFT; 
@@ -682,39 +689,11 @@ impl Blockchain {
         };
         valid_transactions.insert(0, coinbase_tx);
 		
-		// GÉNÉRATION DU TROUSSEAU L2 (128 clés WOTS+ pour 2 minutes de L2)
-        // OPTIMISATION MULTI-THREAD DYNAMIQUE : S'adapte au CPU de l'utilisateur
-        // On détecte le nombre de cœurs logiques de la machine
-        let available_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        
-        // On laisse toujours 1 cœur libre pour l'OS et Tokio (Réseau) pour éviter les micro-freezes
-        let num_threads = if available_cores > 2 { available_cores - 1 } else { 1 }; 
-        
-        let mut handles = Vec::new();
-        let mut keys_left = 128;
-
-        for i in 0..num_threads {
-            // Répartition mathématique équitable des 128 clés sur les cœurs disponibles
-            let chunk_size = if i == num_threads - 1 { keys_left } else { 128 / num_threads };
-            keys_left -= chunk_size;
-
-            handles.push(std::thread::spawn(move || {
-                let mut chunk_keys = Vec::with_capacity(chunk_size);
-                for _ in 0..chunk_size {
-                    chunk_keys.push(crate::wots::WotsKeyPair::generate());
-                }
-                chunk_keys
-            }));
-        }
-        
-        let mut l2_keys = Vec::with_capacity(128);
+		// GÉNÉRATION DU TROUSSEAU L2
+        // Les clés sont maintenant reçues en argument, générées HORS du Mutex !
         let mut l2_pubkeys = Vec::with_capacity(128);
-        for handle in handles {
-            let keys = handle.join().expect("Erreur critique dans le thread WOTS+");
-            for k in keys {
-                l2_pubkeys.push(k.public_key.clone());
-                l2_keys.push(k);
-            }
+        for k in &l2_keys {
+            l2_pubkeys.push(k.public_key.clone());
         }
 
         // Création de l'arbre de Merkle simple pour la racine
@@ -725,13 +704,13 @@ impl Blockchain {
 
         let new_header = BlockHeader {
             index: current_height,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: new_timestamp, // Utilise le temps corrigé
             previous_hash: previous_block.header.hash.clone(),
             hash: String::new(),
             nonce: 0,
             target_hex: format!("{:0>64}", self.target.to_str_radix(16)),
-            l2_root, // La racine est ancrée dans le L1 !
-			tx_root: String::new(), // Sera calculé juste après
+            l2_root, 
+            tx_root: String::new(), 
         };
 
         let mut block = Block { header: new_header, transactions: valid_transactions };

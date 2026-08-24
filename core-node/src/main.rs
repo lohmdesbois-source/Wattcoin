@@ -294,14 +294,42 @@ async fn main() {
         
             loop {
                 // BOUCLIER ANTI-SPINLOCK
-                // Si le kill switch est activé, on attend que le réseau finisse de valider
                 let current_height = { miner_chain.lock().unwrap().chain.len() as u64 };
                 let highest_known = wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed);
                 
                 if highest_known >= current_height {
-                    // On dort 100ms pour laisser 100% du CPU et du Mutex au validateur réseau
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue; // On reboucle silencieusement sans rien calculer
+                    continue; 
+                }
+
+                // 1. GÉNÉRATION DES CLÉS L2 HORS DU MUTEX (ÉVITE LE GOULOT D'ÉTRANGLEMENT)
+                let available_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let num_threads = if available_cores > 2 { available_cores - 1 } else { 1 }; 
+                let mut handles = Vec::new();
+                let mut keys_left = 128;
+
+                for i in 0..num_threads {
+                    let chunk_size = if i == num_threads - 1 { keys_left } else { 128 / num_threads };
+                    keys_left -= chunk_size;
+
+                    handles.push(std::thread::spawn(move || {
+                        let mut chunk_keys = Vec::with_capacity(chunk_size);
+                        for _ in 0..chunk_size {
+                            chunk_keys.push(wattcoin_core::wots::WotsKeyPair::generate());
+                        }
+                        chunk_keys
+                    }));
+                }
+                
+                let mut pre_generated_l2_keys = Vec::with_capacity(128);
+                for handle in handles {
+                    let keys = handle.join().expect("Erreur critique thread WOTS+");
+                    pre_generated_l2_keys.extend(keys);
+                }
+
+                // 2. VÉRIFICATION DU KILL SWITCH (Au cas où un bloc est arrivé pendant la génération)
+                if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height {
+                    continue; // On annule tout et on laisse la place au réseau !
                 }
 
                 // 0. LE MOTEUR DEX (FBA) ON-CHAIN - VERSION SÉCURISÉE
@@ -377,16 +405,16 @@ async fn main() {
                 }
 
                 let (mut candidate_block, target, l2_keys) = {
-					let mut chain = miner_chain.lock().unwrap();
-					let mut pending_txs = miner_mempool.lock().unwrap().clone();
-					
-					if let Some(dex_tx) = dex_settlement_tx {
-						pending_txs.push(dex_tx);
-					}
-					
-					// On passe `miner_l2_db` pour que le bloc inclue les fonds L2
-					chain.prepare_block_template(pending_txs, &miner_address_clone, Some(&miner_l2_db))
-				};
+                    let mut chain = miner_chain.lock().unwrap();
+                    let mut pending_txs = miner_mempool.lock().unwrap().clone();
+                    
+                    if let Some(dex_tx) = dex_settlement_tx {
+                        pending_txs.push(dex_tx);
+                    }
+                    
+                    // On passe les clés pré-générées !
+                    chain.prepare_block_template(pending_txs, &miner_address_clone, Some(&miner_l2_db), pre_generated_l2_keys)
+                };
 
                 let target_epoch = (candidate_block.header.index - 1) / EPOCH_BLOCKS;
                 if target_epoch > current_epoch {
