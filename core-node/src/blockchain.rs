@@ -498,7 +498,7 @@ impl Blockchain {
         let total_lottery_tax = l1_lottery_tax + slashed_for_jackpot; 
 
         
-        println!("📉 Le mineur L1 gagne (100% des frais restants) : {:.9} Watts", (l1_miner_fees as f64) / (FLAME as f64));
+        println!("📉 Frais du mineur L1 : {:.9} Watts", (l1_miner_fees as f64) / (FLAME as f64));
 		
 		// RÉPARTITION ÉQUITABLE (80/20) P2POOL NATIF SUR LA SUBVENTION UNIQUEMENT
         let mut coinbase_outputs = Vec::new();
@@ -565,7 +565,7 @@ impl Blockchain {
 				(final_finder_reward as f64) / (FLAME as f64),
                 (exact_community_reward as f64) / (FLAME as f64)
             );
-            println!("🤝 [P2POOL] Chacun des {} petits mineurs reçoit : {:.9} Watts", 
+            println!("🤝 [P2POOL] Il y a {} parts de minages de : {:.9} Watts", 
                 valid_shares.len(), 
                 (share_reward as f64) / (FLAME as f64)
             );

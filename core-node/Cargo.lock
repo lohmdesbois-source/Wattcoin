@@ -5249,7 +5249,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_core"
-version = "2.1.14"
+version = "2.1.18"
 dependencies = [
  "aes-gcm",
  "arti-client",

@@ -1,6 +1,6 @@
 [package]
 name = "wattcoin-wallet"
-version = "2.1.14"
+version = "2.1.18"
 authors = ["ohm"]
 edition = "2024"
 resolver = "2"

@@ -151,7 +151,7 @@ async fn main() {
         println!("⏳ Le nœud est en mode veille. Lancement automatique dans {} secondes...", wait_seconds);
         println!("⏳ Laissez ce terminal ouvert. Les moteurs s'allumeront à l'heure H.\n");
         
-        // 💡 Le nœud s'endort ici et se réveillera exactement à l'heure du Genesis !
+        // Le nœud s'endort ici et se réveillera exactement à l'heure du Genesis !
         tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds as u64)).await;
         
         //println!("🚀 [MAINNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
@@ -159,7 +159,7 @@ async fn main() {
     }
     // ====================================================================
 
-    // 💡 L'initialisation se fera juste avant le minage
+    // L'initialisation se fera juste avant le minage
     
     let known_peers: wattcoin_core::SharedPeers = Arc::new(Mutex::new(HashSet::new()));
     if let Some(target) = &peer_target { known_peers.lock().unwrap().insert(target.clone()); }
@@ -206,34 +206,49 @@ async fn main() {
         let p2p_l2_db_tunnel = l2_db_file.clone(); 
         
         tokio::spawn(async move {
-            // On respecte TOUJOURS l'argument passé dans la console !
             let address = if target_clone.contains(':') { 
                 target_clone.clone() 
             } else { 
                 format!("127.0.0.1:{}", target_clone) 
             };
             
-            println!("🔓 Tentative de connexion P2P vers {}...", address);
-            
-            match tokio::net::TcpStream::connect(&address).await {
-                Ok(socket) => {
-                    println!("✅ Connexion P2P réussie vers {} !", address);
-                    wattcoin_core::network::start_peer_connection(
-                        socket, 
-                        target_clone.split(':').next().unwrap_or("127.0.0.1").to_string(), 
-                        my_port, 
-                        p2p_chain_handshake, 
-                        p2p_mempool_hs, 
-                        p2p_dex_hs, 
-                        p2p_peers_hs, 
-                        p2p_active_hs,
-                        p2p_l2_db_tunnel 
-                    );
+            // LE CHIEN DE GARDE (Watchdog Auto-Reconnect)
+            loop {
+                // 1. On vérifie si l'IP cible est toujours dans la liste des pairs actifs
+                let is_connected = {
+                    let ap = p2p_active_hs.lock().unwrap();
+                    let target_ip = address.split(':').next().unwrap_or("");
+                    ap.keys().any(|k| k.starts_with(target_ip))
+                };
+
+                // 2. Si la connexion est tombée (ou n'a jamais réussi), on relance !
+                if !is_connected {
+                    println!("🔓 Tentative de connexion P2P vers {}...", address);
+                    
+                    match tokio::net::TcpStream::connect(&address).await {
+                        Ok(socket) => {
+                            println!("✅ Connexion P2P réussie vers {} !", address);
+                            wattcoin_core::network::start_peer_connection(
+                                socket, 
+                                address.split(':').next().unwrap_or("127.0.0.1").to_string(), 
+                                my_port.clone(), 
+                                Arc::clone(&p2p_chain_handshake), 
+                                Arc::clone(&p2p_mempool_hs), 
+                                Arc::clone(&p2p_dex_hs), 
+                                Arc::clone(&p2p_peers_hs), 
+                                Arc::clone(&p2p_active_hs),
+                                p2p_l2_db_tunnel.clone() 
+                            );
+                        }
+                        Err(e) => { 
+                            println!("❌ Échec de connexion au réseau : {}", e); 
+                            println!("⚠️ Nouvelle tentative automatique dans 10 secondes...");
+                        }
+                    }
                 }
-                Err(e) => { 
-                    println!("❌ Échec de connexion au réseau : {}", e); 
-                    println!("⚠️ Vérifiez que le Nœud Relais est allumé et que ses ports sont ouverts.");
-                }
+
+                // 3. On dort 10 secondes avant de revérifier (zéro impact CPU)
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         });
     }
@@ -315,6 +330,14 @@ async fn main() {
                     handles.push(std::thread::spawn(move || {
                         let mut chunk_keys = Vec::with_capacity(chunk_size);
                         for _ in 0..chunk_size {
+                            // LECTURE DU KILL SWITCH DANS LE THREAD WOTS+ !
+                            if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height {
+                                break; // On avorte la génération instantanément !
+                            }
+                            
+                            // ON LAISSE RESPIRER LE RÉSEAU : 1ms de pause pour laisser passer les paquets TCP
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            
                             chunk_keys.push(wattcoin_core::wots::WotsKeyPair::generate());
                         }
                         chunk_keys
@@ -327,8 +350,9 @@ async fn main() {
                     pre_generated_l2_keys.extend(keys);
                 }
 
-                // 2. VÉRIFICATION DU KILL SWITCH (Au cas où un bloc est arrivé pendant la génération)
-                if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height {
+                // 2. VÉRIFICATION DU KILL SWITCH (Au cas où un bloc est arrivé)
+                // OU si les threads ont été avortés (moins de 128 clés générées)
+                if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height || pre_generated_l2_keys.len() < 128 {
                     continue; // On annule tout et on laisse la place au réseau !
                 }
 
@@ -506,7 +530,7 @@ async fn main() {
                         let now = chrono::Utc::now().timestamp();
                         if now - last_share_time > 5 {
                             last_share_time = now;
-                            println!("🤝 [P2POOL] Part de minage trouvée ! Partage avec le réseau...");
+                            println!("💻 [P2POOL] Part de minage trouvée ! Partage avec le réseau...");
                             let share_tx = Transaction {
                                 tx_type: TransactionType::MiningShare { 
                                     miner_address: miner_address_clone.clone(), 
