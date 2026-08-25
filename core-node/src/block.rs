@@ -72,7 +72,10 @@ impl Block {
         let initial_target = max_target >> 12_u32;           
         let target_hex = format!("{:0>64}", initial_target.to_str_radix(16));
 
-        let tx = Transaction {
+        let mut transactions = Vec::new();
+
+        // 1. La vraie transaction Coinbase du Genesis (Index 0)
+        let coinbase_tx = Transaction {
             tx_type: crate::transaction::TransactionType::Coinbase,
             inputs: vec![],
             outputs: vec![
@@ -87,21 +90,38 @@ impl Block {
             public_key: "GENESIS".to_string(),
             wots_signature: None,
         };
+        transactions.push(coinbase_tx);
 
-        // Calcul automatique du tx_root pour le Genesis (contient 1 seule TX)
-        let tx_root = hex::encode(tx.hash_data());
+        // 2. INJECTION MAINNET : 64 Transactions factices pour l'amorçage des leurres ZKP
+        for i in 0..64 {
+            let dummy_tx = Transaction {
+                tx_type: crate::transaction::TransactionType::Standard,
+                inputs: vec![], // Transaction fantôme, aucun input
+                outputs: vec![], // Aucun output
+                fee: 0,
+                // On génère 64 clés publiques uniques qui serviront de leurres initiaux
+                public_key: format!("GENESIS_DECOY_WOTS_PUBKEY_{:02}", i),
+                wots_signature: None,
+            };
+            transactions.push(dummy_tx);
+        }
 
         let header = BlockHeader {
             index: 0,
-            timestamp: 1787403240,
+            timestamp: 1787661000, 
             previous_hash: String::from("0000000000000000000000000000000000000000000000000000000000000000"),
             hash: String::from("GENESIS_HASH_WATTCOIN_000000000000000000000000000000000000000000"),
             nonce: 0,
             target_hex,
             l2_root: String::from("NO_L2_FOR_GENESIS"), 
-            tx_root, 
+            tx_root: String::new(), // On va le calculer juste en dessous
         };
 
-        Block { header, transactions: vec![tx] }
+        let mut genesis_block = Block { header, transactions };
+        
+        // 3. Calcul automatique du tx_root incluant les 65 transactions
+        genesis_block.header.tx_root = genesis_block.calculate_tx_root();
+
+        genesis_block
     }
 }
