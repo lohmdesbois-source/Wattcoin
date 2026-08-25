@@ -260,18 +260,18 @@ pub fn start_peer_connection(
                         // 3. On isole la lourde cryptographie sur un cœur du CPU
                         let bc_clone_blocking = Arc::clone(&bc_clone); 
                         let validation_result = tokio::task::spawn_blocking(move || {
-                            let mut chain = bc_clone_blocking.lock().unwrap(); 
-                            let current_height = chain.chain.len() as u64;
-                            
-                            // Anti-doublon ultra-rapide avant la grosse validation
-                            if block_clone.header.index < current_height {
-                                let our_hash = &chain.chain[block_clone.header.index as usize].header.hash;
-                                if our_hash == &block_clone.header.hash {
-                                    return Ok(()); // Déjà connu, on ignore
-                                }
-                            }
+							let mut chain = bc_clone_blocking.lock().unwrap(); 
+							let current_height = chain.chain.len() as u64;
+							
+							// Anti-doublon ultra-rapide avant la grosse validation
+							if block_clone.header.index < current_height {
+								let our_hash = &chain.chain[block_clone.header.index as usize].header.hash;
+								if our_hash == &block_clone.header.hash {
+									return Ok(false); // 👈 FAUX : Bloc déjà connu, on arrête les frais.
+								}
+							}
 
-                            if let Err(_) = chain.validate_and_add_external_block(block_clone) {
+							if let Err(_) = chain.validate_and_add_external_block(block_clone) {
                                 // Préparation des locators pour la synchro en cas de rejet
                                 let mut locators = Vec::new();
                                 let len = chain.chain.len();
@@ -289,8 +289,8 @@ pub fn start_peer_connection(
                                 }
                                 Err((chain.chain[0].header.hash.clone(), len as u64, locators))
                             } else {
-                                Ok(())
-                            }
+								Ok(true) // VRAI : C'est un vrai nouveau bloc validé !
+							}
                         }).await.unwrap();
 
                         // 4. Gestion du résultat réseau
@@ -305,8 +305,13 @@ pub fn start_peer_connection(
                                 send_message_to_channel(&tx_clone, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() }).await;
                                 send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port_clone.clone() }).await;
                             },
-                            Ok(()) => {
-                                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                            Ok(is_new) => {
+								// BOUCLIER ANTI-TEMPÊTE
+								if !is_new {
+									return; // On coupe la propagation instantanément !
+								}
+								
+								let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                                 let tx_count = block.transactions.len();
                                 let tx_detail = if tx_count == 1 { "1 Coinbase".to_string() } else { format!("1 Coinbase + {} Publique/Swap", tx_count - 1) };
 
