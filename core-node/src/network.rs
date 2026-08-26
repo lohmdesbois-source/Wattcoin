@@ -10,7 +10,6 @@ use crate::block::Block;
 use crate::blockchain::Blockchain;
 use crate::transaction::{Transaction, TransactionType};
 use crate::api::{Order, SharedPool};
-use crate::dht::DhtRecord;
 use crate::mixnet::OnionPacket;
 
 
@@ -31,12 +30,6 @@ pub enum P2PMessage {
     GetMempool,
     MempoolSync { txs: Vec<Transaction> },
 	BroadcastMicroBlock { micro_block: crate::block::MicroBlock },
-	/// Un nœud annonce qu'il héberge un site (ou relaie l'annonce d'un autre)
-    DhtPublish { record: DhtRecord },
-    /// Un navigateur demande "Qui connaît la route vers felps.watt ?"
-    DhtLookup { domain_name: String, sender_port: String },
-    /// Réponse contenant la route prouvée
-    DhtResponse { record: Option<DhtRecord> },
 	RelayOnion { packet: OnionPacket },
 }
 
@@ -257,10 +250,27 @@ pub fn start_peer_connection(
                     // 2. On libère IMMÉDIATEMENT le port TCP (le réseau respire)
                     tokio::spawn(async move {
                         
-                        // 3. On isole la lourde cryptographie sur un cœur du CPU
+                        // VÉRIFICATION MATHÉMATIQUE HORS DU MUTEX !
+                        // On vérifie tout le bloc sans bloquer le reste du nœud.
+                        let mut all_math_valid = true;
+                        for tx in &block_clone.transactions {
+                            if tx.tx_type != TransactionType::Coinbase && tx.tx_type != TransactionType::MicroCoinbase {
+                                if !tx.is_valid() {
+                                    all_math_valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if !all_math_valid {
+                            println!("❌ [SÉCURITÉ] Bloc frauduleux ! Cryptographie invalide (Rejeté).");
+                            return; // On jette le bloc sans jamais avoir bloqué le nœud !
+                        }
+
+                        // SEULEMENT MAINTENANT, on bloque la chaîne pour les vérifications de solde (ultra-rapide)
                         let bc_clone_blocking = Arc::clone(&bc_clone); 
                         let validation_result = tokio::task::spawn_blocking(move || {
-							let mut chain = bc_clone_blocking.lock().unwrap(); 
+							let mut chain = bc_clone_blocking.lock().unwrap();
 							let current_height = chain.chain.len() as u64;
 							
 							// Anti-doublon ultra-rapide avant la grosse validation
@@ -521,15 +531,14 @@ pub fn start_peer_connection(
                     let actual_peer_id_clone = actual_peer_id.clone();
                     let l2_db_file_clone = l2_db_file.clone();
 
-                    // On passe en asynchrone pour pouvoir patienter sans bloquer le réseau
                     tokio::spawn(async move {
                         let mut parent_l1_block = None;
                         
-                        // BOUCLIER DE LATENCE : On patiente jusqu'à 5 secondes que le bloc L1 soit validé
-                        for _ in 0..10 {
+                        // BOUCLIER DE LATENCE ÉTENDU À 60 SECONDES !
+                        // 120 boucles de 500ms = laisse largement le temps au L1 d'être vérifié (30s)
+                        for _ in 0..120 {
                             {
                                 let chain = bc_clone.lock().unwrap();
-                                // On cherche dans les 10 derniers blocs au cas où on avance très vite
                                 parent_l1_block = chain.chain.iter().rev().take(10).find(|b| b.header.hash == micro_block.l1_parent_hash).cloned();
                             }
                             if parent_l1_block.is_some() { break; }
@@ -547,7 +556,6 @@ pub fn start_peer_connection(
                                                 
                                 if calculated_root == current_l2_root && micro_block.merkle_proof[micro_block.key_index as usize] == micro_block.sequencer_pubkey {
                                     
-                                    // On hache avec key_index
                                     let mb_data = format!("{}{}{}{}", micro_block.l1_parent_hash, micro_block.micro_index, micro_block.key_index, micro_block.timestamp);
                                     let mut hasher = sha2::Sha512::new();
                                     use sha2::Digest;
@@ -557,7 +565,6 @@ pub fn start_peer_connection(
 
 									if crate::lattice::LatticeKeyPair::verify(&micro_block.sequencer_pubkey, &micro_block.sequencer_sig, &hash_arr) {
                                                         
-                                        // 1. TRIBUNAL DES FRAIS
                                         if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
                                             println!("❌ [L2 REJETÉ] Le séquenceur a oublié la MicroCoinbase !");
                                             return;
@@ -570,17 +577,52 @@ pub fn start_peer_connection(
                                             return;
                                         }
 
-                                        // 1.5 TRIBUNAL DES TRANSACTIONS L2
+                                        // ANTI-DOUBLON GOSSIP (Silencieux)
+                                        // Vérifie si on a déjà traité ce MicroBloc pour éviter de crier à la fraude
+                                        let mut is_duplicate = false;
+                                        {
+                                            let chain_lock = bc_clone.lock().unwrap();
+                                            for tx in micro_block.transactions.iter().skip(1) {
+                                                for input in &tx.inputs {
+                                                    if chain_lock.spent_key_images.contains(&input.mpc_ring.key_image) {
+                                                        is_duplicate = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if is_duplicate { break; }
+                                            }
+                                        }
+                                        if is_duplicate {
+                                            return; // On l'a déjà, on l'ignore silencieusement.
+                                        }
+
+                                        // LA CRYPTOGRAPHIE L2 HORS DU MUTEX !
+                                        // On vérifie les signatures Lattice sur un thread CPU dédié sans bloquer le reste !
+                                        let mb_clone_for_math = micro_block.clone();
+                                        let math_valid = tokio::task::spawn_blocking(move || {
+                                            let mut all_valid = true;
+                                            for tx in mb_clone_for_math.transactions.iter().skip(1) {
+                                                if !tx.is_valid() { 
+                                                    all_valid = false; 
+                                                    break; 
+                                                }
+                                            }
+                                            all_valid
+                                        }).await.unwrap();
+
+                                        if !math_valid {
+                                            println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux (Crypto invalide) ignoré.");
+                                            return;
+                                        }
+
+                                        // 1.5 TRIBUNAL DES TRANSACTIONS L2 (Double Dépense Intra-bloc)
                                         let mut all_valid = true;
                                         let mut temp_spent = std::collections::HashSet::new();
 
                                         {
                                             let chain_lock = bc_clone.lock().unwrap(); 
                                             
-                                            for (idx, tx) in micro_block.transactions.iter().enumerate() {
-                                                if idx == 0 { continue; } 
-                                                if !tx.is_valid() { all_valid = false; break; }
-                                                
+                                            for tx in micro_block.transactions.iter().skip(1) {
                                                 let mut double_spend = false;
                                                 for input in &tx.inputs {
                                                     let ki = &input.mpc_ring.key_image;
@@ -595,7 +637,7 @@ pub fn start_peer_connection(
                                         }
 
                                         if !all_valid {
-                                            println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux ignoré.");
+                                            println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux (Double Dépense) ignoré.");
                                             return;
                                         }
 
@@ -665,12 +707,6 @@ pub fn start_peer_connection(
                     }
                 },
                 
-                // Pour l'instant on ignore les requêtes DHT le temps de finir le Mixnet
-                P2PMessage::DhtPublish { .. } | 
-                P2PMessage::DhtLookup { .. } | 
-                P2PMessage::DhtResponse { .. } => {
-                    // TODO: Implémenter le stockage Kademlia plus tard
-                }
             }
         }
         

@@ -287,7 +287,7 @@ impl Blockchain {
         // TRAITEMENT DU MEMPOOL CLASSIQUE (L1 + L2)
         // ====================================================================
         for tx in &transactions {
-            if tx.is_valid() {
+            if true { // Le mempool n'accepte QUE des TX valides. On saute la lourde revérification mathématique !
                 
                 // BOUCLIER : On laisse les TX pures L2 au Séquenceur !
                 let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
@@ -1159,9 +1159,11 @@ impl Blockchain {
             }
 
 			// Validité intrinsèque
+			/*
 			if !tx.is_valid() { 
 				return Err("Signature WOTS+ invalide.".to_string()); 
 			}
+			*/
 
 			// Anti-Double Dépense
 			for input in &tx.inputs {

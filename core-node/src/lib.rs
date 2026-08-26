@@ -14,7 +14,6 @@ pub mod network;
 pub mod api;
 pub mod merkle_ring;
 pub mod lattice;
-pub mod dht;
 pub mod mixnet;
 
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
