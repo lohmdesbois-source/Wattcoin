@@ -347,6 +347,15 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
 name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
@@ -4953,7 +4962,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "898160f1dfd383b4e92e17f0512a7d62f3c51c44937b23b6ffc3a1614a8eaccd"
 dependencies = [
- "bincode",
+ "bincode 2.0.1",
  "serde",
 ]
 
@@ -5249,10 +5258,11 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_core"
-version = "2.1.18"
+version = "2.2.1"
 dependencies = [
  "aes-gcm",
  "arti-client",
+ "bincode 1.3.3",
  "bitcoin",
  "chrono",
  "ed25519-dalek",

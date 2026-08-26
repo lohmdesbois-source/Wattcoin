@@ -1,6 +1,6 @@
 use serde::{Serialize, Deserialize};
 use crate::transaction::{Transaction, TransactionOutput};
-use crate::wots::WotsSignature;
+use crate::lattice::LatticeSignature;
 use num_bigint::BigUint;
 use sha2::Digest;
 
@@ -32,7 +32,7 @@ pub struct MicroBlock {
     pub transactions: Vec<Transaction>, // Les transactions instantanées
     pub sequencer_pubkey: String,       // La clé WOTS publique spécifique à ce microbloc
 	pub sequencer_reward_address: String, // Pour payer le bon séquenceur !
-    pub sequencer_sig: WotsSignature,   // La signature WOTS de ce microbloc
+    pub sequencer_sig: LatticeSignature,   // La signature Lattice de ce microbloc
     pub merkle_proof: Vec<String>,      // La preuve que cette clé fait partie du l2_root
 }
 
@@ -88,7 +88,7 @@ impl Block {
             ],
             fee: 0,
             public_key: "GENESIS".to_string(),
-            wots_signature: None,
+            lattice_signature: None,
         };
         transactions.push(coinbase_tx);
 
@@ -101,7 +101,7 @@ impl Block {
                 fee: 0,
                 // On génère 64 clés publiques uniques qui serviront de leurres initiaux
                 public_key: format!("GENESIS_DECOY_WOTS_PUBKEY_{:02}", i),
-                wots_signature: None,
+                lattice_signature: None,
             };
             transactions.push(dummy_tx);
         }

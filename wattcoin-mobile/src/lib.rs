@@ -16,10 +16,10 @@ use pqc_kyber::{keypair, encapsulate, decapsulate};
 
 
 // 1. IMPORT DES OUTILS L1 (Depuis le Node Core)
-pub use wattcoin_core::wots;
 pub use wattcoin_core::lattice::{self, LWECommitment, LATTICE_DIM};
 pub use wattcoin_core::merkle_ring;
 pub use wattcoin_core::transaction::{Transaction, TransactionType, TransactionInput, TransactionOutput, SwapContract};
+pub use wattcoin_core::mixnet::{OnionPacket, HopPayload};
 
 // 2. IMPORT DES OUTILS L2 WNS (Directement depuis le Séquenceur WNS !)
 pub use wattcoin_name_service::transaction::{L2Transaction, WnsAction};
@@ -37,7 +37,7 @@ pub static SYNC_STATUS: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(Stri
 
 const MATURITY_BLOCKS: u64 = 3; 
 const FLAME: u64 = 1_000_000_000;
-const MAX_BILL_WATT: u64 = 10_000; // Le plus gros billet autorisé (pour garantir le Ring Signature)
+
 
 // ===================================================================
 // 1. LES RÉSOLVEURS WNS ET LE CACHE
@@ -127,7 +127,7 @@ pub struct WalletKeys {
     pub watt_address: String, 
     pub master_seed_hex: String,
     pub kyber_secret_hex: String,
-    pub wots_index: u32,
+    pub lattice_secret: Vec<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -185,20 +185,10 @@ pub struct WalletCache {
 	pub last_scanned_micro_index: u64,
     pub my_decrypted_payloads: std::collections::HashMap<String, String>, 
 	pub known_spent_key_images: std::collections::HashSet<String>,
-	pub known_used_wots_pubkeys: std::collections::HashSet<String>,
+	pub known_used_lattice_pubkeys: std::collections::HashSet<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct HopPayload {
-    pub next_hop_address: String,
-    pub inner_data: String,
-}
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct OnionPacket {
-    pub kyber_capsule: String, 
-    pub encrypted_payload: String, 
-}
 
 
 
@@ -241,32 +231,6 @@ fn get_vault_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-// PISTEUR D'INDEX WOTS+
-pub fn get_wots_tracker_path() -> Result<PathBuf, String> {
-    let mut path = crate::get_base_dir().ok_or("Impossible de trouver le dossier système")?;
-    path.push("wattcoin_wallet");
-    let name = CURRENT_WALLET.lock().unwrap().clone();
-    path.push(format!("{}.wots", name));
-    Ok(path)
-}
-
-pub fn get_saved_wots_index(base_index: u32) -> u32 {
-    if let Ok(path) = get_wots_tracker_path() {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(idx) = content.trim().parse::<u32>() {
-                return std::cmp::max(base_index, idx); // On prend toujours le plus grand
-            }
-        }
-    }
-    base_index
-}
-
-pub fn save_wots_index(new_index: u32) {
-    if let Ok(path) = get_wots_tracker_path() {
-        let _ = std::fs::write(path, new_index.to_string());
-    }
-}
-
 pub fn set_active_wallet(name: &str) {
     *CURRENT_WALLET.lock().unwrap() = name.to_string();
 }
@@ -279,12 +243,12 @@ pub fn list_wallets() -> Vec<String> {
         // MIGRATION AUTOMATIQUE : On renomme l'ancien coffre unique s'il existe
         let old_vault = path.join(".wattcoin_vault");
         let old_spends = path.join(".wattcoin_spends");
-        let old_wots = path.join(".wattcoin_wots_index");
+        let old_lattice = path.join(".wattcoin_lattice_index");
         
         if old_vault.exists() {
             let _ = std::fs::rename(&old_vault, path.join("Principal.vault"));
             if old_spends.exists() { let _ = std::fs::rename(&old_spends, path.join("Principal.spends")); }
-            if old_wots.exists() { let _ = std::fs::rename(&old_wots, path.join("Principal.wots")); }
+            if old_lattice.exists() { let _ = std::fs::rename(&old_lattice, path.join("Principal.lattice")); }
         }
         
         // Lecture de tous les coffres disponibles
@@ -315,12 +279,12 @@ pub fn get_swap_secrets_path() -> Result<PathBuf, String> {
 // Le client global : on désactive le recyclage des connexions TCP !
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap()
 });
 
-async fn node_call(method: &str, endpoint: &str, body: Option<String>) -> Result<String, String> {
+async fn node_call(method: &str, endpoint: &str, body: Option<Vec<u8>>) -> Result<String, String> {
     
     // 1. On synchronise l'annuaire WNS s'il est vide
     {
@@ -352,24 +316,26 @@ async fn node_call(method: &str, endpoint: &str, body: Option<String>) -> Result
 
 			let original_public_url = format!("http://{}{}", target_ip, endpoint);
 
-			// MAGIE DE L'OIGNON : On emballe les requêtes POST
-			let (final_url, final_body) = if method == "POST" && body.is_some() {
+			// GESTION DU TYPE (JSON vs BINAIRE) SELON LA ROUTE
+			let (final_url, final_body, final_ct) = if method == "POST" && body.is_some() {
 				
 				// L'URL cible à l'intérieur de l'oignon DOIT rester 127.0.0.1:8100 (C'est ce que le Nœud comprend en le déballant)
 				let internal_target_url = format!("http://127.0.0.1:8100{}", endpoint);
 				
+				// On passe du binaire à l'oignon
 				let packet = wrap_in_onion(&internal_target_url, &body.clone().unwrap(), node_pubkey)?;
-				let onion_json = serde_json::to_string(&packet).unwrap();
+				let onion_bytes = bincode::serialize(&packet).map_err(|_| "Erreur bincode Onion".to_string())?;
 				
 				// On l'envoie à l'extérieur via NGINX
-				(format!("http://{}/relay_onion", target_ip), Some(onion_json))
+				(format!("http://{}/relay_onion", target_ip), Some(onion_bytes), "application/octet-stream")
 			} else {
-				(original_public_url, body.clone())
+                let ct = if endpoint == "/send_tx" { "application/octet-stream" } else { "application/json" };
+				(original_public_url, body.clone(), ct)
 			};
 
             // Envoi HTTP
             let req = match method {
-                "POST" => HTTP_CLIENT.post(&final_url).header("Content-Type", "application/json").body(final_body.unwrap_or_default()),
+                "POST" => HTTP_CLIENT.post(&final_url).header("Content-Type", final_ct).body(final_body.unwrap_or_default()),
                 "DELETE" => HTTP_CLIENT.delete(&final_url), 
                 _ => HTTP_CLIENT.get(&final_url),           
             };
@@ -380,19 +346,13 @@ async fn node_call(method: &str, endpoint: &str, body: Option<String>) -> Result
                     if resp.status().is_success() {
                         return Ok(resp.text().await.unwrap_or_default());
                     } else {
-                        // 1. On sauvegarde le statut (qui se copie facilement)
                         let status = resp.status(); 
-                        // 2. On consomme la réponse
                         let error_msg = resp.text().await.unwrap_or_default(); 
-                        
                         println!("⚠️ [RESEAU] Le nœud {} a rejeté la requête (HTTP {}) : {}", seed_domain, status, error_msg);
                         return Err(format!("❌ Rejeté par le Nœud : {}", error_msg)); 
                     }
                 },
-                Err(e) => {
-                    println!("⚠️ [RESEAU] Erreur de connexion brute avec {} : {}", seed_domain, e);
-                    // Si on a une vraie erreur de co, on laisse la boucle tester un autre nœud seed s'il y en a un
-                }
+                Err(e) => { println!("⚠️ [RESEAU] Erreur de connexion brute avec {} : {}", seed_domain, e); }
             }
         }
     }
@@ -402,24 +362,21 @@ async fn node_call(method: &str, endpoint: &str, body: Option<String>) -> Result
 
 pub fn wrap_in_onion(
     target_url: &str, 
-    payload: &str, 
+    payload: &[u8], // On prend des bytes purs !
     node_pubkey_hex: &str
 ) -> Result<OnionPacket, String> {
     let pk_bytes = hex::decode(node_pubkey_hex).map_err(|_| "Clé publique du nœud invalide")?;
     
-    // 1. Encapsulation Post-Quantique (Génère le secret partagé)
     let mut rng = rand::thread_rng();
-    let (capsule, shared_secret) = pqc_kyber::encapsulate(&pk_bytes, &mut rng)
-        .map_err(|_| "Erreur encapsulation Kyber")?;
+    let (capsule, shared_secret) = pqc_kyber::encapsulate(&pk_bytes, &mut rng).map_err(|_| "Erreur Kyber")?;
     
-    // 2. Préparation des instructions pour le Nœud 
     let hop = HopPayload {
         next_hop_address: target_url.to_string(),
-        inner_data: payload.to_string(),
+        inner_data: payload.to_vec(),
     };
-    let hop_json = serde_json::to_string(&hop).unwrap();
+    // Le coeur de l'oignon en binaire
+    let hop_bytes = bincode::serialize(&hop).map_err(|_| "Erreur bincode Hop")?;
     
-    // 3. Chiffrement de la couche (AES-256-GCM)
     let aes_key = Key::<Aes256Gcm>::from_slice(&shared_secret);
     let cipher = Aes256Gcm::new(aes_key);
     
@@ -427,15 +384,14 @@ pub fn wrap_in_onion(
     rng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     
-    let ciphertext = cipher.encrypt(nonce, hop_json.as_bytes())
-        .map_err(|_| "Erreur de chiffrement AES Oignon")?;
+    let ciphertext = cipher.encrypt(nonce, hop_bytes.as_slice()).map_err(|_| "Erreur de chiffrement AES")?;
         
     let mut encrypted_payload = nonce_bytes.to_vec();
     encrypted_payload.extend(ciphertext);
     
     Ok(OnionPacket {
-        kyber_capsule: hex::encode(capsule),
-        encrypted_payload: hex::encode(encrypted_payload),
+        kyber_capsule: capsule.to_vec(), // Hexa supprimé !
+        encrypted_payload, // Hexa supprimé !
     })
 }
 
@@ -493,7 +449,7 @@ pub async fn submit_order(
         "htlc_hash": htlc_hash 
     });
 
-    node_call("POST", "/order", Some(order_data.to_string())).await?;
+    node_call("POST", "/order", Some(order_data.to_string().into_bytes())).await?;
     Ok(())
 }
 
@@ -539,7 +495,7 @@ pub async fn generate_pro_wallet(phrase_option: Option<String>, password: String
 			let phrase1 = words[0..24].join(" ");
 			let phrase2 = words[24..48].join(" ");
 			
-			// 🛡️ MAGIE CRYPTO : bip39 exige le format NFKD pour parser
+			// MAGIE CRYPTO : bip39 exige le format NFKD pour parser
 			let _ = Mnemonic::parse_in(Language::French, &phrase1.nfkd().collect::<String>())
 				.map_err(|_| "La première moitié (1-24) est invalide ou contient un mot inconnu.")?;
 			let _ = Mnemonic::parse_in(Language::French, &phrase2.nfkd().collect::<String>())
@@ -553,7 +509,7 @@ pub async fn generate_pro_wallet(phrase_option: Option<String>, password: String
 			let m1 = Mnemonic::from_entropy_in(Language::French, &ent1).unwrap();
 			let m2 = Mnemonic::from_entropy_in(Language::French, &ent2).unwrap();
 			
-			// 🛡️ MAGIE VISUELLE : On force le NFC dès la création pour que le coffre soit propre !
+			// MAGIE VISUELLE : On force le NFC dès la création pour que le coffre soit propre !
 			format!("{} {}", m1, m2).nfc().collect::<String>()
 		}
 	};
@@ -588,16 +544,18 @@ pub async fn generate_pro_wallet(phrase_option: Option<String>, password: String
 
 	// La clé générée sera TOUJOURS la même pour ces 48 mots précis !
 	let kyber_keys = keypair(&mut deterministic_rng).map_err(|_| "Erreur génération Kyber")?;
+	// Dérivation de la clé de signature Lattice unifiée
+    let lattice_kp = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_array);
 
-	Ok(WalletKeys {
-		mnemonic, 
-		btc_address,
-		btc_pubkey_hex: btc_pub.to_string(),
-		master_seed_hex: hex::encode(&master_seed),
-		watt_address: URL_SAFE_NO_PAD.encode(kyber_keys.public),
-		kyber_secret_hex: hex::encode(kyber_keys.secret),
-        wots_index: 0, // On commence toujours à l'index 0
-	})
+    Ok(WalletKeys {
+        mnemonic, 
+        btc_address,
+        btc_pubkey_hex: btc_pub.to_string(),
+        master_seed_hex: hex::encode(&master_seed),
+        watt_address: URL_SAFE_NO_PAD.encode(&kyber_keys.public), // ON UTILISE KYBER !
+        kyber_secret_hex: hex::encode(kyber_keys.secret),
+        lattice_secret: lattice_kp.secret_key,
+    })
 }
 
 
@@ -657,7 +615,7 @@ pub async fn unlock_vault(password: String) -> Result<WalletKeys, String> {
 // Scanne uniquement les nouveautés de la blockchain en 0.01 seconde
 pub fn update_spent_cache_fast(enriched: &[serde_json::Value], cache: &mut WalletCache, cache_updated: &mut bool) {
     // Si c'est la première fois (ou qu'un des deux caches est vide), on force un scan.
-    let force_full_scan = (cache.known_spent_key_images.is_empty() || cache.known_used_wots_pubkeys.is_empty()) && cache.last_scanned_height > 0;
+    let force_full_scan = (cache.known_spent_key_images.is_empty() || cache.known_used_lattice_pubkeys.is_empty()) && cache.last_scanned_height > 0;
 
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
@@ -677,9 +635,9 @@ pub fn update_spent_cache_fast(enriched: &[serde_json::Value], cache: &mut Walle
                         }
                     }
                 }
-                // 2. Mise en cache des clés WOTS+ (O(1) Check !)
+                // 2. Mise en cache des clés lattice+ (O(1) Check !)
                 if let Some(pk) = tx.get("public_key").and_then(|p| p.as_str()) {
-                    cache.known_used_wots_pubkeys.insert(pk.to_string());
+                    cache.known_used_lattice_pubkeys.insert(pk.to_string());
                     *cache_updated = true;
                 }
             }
@@ -792,7 +750,6 @@ async fn get_current_block_height() -> Result<u64, String> {
 
 pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     use chrono::{DateTime, Utc, Local};
-    use std::collections::HashMap;
 
     // 1. Remplacement de l'appel réseau
     let res_str = get_all_transactions_cached().await?;
@@ -810,8 +767,8 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     let mut current_max_l1 = cache.last_scanned_height;
     let mut current_max_l2 = cache.last_scanned_micro_index;
 
-    // Le groupeur visuel d'UTXO
-    let mut grouped_history: HashMap<String, HistoryItem> = HashMap::new();
+    // On utilise directement un Vec, zéro groupement !
+    let mut final_history: Vec<HistoryItem> = Vec::new();
 
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
@@ -896,40 +853,22 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                 }
             }
 
-            // Si cet UTXO nous appartient, on l'ajoute au groupe correspondant
+            // Si cet UTXO nous appartient, on l'ajoute individuellement !
             if amt_to_add > 0.0 {
-                
-                // 💡 FIX ABSOLU : La couche dépend de la destination des fonds (stealth_address), PAS du bloc !
-                let current_layer = if out.stealth_address.starts_with("L2_WATT_") { 
-                    "L2".to_string() 
-                } else { 
-                    "L1".to_string() 
-                };
-                
-                // NUMÉROTATION PROPRE
-                let display_id = if is_l2 && micro_index > 0 {
-                    format!("MicroBloc #{}", micro_index)
-                } else {
-                    format!("Bloc #{}", height) 
-                };
-
+                let current_layer = if out.stealth_address.starts_with("L2_WATT_") { "L2".to_string() } else { "L1".to_string() };
+                let display_id = if is_l2 && micro_index > 0 { format!("MicroBloc #{}", micro_index) } else { format!("Bloc #{}", height) };
                 let status_full = format!("{} ({})", label, status_text);
-                
-                // La clé de groupe intègre la couche pour ne jamais mélanger un paiement et sa monnaie rendue cross-layer
-                let group_key = format!("{}_{}_{}", current_layer, display_id, status_full);
 
-                let entry = grouped_history.entry(group_key).or_insert(HistoryItem {
+                final_history.push(HistoryItem {
                     id: display_id,
                     tx_type: "receive".to_string(),
-                    amount: 0.0,
+                    amount: amt_to_add,
                     coin: "WATT".to_string(),
                     date: date_str,
                     status: status_full,
-                    layer: current_layer, // 💡 Filtre infaillible pour l'UI React
+                    layer: current_layer, 
                     raw_timestamp: timestamp,
                 });
-                
-                entry.amount += amt_to_add; 
             }
         }
     }
@@ -944,13 +883,11 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     }
     if cache_updated { save_cache(&cache); }
 
-    // Tri chronologique infaillible
-    let mut final_history: Vec<HistoryItem> = grouped_history.into_values().collect();
+    // Tri chronologique infaillible (Le Vec se trie directement)
     final_history.sort_by(|a, b| b.raw_timestamp.cmp(&a.raw_timestamp));
 
     Ok(final_history)
 }
-
 
 pub async fn get_messages(keys: WalletKeys) -> Result<Vec<DataItem>, String> {
     use chrono::{DateTime, Utc, Local};
@@ -1036,39 +973,6 @@ pub async fn get_messages(keys: WalletKeys) -> Result<Vec<DataItem>, String> {
     Ok(data_items)
 }
 
-/// 💵 Découpe un montant arbitraire en coupures standards (Billets)
-/// Exemple : 13 WATT -> [10 WATT, 1 WATT, 1 WATT, 1 WATT]
-pub fn break_into_denominations(mut amount_flames: u64) -> Vec<u64> {
-    let mut denominations = Vec::new();
-    
-    // 💡 On lie notre constante au premier billet !
-    let standard_bills = [
-        MAX_BILL_WATT * FLAME, // <--- C'est ici qu'on utilise la constante !
-        1_000 * FLAME,
-        100 * FLAME,
-        10 * FLAME,
-        1 * FLAME,
-        FLAME / 10,       
-        FLAME / 100,      
-        FLAME / 1_000,    
-        100_000,          
-        10_000,
-        1_000,
-        100,
-        10,
-        1
-    ];
-
-    for bill in standard_bills.iter() {
-        while amount_flames >= *bill {
-            denominations.push(*bill);
-            amount_flames -= *bill;
-        }
-    }
-    
-    denominations
-}
-
 /// Génère les facteurs d'aveuglement (Blinding Factors) pour les nouveaux outputs.
 /// Règle d'or : Sum(Inputs) = Sum(Outputs) mod 2^64
 pub fn generate_balanced_blinding_factors(
@@ -1107,43 +1011,24 @@ pub fn generate_balanced_blinding_factors(
     out_bfs
 }
 
-// DÉCOUVERTE CYPERPUNK OPTIMISÉE PAR LE CACHE
-pub fn get_safe_wots_index(cache: &WalletCache, master_seed_hex: &str, saved_index: u32) -> u32 {
-    let mut seed_bytes = [0u8; 32];
-    if let Ok(decoded_seed) = hex::decode(master_seed_hex) {
-        if decoded_seed.len() >= 32 { seed_bytes.copy_from_slice(&decoded_seed[0..32]); }
-    } else { return saved_index; }
-
-    let mut current_index = saved_index;
-    loop {
-        let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, current_index);
-        // Vérification instantanée en O(1) grâce à la RAM !
-        if cache.known_used_wots_pubkeys.contains(&wots_keys.public_key) {
-            current_index += 1;
-        } else {
-            break; 
-        }
-    }
-    current_index
-}
-
 pub async fn send_wattcoin(
 	recipient_kyber_hex: String,
     amount: f64,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
-    master_seed_hex: String, 
-    wots_index: u32,         
+    master_seed_hex: String,       
     htlc_hash_hex: Option<String>,
     htlc_timeout: Option<u64>,
     spend_from_l2: bool, 
     send_to_l2: bool   
-) -> Result<u32, String> { 
+) -> Result<String, String> { 
     
-    let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
-	if amount_in_flames > (MAX_BILL_WATT * FLAME * 5) {
-		return Err(format!("❌ Transaction trop volumineuse ! Limite de sécurité : {} WATT par envoi. Veuillez faire plusieurs virements.", MAX_BILL_WATT * 5));
-	}
+	let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
+    // Limite de 50 000 WATT par transaction pour éviter l'épuisement de la mémoire
+    let max_send = 50_000 * FLAME;
+    if amount_in_flames > max_send {
+        return Err("❌ Transaction trop volumineuse ! Limite de sécurité : 50 000 WATT par envoi. Veuillez faire plusieurs virements.".to_string());
+    }
     let fee: u64 = if spend_from_l2 && send_to_l2 { 100 } else { 1000 }; 
     let required_total = amount_in_flames + fee;
 
@@ -1156,7 +1041,6 @@ pub async fn send_wattcoin(
     // On charge l'état des compteurs
     let mut cache = load_cache();
     let mut cache_updated = false;
-	let real_wots_index = get_safe_wots_index(&cache, &master_seed_hex, wots_index);
 	crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
 	let spent_keys_snapshot = cache.known_spent_key_images.clone();
     let mut current_max_l1 = cache.last_scanned_height;
@@ -1171,7 +1055,7 @@ pub async fn send_wattcoin(
         let is_l2 = item["is_l2"].as_bool().unwrap_or(false);
         let micro_index = item["micro_index"].as_u64().unwrap_or(0);
 
-        // 💡 2. Mise à jour de nos compteurs locaux
+        // 2. Mise à jour de nos compteurs locaux
         if !is_l2 && height > current_max_l1 { current_max_l1 = height; }
         if is_l2 && micro_index > current_max_l2 { current_max_l2 = micro_index; }
 
@@ -1211,7 +1095,7 @@ pub async fn send_wattcoin(
                 val = out.aes_vault.parse::<u64>().unwrap_or(0); is_mine = true;
             } 
             else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
-                // 💡 3. Le remplaçant magique : on utilise try_decrypt_output !
+                // 3. Le remplaçant magique : on utilise try_decrypt_output !
                 if let Some(payload_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
                     let parts: Vec<&str> = payload_str.split('|').collect();
                     if parts.len() >= 2 {
@@ -1242,7 +1126,7 @@ pub async fn send_wattcoin(
         if collected_flames >= required_total { break; }
     }
 	
-	// 💡 4. Sauvegarde finale des compteurs sur le disque
+	// 4. Sauvegarde finale des compteurs sur le disque
     if current_max_l1 > cache.last_scanned_height { cache.last_scanned_height = current_max_l1; cache_updated = true; }
     if current_max_l2 > cache.last_scanned_micro_index { cache.last_scanned_micro_index = current_max_l2; cache_updated = true; }
     if cache_updated { save_cache(&cache); }
@@ -1265,10 +1149,9 @@ pub async fn send_wattcoin(
     // ISOLATION DE LA CRYPTOGRAPHIE LOURDE (Empêche l'UI de freeze)
     let tx_pq_result = tokio::task::spawn_blocking(move || {
         let change_amount = collected_flames - required_total;
-        let bills_to_send = break_into_denominations(amount_in_flames);
-        let change_bills = break_into_denominations(change_amount);
         
-        let total_outputs_count = bills_to_send.len() + change_bills.len();
+        // PLUS DE DÉCOUPE EN BILLETS ! Seulement 1 ou 2 outputs max.
+        let total_outputs_count = 1 + if change_amount > 0 { 1 } else { 0 };
         let balanced_bfs = generate_balanced_blinding_factors(&input_blinding_factors, total_outputs_count);
         
         let mut outputs = Vec::new();
@@ -1284,57 +1167,56 @@ pub async fn send_wattcoin(
         let recipient_bytes = URL_SAFE_NO_PAD.decode(&clean_recipient).map_err(|_| "Adresse WATT invalide".to_string())?;
         let stealth_prefix = if send_to_l2 { "L2_WATT_" } else if matches!(tx_type, TransactionType::HTLCLock { .. }) { "htlc_watt_" } else { "pq_watt_" };
 
-        // CONSTRUCTION DES OUTPUTS POUR LE DESTINATAIRE
-        for bill_amount in bills_to_send {
-            let current_bf = &balanced_bfs[bf_index];
-            let (kyber_capsule, shared_secret) = encapsulate(&recipient_bytes, &mut rand::thread_rng()).unwrap();
-            let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
-            
-            let bf_json = serde_json::to_string(current_bf).unwrap();
-            let payload = format!("{}|{}|{}", bill_amount, hex::encode(otp), bf_json);
-            
-            let aes_key = Key::<Aes256Gcm>::from_slice(&shared_secret);
-            let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
-            let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).map_err(|_| "Erreur AES".to_string())?;
-            let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
+        // 1. UNIQUE OUTPUT POUR LE DESTINATAIRE (Montant entier)
+        let current_bf = &balanced_bfs[bf_index];
+        let (kyber_capsule, shared_secret) = pqc_kyber::encapsulate(&recipient_bytes, &mut rand::thread_rng()).unwrap();
+        let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
+        
+        let bf_json = serde_json::to_string(current_bf).unwrap();
+        // Le montant entier est caché dans l'enveloppe AES :
+        let payload = format!("{}|{}|{}", amount_in_flames, hex::encode(otp), bf_json);
+        
+        let aes_key = Key::<Aes256Gcm>::from_slice(&shared_secret);
+        let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        use aes_gcm::aead::Aead;
+        let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).map_err(|_| "Erreur AES".to_string())?;
+        let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
 
-            let commitment = LWECommitment::commit(bill_amount, current_bf);
+        let commitment = LWECommitment::commit(amount_in_flames, current_bf);
 
-            outputs.push(TransactionOutput {
-                stealth_address: format!("{}{}", stealth_prefix, hex::encode(&otp[0..8])),
-                kyber_capsule: hex::encode(&kyber_capsule),
-                aes_vault: hex::encode(final_vault),
-                lattice_commitment: commitment,
-            });
-            bf_index += 1;
-        }
+        outputs.push(TransactionOutput {
+            stealth_address: format!("{}{}", stealth_prefix, hex::encode(&otp[0..8])),
+            kyber_capsule: hex::encode(&kyber_capsule),
+            aes_vault: hex::encode(final_vault),
+            lattice_commitment: commitment,
+        });
+        bf_index += 1;
 
-        // CONSTRUCTION DES OUTPUTS DE CHANGE
-        let my_pk_bytes = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).unwrap();
-        let change_prefix = if spend_from_l2 { "L2_WATT_" } else { "pq_watt_" };
-
-        for bill_change in change_bills {
+        // 2. UNIQUE OUTPUT POUR LE RENDU DE MONNAIE
+        if change_amount > 0 {
             let change_bf = &balanced_bfs[bf_index]; 
-            let (kyber_capsule_change, my_shared_secret) = encapsulate(&my_pk_bytes, &mut rand::thread_rng()).unwrap();
-            let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
-            
-            let bf_json = serde_json::to_string(change_bf).unwrap();
-            let payload = format!("{}|{}|{}", bill_change, hex::encode(otp), bf_json);
-            
-            let aes_key = Key::<Aes256Gcm>::from_slice(&my_shared_secret);
-            let mut nonce_bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes);
-            let encrypted_data = Aes256Gcm::new(aes_key).encrypt(Nonce::from_slice(&nonce_bytes), payload.as_bytes()).unwrap();
-            let mut final_vault = nonce_bytes.to_vec(); final_vault.extend_from_slice(&encrypted_data);
+            let my_pk_bytes = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).unwrap();
+            let change_prefix = if spend_from_l2 { "L2_WATT_" } else { "pq_watt_" };
 
-            let commitment = LWECommitment::commit(bill_change, change_bf);
+            let (kyber_capsule_change, my_shared_secret) = pqc_kyber::encapsulate(&my_pk_bytes, &mut rand::thread_rng()).unwrap();
+            let mut otp_c = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp_c);
+            
+            let bf_json_c = serde_json::to_string(change_bf).unwrap();
+            let payload_c = format!("{}|{}|{}", change_amount, hex::encode(otp_c), bf_json_c);
+            
+            let aes_key_c = Key::<Aes256Gcm>::from_slice(&my_shared_secret);
+            let mut nonce_bytes_c = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes_c);
+            let encrypted_data_c = Aes256Gcm::new(aes_key_c).encrypt(Nonce::from_slice(&nonce_bytes_c), payload_c.as_bytes()).unwrap();
+            let mut final_vault_c = nonce_bytes_c.to_vec(); final_vault_c.extend_from_slice(&encrypted_data_c);
+
+            let commitment_c = LWECommitment::commit(change_amount, change_bf);
 
             outputs.push(TransactionOutput {
-                stealth_address: format!("{}{}", change_prefix, hex::encode(&otp[0..8])),
+                stealth_address: format!("{}{}", change_prefix, hex::encode(&otp_c[0..8])),
                 kyber_capsule: hex::encode(&kyber_capsule_change),
-                aes_vault: hex::encode(final_vault),
-                lattice_commitment: commitment
+                aes_vault: hex::encode(final_vault_c),
+                lattice_commitment: commitment_c
             });
-            bf_index += 1;
         }
 
         // RING SIGNATURES & HASH FINAL
@@ -1342,15 +1224,16 @@ pub async fn send_wattcoin(
         let decoded_seed = hex::decode(&master_seed_hex).unwrap_or_default();
         seed_bytes.copy_from_slice(&decoded_seed[0..32]);
         
-        // On utilise real_wots_index pour créer la clé !
-        let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, real_wots_index);
-        let temp_tx = Transaction { tx_type: tx_type.clone(), inputs: vec![], outputs: outputs.clone(), fee, wots_signature: None, public_key: wots_keys.public_key.clone() };
+        // DÉCLARATION AVANT UTILISATION :
+        let lattice_keys = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
+
+        let temp_tx = Transaction { tx_type: tx_type.clone(), inputs: vec![], outputs: outputs.clone(), fee, lattice_signature: None, public_key: lattice_keys.public_key.clone() };
         let tx_hash = temp_tx.hash_data();
 
         // ANNEAU DE MERKLE : Garantie absolue d'unicité
-        let mut decoys = vec![wots_keys.public_key.clone()]; 
+        let mut decoys = vec![lattice_keys.public_key.clone()];
         let mut unique_set = std::collections::HashSet::new();
-        unique_set.insert(wots_keys.public_key.clone());
+        unique_set.insert(lattice_keys.public_key.clone());
 
         for decoy in fetched_decoys {
             if !unique_set.contains(&decoy) && decoys.len() < 64 {
@@ -1360,7 +1243,7 @@ pub async fn send_wattcoin(
         }
         
         while decoys.len() < 64 { 
-            let new_decoy = crate::wots::WotsKeyPair::generate().public_key;
+            let new_decoy = crate::lattice::LatticeKeyPair::generate().public_key;
             if !unique_set.contains(&new_decoy) {
                 unique_set.insert(new_decoy.clone());
                 decoys.push(new_decoy);
@@ -1369,12 +1252,12 @@ pub async fn send_wattcoin(
         
         use rand::seq::SliceRandom;
         decoys.shuffle(&mut rand::thread_rng());
-        let real_index = decoys.iter().position(|r| r == &wots_keys.public_key).unwrap();
+        let real_index = decoys.iter().position(|r| r == &lattice_keys.public_key).unwrap();
 
         let mut final_inputs = Vec::new();
         for utxo in &selected_utxos_clone {
             let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(
-                &wots_keys.secret_key, 
+                &lattice_keys.secret_key, 
                 &tx_hash, 
                 &decoys, 
                 real_index, 
@@ -1384,17 +1267,17 @@ pub async fn send_wattcoin(
             final_inputs.push(TransactionInput { mpc_ring: mpc_sig, commitment: utxo.2.clone(), source_height: utxo.3 });
         }
 
-        let mut tx_pq = Transaction { tx_type, inputs: final_inputs, outputs, fee, wots_signature: None, public_key: wots_keys.public_key.clone() };
-        tx_pq.wots_signature = Some(crate::wots::WotsKeyPair::sign(&wots_keys.secret_key, &wots_keys.public_seed, &tx_hash));
+        let mut tx_pq = Transaction { tx_type, inputs: final_inputs, outputs, fee, lattice_signature: None, public_key: lattice_keys.public_key.clone() };
+        tx_pq.lattice_signature = Some(crate::lattice::LatticeKeyPair::sign(&lattice_keys.secret_key, &tx_hash));
 
         Ok::<Transaction, String>(tx_pq)
     }).await.map_err(|e| format!("Erreur du thread CPU : {}", e))?;
 
     let tx_pq = tx_pq_result?;
 
-    // 7. BROADCAST
-    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_json)).await?;
+    // 7. BROADCAST (Binaire pur !)
+    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
     // MISE À JOUR DU CACHE LOCAL INSTANTANÉE (Anti-double dépense locale)
     let mut instant_cache = load_cache();
@@ -1402,15 +1285,11 @@ pub async fn send_wattcoin(
         // On marque les billets comme "dépensés" localement
         instant_cache.known_spent_key_images.insert(input.mpc_ring.key_image.clone());
     }
-    // On marque la clé publique WOTS+ comme "utilisée" localement
-    instant_cache.known_used_wots_pubkeys.insert(tx_pq.public_key.clone());
+    // On marque la clé publique lattice+ comme "utilisée" localement
+    instant_cache.known_used_lattice_pubkeys.insert(tx_pq.public_key.clone());
     save_cache(&instant_cache);
 
-    // Sauvegarde du nouvel index sur le disque !
-    let next_index = real_wots_index + 1;
-    crate::save_wots_index(next_index);
-
-    Ok(next_index)
+    Ok("✅ Succès".to_string())
 }
 
 
@@ -1418,18 +1297,13 @@ pub async fn send_data(
     recipient_kyber_hex: String, 
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
-    master_seed_hex: String, 
-    wots_index: u32,       
+    master_seed_hex: String,      
     data_type: String, 
     content: String,
     use_l2: bool
-) -> Result<u32, String> {   // ON RENVOIE u32 (le nouvel index)
+) -> Result<String, String> {
     
-    
-    send_data_internal(
-        recipient_kyber_hex, sender_kyber_secret_hex, 
-        sender_kyber_public_hex, master_seed_hex, wots_index, data_type, content, use_l2
-    ).await
+    send_data_internal(recipient_kyber_hex, sender_kyber_secret_hex, sender_kyber_public_hex, master_seed_hex, data_type, content, use_l2).await
 }
 
 // 2. Le Moteur Public (Testable par Cargo !)
@@ -1437,12 +1311,11 @@ pub async fn send_data_internal(
     recipient_kyber_hex: String, 
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
-    master_seed_hex: String, 
-    wots_index: u32,         
+    master_seed_hex: String,        
     data_type: String, 
     content: String,
     use_l2: bool
-) -> Result<u32, String> {   // ON RENVOIE u32
+) -> Result<String, String> {   
     
     let fee: u64 = if use_l2 { 100 } else { 1000 }; 
     let required_total = fee;
@@ -1454,8 +1327,6 @@ pub async fn send_data_internal(
 	// 1. On charge l'état des compteurs
 	let mut cache = load_cache();
 	let mut cache_updated = false;
-	// On calcule le vrai index réseau
-    let real_wots_index = get_safe_wots_index(&cache, &master_seed_hex, wots_index);
 	crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
 	let spent_keys_snapshot = cache.known_spent_key_images.clone();
 	let mut current_max_l1 = cache.last_scanned_height;
@@ -1505,7 +1376,7 @@ pub async fn send_data_internal(
             {
                 val = out.aes_vault.parse::<u64>().unwrap_or(0); is_mine = true;
             } else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
-				// 💡 3. Utilisation directe du cache L1/L2
+				// 3. Utilisation directe du cache L1/L2
 				if let Some(payload_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
 					let parts: Vec<&str> = payload_str.split('|').collect();
 					if parts.len() >= 2 {
@@ -1533,7 +1404,7 @@ pub async fn send_data_internal(
         if collected_flames >= required_total { break; }
     }
 	
-	// 💡 4. Sauvegarde finale des compteurs sur le disque
+	// 4. Sauvegarde finale des compteurs sur le disque
 	if current_max_l1 > cache.last_scanned_height { cache.last_scanned_height = current_max_l1; cache_updated = true; }
 	if current_max_l2 > cache.last_scanned_micro_index { cache.last_scanned_micro_index = current_max_l2; cache_updated = true; }
 	if cache_updated { save_cache(&cache); }
@@ -1593,23 +1464,24 @@ pub async fn send_data_internal(
         });
     }
 
-    let mut seed_bytes = [0u8; 32];
+	let mut seed_bytes = [0u8; 32];
     let decoded_seed = hex::decode(&master_seed_hex).unwrap_or_default();
     seed_bytes.copy_from_slice(&decoded_seed[0..32]);
-    // On utilise real_wots_index
-    let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, real_wots_index);
-    let temp_tx = Transaction { tx_type: TransactionType::Standard, inputs: vec![], outputs: outputs.clone(), fee, wots_signature: None, public_key: wots_keys.public_key.clone() };
-	let tx_hash = temp_tx.hash_data();
 
-    // MODE PROD : 64 Vrais Leurres
-	let mut decoys = vec![wots_keys.public_key.clone()]; 
+    let lattice_keys = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
+
+    let temp_tx = Transaction { tx_type: TransactionType::Standard, inputs: vec![], outputs: outputs.clone(), fee, lattice_signature: None, public_key: lattice_keys.public_key.clone() };
+    let tx_hash = temp_tx.hash_data();
+
+    // MODE PROD : 16 Vrais Leurres
+	let mut decoys = vec![lattice_keys.public_key.clone()]; 
 	let mut unique_set = std::collections::HashSet::new();
-	unique_set.insert(wots_keys.public_key.clone());
+	unique_set.insert(lattice_keys.public_key.clone());
 
-	if let Ok(res_str) = node_call("GET", "/get_decoys/63", None).await {
+	if let Ok(res_str) = node_call("GET", "/get_decoys/15", None).await {
 		if let Ok(real_decoys) = serde_json::from_str::<Vec<String>>(&res_str) {
 			for decoy in real_decoys {
-				if !unique_set.contains(&decoy) && decoys.len() < 64 {
+				if !unique_set.contains(&decoy) && decoys.len() < 16 {
 					unique_set.insert(decoy.clone());
 					decoys.push(decoy);
 				}
@@ -1617,8 +1489,8 @@ pub async fn send_data_internal(
 		}
 	}
 
-	while decoys.len() < 64 { 
-		let new_decoy = crate::wots::WotsKeyPair::generate().public_key;
+	while decoys.len() < 16 { 
+		let new_decoy = crate::lattice::LatticeKeyPair::generate().public_key;
 		if !unique_set.contains(&new_decoy) {
 			unique_set.insert(new_decoy.clone());
 			decoys.push(new_decoy);
@@ -1627,19 +1499,20 @@ pub async fn send_data_internal(
     
     use rand::seq::SliceRandom;
     decoys.shuffle(&mut rand::thread_rng());
-    let real_index = decoys.iter().position(|r| r == &wots_keys.public_key).unwrap();
+    let real_index = decoys.iter().position(|r| r == &lattice_keys.public_key).unwrap();
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&wots_keys.secret_key, &tx_hash, &decoys, real_index, &utxo.1, &sk_bytes);
+        let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&lattice_keys.secret_key, &tx_hash, &decoys, real_index, &utxo.1, &sk_bytes);
         final_inputs.push(TransactionInput { mpc_ring: mpc_sig, commitment: utxo.2.clone(), source_height: utxo.3 });
     }
 
-    let mut tx_pq = Transaction { tx_type: TransactionType::Standard, inputs: final_inputs, outputs, fee, wots_signature: None, public_key: wots_keys.public_key.clone() };
-    tx_pq.wots_signature = Some(crate::wots::WotsKeyPair::sign(&wots_keys.secret_key, &wots_keys.public_seed, &tx_hash));
+    let mut tx_pq = Transaction { tx_type: TransactionType::Standard, inputs: final_inputs, outputs, fee, lattice_signature: None, public_key: lattice_keys.public_key.clone() };
+    tx_pq.lattice_signature = Some(crate::lattice::LatticeKeyPair::sign(&lattice_keys.secret_key, &tx_hash));
 
-    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_json)).await?;
+    // BROADCAST (Binaire pur !)
+    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
     // MISE À JOUR DU CACHE LOCAL INSTANTANÉE (Anti-double dépense locale)
     let mut instant_cache = load_cache();
@@ -1647,26 +1520,20 @@ pub async fn send_data_internal(
         // On marque les billets comme "dépensés" localement
         instant_cache.known_spent_key_images.insert(input.mpc_ring.key_image.clone());
     }
-    // On marque la clé publique WOTS+ comme "utilisée" localement
-    instant_cache.known_used_wots_pubkeys.insert(tx_pq.public_key.clone());
+    // On marque la clé publique lattice+ comme "utilisée" localement
+    instant_cache.known_used_lattice_pubkeys.insert(tx_pq.public_key.clone());
     save_cache(&instant_cache);
 
-    // Sauvegarde du nouvel index sur le disque !
-    let next_index = real_wots_index + 1;
-    crate::save_wots_index(next_index);
-
-    // On retourne le nouvel index
-    Ok(next_index)
+    Ok("✅ Succès".to_string())
 }
 
 
 pub async fn buy_lottery_ticket(
     sender_kyber_secret_hex: String, 
     sender_kyber_public_hex: String,
-    master_seed_hex: String, 
-    wots_index: u32,
+    master_seed_hex: String,
     ticket_price_flames: u64	
-) -> Result<u32, String> {   // ON RENVOIE u32
+) -> Result<String, String> {   
     
     let fee: u64 = 1000;
     let required_total = ticket_price_flames + fee;
@@ -1678,8 +1545,6 @@ pub async fn buy_lottery_ticket(
 	// 1. On charge l'état des compteurs
 	let mut cache = load_cache();
 	let mut cache_updated = false;
-	// On calcule le vrai index réseau
-    let real_wots_index = get_safe_wots_index(&cache, &master_seed_hex, wots_index);
 	crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
 	let spent_keys_snapshot = cache.known_spent_key_images.clone();
 	let mut current_max_l1 = cache.last_scanned_height;
@@ -1822,27 +1687,26 @@ pub async fn buy_lottery_ticket(
     let mut seed_bytes = [0u8; 32];
     let decoded_seed = hex::decode(&master_seed_hex).unwrap_or_default();
     seed_bytes.copy_from_slice(&decoded_seed[0..32]);
-    // On utilise real_wots_index
-    let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, real_wots_index);
+    let lattice_keys = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
     let temp_tx = Transaction {
         tx_type: TransactionType::HTLCLottery { target_block, player_pubkey: sender_kyber_public_hex.clone() },
         inputs: vec![],
         outputs: outputs.clone(),
         fee,
-        wots_signature: None,
-        public_key: wots_keys.public_key.clone(),
+        lattice_signature: None,
+        public_key: lattice_keys.public_key.clone(),
     };
     let tx_hash = temp_tx.hash_data();
 
-   // MODE PROD : 64 Vrais Leurres pour le ticket de Loto !
-	let mut decoys = vec![wots_keys.public_key.clone()]; 
+   // MODE PROD : 16 Vrais Leurres pour le ticket de Loto !
+	let mut decoys = vec![lattice_keys.public_key.clone()]; 
 	let mut unique_set = std::collections::HashSet::new();
-	unique_set.insert(wots_keys.public_key.clone());
+	unique_set.insert(lattice_keys.public_key.clone());
 
-	if let Ok(res_str) = node_call("GET", "/get_decoys/63", None).await {
+	if let Ok(res_str) = node_call("GET", "/get_decoys/15", None).await {
 		if let Ok(real_decoys) = serde_json::from_str::<Vec<String>>(&res_str) {
 			for decoy in real_decoys {
-				if !unique_set.contains(&decoy) && decoys.len() < 64 {
+				if !unique_set.contains(&decoy) && decoys.len() < 16 {
 					unique_set.insert(decoy.clone());
 					decoys.push(decoy);
 				}
@@ -1850,8 +1714,8 @@ pub async fn buy_lottery_ticket(
 		}
 	}
 
-	while decoys.len() < 64 { 
-		let new_decoy = crate::wots::WotsKeyPair::generate().public_key;
+	while decoys.len() < 16 { 
+		let new_decoy = crate::lattice::LatticeKeyPair::generate().public_key;
 		if !unique_set.contains(&new_decoy) {
 			unique_set.insert(new_decoy.clone());
 			decoys.push(new_decoy);
@@ -1860,12 +1724,12 @@ pub async fn buy_lottery_ticket(
     
     use rand::seq::SliceRandom;
     decoys.shuffle(&mut rand::thread_rng());
-    let real_index = decoys.iter().position(|r| r == &wots_keys.public_key).unwrap();
+    let real_index = decoys.iter().position(|r| r == &lattice_keys.public_key).unwrap();
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
         let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(
-            &wots_keys.secret_key, 
+            &lattice_keys.secret_key, 
             &tx_hash, 
             &decoys, 
             real_index, 
@@ -1877,12 +1741,13 @@ pub async fn buy_lottery_ticket(
 
     let mut tx_pq = Transaction {
         tx_type: TransactionType::HTLCLottery { target_block, player_pubkey: sender_kyber_public_hex.clone() }, 
-        inputs: final_inputs, outputs, fee, wots_signature: None, public_key: wots_keys.public_key.clone()
+        inputs: final_inputs, outputs, fee, lattice_signature: None, public_key: lattice_keys.public_key.clone()
     };
-    tx_pq.wots_signature = Some(crate::wots::WotsKeyPair::sign(&wots_keys.secret_key, &wots_keys.public_seed, &tx_hash));
+    tx_pq.lattice_signature = Some(crate::lattice::LatticeKeyPair::sign(&lattice_keys.secret_key, &tx_hash));
 
-    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_json)).await?;
+    // BROADCAST (Binaire pur !)
+    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
     // MISE À JOUR DU CACHE LOCAL INSTANTANÉE (Anti-double dépense locale)
     let mut instant_cache = load_cache();
@@ -1890,16 +1755,11 @@ pub async fn buy_lottery_ticket(
         // On marque les billets comme "dépensés" localement
         instant_cache.known_spent_key_images.insert(input.mpc_ring.key_image.clone());
     }
-    // On marque la clé publique WOTS+ comme "utilisée" localement
-    instant_cache.known_used_wots_pubkeys.insert(tx_pq.public_key.clone());
+    // On marque la clé publique lattice+ comme "utilisée" localement
+    instant_cache.known_used_lattice_pubkeys.insert(tx_pq.public_key.clone());
     save_cache(&instant_cache);
 
-    // Sauvegarde du nouvel index sur le disque !
-    let next_index = real_wots_index + 1;
-    crate::save_wots_index(next_index);
-
-    // On renvoie la bonne valeur
-    Ok(next_index)
+    Ok("✅ Succès".to_string())
 }
 
 
@@ -1909,11 +1769,11 @@ pub async fn refund_wattcoin_swap(hash: String, _watt_address: String, _amount: 
         inputs: vec![],
         outputs: vec![],
         fee: 0, // 0 frais 
-        wots_signature: None,
+        lattice_signature: None,
         public_key: hash,
     };
-    let tx_json = serde_json::to_string(&refund_tx).map_err(|e| e.to_string())?;
-    let _ = node_call("POST", "/send_tx", Some(tx_json)).await?;
+    let tx_bytes = bincode::serialize(&refund_tx).map_err(|e| e.to_string())?;
+    let _ = node_call("POST", "/send_tx", Some(tx_bytes)).await?;
     Ok("🔙 REMBOURSEMENT WATT DEMANDÉ !".to_string())
 }
 
@@ -1988,7 +1848,7 @@ pub async fn check_btc_contract_exists(htlc_hash: &str) -> Result<bool, String> 
 
 
 pub async fn claim_wattcoin_swap(secret: String, _hash: String, amount_flames: u64, watt_address: String) -> Result<String, String> {
-    // 💡 PAS DE KYBER/AES ICI ! Le Tribunal L1 doit pouvoir lire le montant exact.
+    // PAS DE KYBER/AES ICI ! Le Tribunal L1 doit pouvoir lire le montant exact.
     let claim_output = TransactionOutput {
         stealth_address: watt_address.clone(),   // L'adresse publique brute
         kyber_capsule: "HTLC_CLAIM".to_string(), // Un marqueur propre
@@ -2002,12 +1862,12 @@ pub async fn claim_wattcoin_swap(secret: String, _hash: String, amount_flames: u
         inputs: vec![],
         outputs: vec![claim_output],
         fee: 0, // 0 frais 
-        wots_signature: None,
+        lattice_signature: None,
         public_key: hex::encode(sha2::Sha256::digest(&secret_bytes)),
     };
 
-    let tx_json = serde_json::to_string(&claim_tx).map_err(|e| e.to_string())?;
-    node_call("POST", "/htlc/claim", Some(tx_json)).await?;
+    let tx_bytes = bincode::serialize(&claim_tx).map_err(|e| e.to_string())?;
+    node_call("POST", "/htlc/claim", Some(tx_bytes)).await?;
     Ok("✅ Claim envoyé au node.".to_string())
 }
 
@@ -2033,14 +1893,14 @@ pub fn delete_wallet(name: &str) -> Result<String, String> {
         
         let vault_path = path.join(format!("{}.vault", name));
         let spends_path = path.join(format!("{}.spends", name));
-        let wots_path = path.join(format!("{}.wots", name));
+        let lattice_path = path.join(format!("{}.lattice", name));
 		let cache_path = path.join(format!("{}.cache", name));
 		let chain_path = path.join(format!("{}_chain.json", name));
 		let swap_path = path.join(format!("{}_swap_secrets.json", name));
         
         if vault_path.exists() { let _ = std::fs::remove_file(vault_path); }
         if spends_path.exists() { let _ = std::fs::remove_file(spends_path); }
-        if wots_path.exists() { let _ = std::fs::remove_file(wots_path); }
+        if lattice_path.exists() { let _ = std::fs::remove_file(lattice_path); }
 		if cache_path.exists() { let _ = std::fs::remove_file(cache_path); }
 		if chain_path.exists() { let _ = std::fs::remove_file(chain_path); }
 		if swap_path.exists() { let _ = std::fs::remove_file(swap_path); }
@@ -2117,7 +1977,7 @@ pub async fn send_btc_to_htlc(htlc_address: String, amount_btc: f64, raw_tx: Opt
         "amount_btc": amount_btc,
         "raw_tx": raw_tx.unwrap_or_default()
     });
-    node_call("POST", "/btc/send/to_htlc", Some(serde_json::to_string(&payload).unwrap())).await
+    node_call("POST", "/btc/send/to_htlc", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await
         .map(|_| "✅ BTC verrouillé dans le HTLC".to_string())
         .map_err(|e| format!("Erreur node : {}", e))
 }
@@ -2240,7 +2100,7 @@ pub async fn send_btc_direct(
     let raw_tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
     
     let payload = serde_json::json!({ "raw_tx": raw_tx_hex });
-    match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap())).await {
+    match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await {
         Ok(resp) => {
             let json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
             if json["success"].as_bool().unwrap_or(false) {
@@ -2265,7 +2125,7 @@ pub async fn auto_claim_btc_swap(htlc_hash: String, _htlc_address: String) -> Re
             htlc_hash, secret
         );
         let payload = serde_json::json!({ "raw_tx": raw_witness_tx });
-        match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap())).await {
+        match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await {
             Ok(_) => Ok(format!("🎉 CLAIM BTC RÉUSSI ! (Secret: {}...)", &secret[0..10])),
             Err(e) => Err(format!("Erreur broadcast BTC : {}", e))
         }
@@ -2298,8 +2158,7 @@ pub async fn stake_l2(
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
     sequencer_pubkey_hex: String,
-    master_seed_hex: String,
-    wots_index: u32,     
+    master_seed_hex: String,    
 ) -> Result<String, String> {
     
     // 1. Calcul des montants
@@ -2315,8 +2174,6 @@ pub async fn stake_l2(
     // ET ENSUITE ON CACHE :
     let mut cache = load_cache();
     let mut cache_updated = false;
-	// On calcule le vrai index réseau
-    let real_wots_index = get_safe_wots_index(&cache, &master_seed_hex, wots_index);
     crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
     let spent_keys_snapshot = cache.known_spent_key_images.clone();
     
@@ -2454,13 +2311,13 @@ pub async fn stake_l2(
         });
     }
 
-    // 7. Signature (WOTS+ et Anneau de Merkle)
+    // 7. Signature (lattice+ et Anneau de Merkle)
     let mut seed_bytes = [0u8; 32];
     let decoded_seed = hex::decode(&master_seed_hex).unwrap_or_default();
     seed_bytes.copy_from_slice(&decoded_seed[0..32]);
     
     // On génère de manière déterministe
-    let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, real_wots_index);
+    let lattice_keys = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
     
     let temp_tx = Transaction { 
         tx_type: TransactionType::L2Stake { 
@@ -2470,20 +2327,20 @@ pub async fn stake_l2(
         inputs: vec![], 
         outputs: outputs.clone(), 
         fee, 
-        wots_signature: None, 
-        public_key: wots_keys.public_key.clone() 
+        lattice_signature: None, 
+        public_key: lattice_keys.public_key.clone() 
     };
     let tx_hash = temp_tx.hash_data();
 
-    // MODE PROD : 64 Vrais Leurres
-	let mut decoys = vec![wots_keys.public_key.clone()]; 
+    // MODE PROD : 16 Vrais Leurres
+	let mut decoys = vec![lattice_keys.public_key.clone()]; 
 	let mut unique_set = std::collections::HashSet::new();
-	unique_set.insert(wots_keys.public_key.clone());
+	unique_set.insert(lattice_keys.public_key.clone());
 
-	if let Ok(res_str) = node_call("GET", "/get_decoys/63", None).await {
+	if let Ok(res_str) = node_call("GET", "/get_decoys/15", None).await {
 		if let Ok(real_decoys) = serde_json::from_str::<Vec<String>>(&res_str) {
 			for decoy in real_decoys {
-				if !unique_set.contains(&decoy) && decoys.len() < 64 {
+				if !unique_set.contains(&decoy) && decoys.len() < 16 {
 					unique_set.insert(decoy.clone());
 					decoys.push(decoy);
 				}
@@ -2491,8 +2348,8 @@ pub async fn stake_l2(
 		}
 	}
 
-	while decoys.len() < 64 { 
-		let new_decoy = crate::wots::WotsKeyPair::generate().public_key;
+	while decoys.len() < 16 { 
+		let new_decoy = crate::lattice::LatticeKeyPair::generate().public_key;
 		if !unique_set.contains(&new_decoy) {
 			unique_set.insert(new_decoy.clone());
 			decoys.push(new_decoy);
@@ -2501,11 +2358,11 @@ pub async fn stake_l2(
     
     use rand::seq::SliceRandom;
     decoys.shuffle(&mut rand::thread_rng());
-    let real_index = decoys.iter().position(|r| r == &wots_keys.public_key).unwrap();
+    let real_index = decoys.iter().position(|r| r == &lattice_keys.public_key).unwrap();
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&wots_keys.secret_key, &tx_hash, &decoys, real_index, &utxo.1, &sk_bytes);
+        let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&lattice_keys.secret_key, &tx_hash, &decoys, real_index, &utxo.1, &sk_bytes);
         final_inputs.push(TransactionInput { mpc_ring: mpc_sig, commitment: utxo.2.clone(), source_height: utxo.3 });
     }
 
@@ -2517,14 +2374,15 @@ pub async fn stake_l2(
         inputs: final_inputs, 
         outputs, 
         fee, 
-        wots_signature: None, 
-        public_key: wots_keys.public_key.clone() 
+        lattice_signature: None, 
+        public_key: lattice_keys.public_key.clone() 
     };
-    tx_pq.wots_signature = Some(crate::wots::WotsKeyPair::sign(&wots_keys.secret_key, &wots_keys.public_seed, &tx_hash));
+    tx_pq.lattice_signature = Some(crate::lattice::LatticeKeyPair::sign(&lattice_keys.secret_key, &tx_hash));
 
     // 8. Envoi au Node
-    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_json)).await?;
+    // BROADCAST (Binaire pur !)
+    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
     // MISE À JOUR DU CACHE LOCAL INSTANTANÉE (Anti-double dépense locale)
     let mut instant_cache = load_cache();
@@ -2532,13 +2390,9 @@ pub async fn stake_l2(
         // On marque les billets comme "dépensés" localement
         instant_cache.known_spent_key_images.insert(input.mpc_ring.key_image.clone());
     }
-    // On marque la clé publique WOTS+ comme "utilisée" localement
-    instant_cache.known_used_wots_pubkeys.insert(tx_pq.public_key.clone());
+    // On marque la clé publique lattice+ comme "utilisée" localement
+    instant_cache.known_used_lattice_pubkeys.insert(tx_pq.public_key.clone());
     save_cache(&instant_cache);
-
-    // Sauvegarde du nouvel index sur le disque !
-    let next_index = real_wots_index + 1;
-    crate::save_wots_index(next_index);
 
     Ok(format!("🎉 Caution verrouillée avec succès ! La L2 '{}' est prête à être ancrée.", l2_name))
 }
@@ -2548,8 +2402,7 @@ pub async fn unstake_l2(
     l2_name: String,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
-    master_seed_hex: String, 
-    wots_index: u32,        
+    master_seed_hex: String,       
 ) -> Result<String, String> {
     
     let fee = 1000u64; // Frais L1
@@ -2561,8 +2414,6 @@ pub async fn unstake_l2(
     // ET ENSUITE ON CACHE :
     let mut cache = load_cache();
     let mut cache_updated = false;
-	// On calcule le vrai index réseau
-    let real_wots_index = get_safe_wots_index(&cache, &master_seed_hex, wots_index);
     crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
     let spent_keys_snapshot = cache.known_spent_key_images.clone();
     
@@ -2662,27 +2513,27 @@ pub async fn unstake_l2(
     seed_bytes.copy_from_slice(&decoded_seed[0..32]);
     
     // On génère de manière déterministe
-    let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, real_wots_index);
+    let lattice_keys = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
     
     let temp_tx = Transaction {
         tx_type: TransactionType::L2Unstake { l2_name: l2_name.clone() },
         inputs: vec![],
         outputs: vec![output.clone()],
         fee,
-        wots_signature: None,
-        public_key: wots_keys.public_key.clone(),
+        lattice_signature: None,
+        public_key: lattice_keys.public_key.clone(),
     };
     let tx_hash = temp_tx.hash_data();
 
-    // MODE PROD : 64 Vrais Leurres
-	let mut decoys = vec![wots_keys.public_key.clone()]; 
+    // MODE PROD : 16 Vrais Leurres
+	let mut decoys = vec![lattice_keys.public_key.clone()]; 
 	let mut unique_set = std::collections::HashSet::new();
-	unique_set.insert(wots_keys.public_key.clone());
+	unique_set.insert(lattice_keys.public_key.clone());
 
-	if let Ok(res_str) = node_call("GET", "/get_decoys/63", None).await {
+	if let Ok(res_str) = node_call("GET", "/get_decoys/15", None).await {
 		if let Ok(real_decoys) = serde_json::from_str::<Vec<String>>(&res_str) {
 			for decoy in real_decoys {
-				if !unique_set.contains(&decoy) && decoys.len() < 64 {
+				if !unique_set.contains(&decoy) && decoys.len() < 16 {
 					unique_set.insert(decoy.clone());
 					decoys.push(decoy);
 				}
@@ -2690,8 +2541,8 @@ pub async fn unstake_l2(
 		}
 	}
 
-	while decoys.len() < 64 { 
-		let new_decoy = crate::wots::WotsKeyPair::generate().public_key;
+	while decoys.len() < 16 { 
+		let new_decoy = crate::lattice::LatticeKeyPair::generate().public_key;
 		if !unique_set.contains(&new_decoy) {
 			unique_set.insert(new_decoy.clone());
 			decoys.push(new_decoy);
@@ -2700,23 +2551,24 @@ pub async fn unstake_l2(
     
     use rand::seq::SliceRandom;
     decoys.shuffle(&mut rand::thread_rng());
-    let real_index = decoys.iter().position(|r| r == &wots_keys.public_key).unwrap();
+    let real_index = decoys.iter().position(|r| r == &lattice_keys.public_key).unwrap();
 
-    let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&wots_keys.secret_key, &tx_hash, &decoys, real_index, &kyber_capsule, &sk_bytes);
+    let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&lattice_keys.secret_key, &tx_hash, &decoys, real_index, &kyber_capsule, &sk_bytes);
     
     let mut tx_pq = Transaction {
         tx_type: TransactionType::L2Unstake { l2_name: l2_name.clone() },
         inputs: vec![TransactionInput { mpc_ring: mpc_sig, commitment, source_height }],
         outputs: vec![output],
         fee,
-        wots_signature: None,
-        public_key: wots_keys.public_key.clone(),
+        lattice_signature: None,
+        public_key: lattice_keys.public_key.clone(),
     };
-    tx_pq.wots_signature = Some(crate::wots::WotsKeyPair::sign(&wots_keys.secret_key, &wots_keys.public_seed, &tx_hash));
+    tx_pq.lattice_signature = Some(crate::lattice::LatticeKeyPair::sign(&lattice_keys.secret_key, &tx_hash));
 
     // 5. Envoi au Nœud L1
-    let tx_json = serde_json::to_string(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_json)).await?;
+    // BROADCAST (Binaire pur !)
+    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
     // MISE À JOUR DU CACHE LOCAL INSTANTANÉE (Anti-double dépense locale)
     let mut instant_cache = load_cache();
@@ -2724,13 +2576,9 @@ pub async fn unstake_l2(
         // On marque les billets comme "dépensés" localement
         instant_cache.known_spent_key_images.insert(input.mpc_ring.key_image.clone());
     }
-    // On marque la clé publique WOTS+ comme "utilisée" localement
-    instant_cache.known_used_wots_pubkeys.insert(tx_pq.public_key.clone());
+    // On marque la clé publique lattice+ comme "utilisée" localement
+    instant_cache.known_used_lattice_pubkeys.insert(tx_pq.public_key.clone());
     save_cache(&instant_cache);
-
-    // Sauvegarde du nouvel index sur le disque !
-    let next_index = real_wots_index + 1;
-    crate::save_wots_index(next_index);
 
     Ok(format!("🔓 Caution récupérée avec succès ! La L2 '{}' a été désactivée.", l2_name))
 }
@@ -2885,7 +2733,6 @@ pub async fn bridge_to_l2(
     sender_kyber_secret_hex: String,
     _sender_kyber_public_hex: String,
     master_seed_hex: String,
-    wots_index: u32,
 ) -> Result<String, String> {
     let amount_flames = (amount_watt * 1_000_000_000.0) as u64;
     let fee = 1000u64; // Frais L1
@@ -2898,7 +2745,6 @@ pub async fn bridge_to_l2(
 
     let mut cache = load_cache();
     let mut cache_updated = false;
-    let real_wots_index = get_safe_wots_index(&cache, &master_seed_hex, wots_index);
     crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
     let spent_keys_snapshot = cache.known_spent_key_images.clone();
     
@@ -3022,13 +2868,13 @@ pub async fn bridge_to_l2(
     let mut seed_bytes = [0u8; 32];
     let decoded_seed = hex::decode(&master_seed_hex).unwrap_or_default();
     seed_bytes.copy_from_slice(&decoded_seed[0..32]);
-    let wots_keys = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, real_wots_index);
+    let lattice_keys = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
     
     // MAGIE UX : Si l'utilisateur bridge vers sa propre adresse, on formate automatiquement !
     let mut final_l2_receiver = receiver_pubkey.clone();
     if final_l2_receiver == _sender_kyber_public_hex {
-        // Le Wallet assemble "Kyber|WOTS+" silencieusement en arrière-plan
-        final_l2_receiver = format!("{}|{}", _sender_kyber_public_hex, wots_keys.public_key);
+        // Le Wallet assemble "Kyber|lattice+" silencieusement en arrière-plan
+        final_l2_receiver = format!("{}|{}", _sender_kyber_public_hex, lattice_keys.public_key);
     }
 
     let temp_tx = Transaction { 
@@ -3036,14 +2882,14 @@ pub async fn bridge_to_l2(
             l2_target_name: l2_target_name.clone(), 
             l2_receiver_pubkey: final_l2_receiver.clone() // 👈 On utilise l'adresse formatée
         }, 
-        inputs: vec![], outputs: outputs.clone(), fee, wots_signature: None, public_key: wots_keys.public_key.clone() 
+        inputs: vec![], outputs: outputs.clone(), fee, lattice_signature: None, public_key: lattice_keys.public_key.clone() 
     };
     let tx_hash = temp_tx.hash_data();
 
     // 64 Leurres...
-    let mut decoys = vec![wots_keys.public_key.clone()]; 
+    let mut decoys = vec![lattice_keys.public_key.clone()]; 
     let mut unique_set = std::collections::HashSet::new();
-    unique_set.insert(wots_keys.public_key.clone());
+    unique_set.insert(lattice_keys.public_key.clone());
     if let Ok(res_str) = node_call("GET", "/get_decoys/63", None).await {
         if let Ok(real_decoys) = serde_json::from_str::<Vec<String>>(&res_str) {
             for decoy in real_decoys {
@@ -3052,17 +2898,17 @@ pub async fn bridge_to_l2(
         }
     }
     while decoys.len() < 64 { 
-        let new_decoy = crate::wots::WotsKeyPair::generate().public_key;
+        let new_decoy = crate::lattice::LatticeKeyPair::generate().public_key;
         if !unique_set.contains(&new_decoy) { unique_set.insert(new_decoy.clone()); decoys.push(new_decoy); }
     }
     
     use rand::seq::SliceRandom;
     decoys.shuffle(&mut rand::thread_rng());
-    let real_index = decoys.iter().position(|r| r == &wots_keys.public_key).unwrap();
+    let real_index = decoys.iter().position(|r| r == &lattice_keys.public_key).unwrap();
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&wots_keys.secret_key, &tx_hash, &decoys, real_index, &utxo.1, &sk_bytes);
+        let mpc_sig = crate::merkle_ring::MpcRingSignature::sign(&lattice_keys.secret_key, &tx_hash, &decoys, real_index, &utxo.1, &sk_bytes);
         final_inputs.push(TransactionInput { mpc_ring: mpc_sig, commitment: utxo.2.clone(), source_height: utxo.3 });
     }
 
@@ -3071,25 +2917,24 @@ pub async fn bridge_to_l2(
             l2_target_name: l2_target_name.clone(), 
             l2_receiver_pubkey: final_l2_receiver // On utilise l'adresse formatée ici aussi
         }, 
-        inputs: final_inputs, outputs, fee, wots_signature: None, public_key: wots_keys.public_key.clone() 
+        inputs: final_inputs, outputs, fee, lattice_signature: None, public_key: lattice_keys.public_key.clone() 
     };
-    tx_pq.wots_signature = Some(crate::wots::WotsKeyPair::sign(&wots_keys.secret_key, &wots_keys.public_seed, &tx_hash));
+    tx_pq.lattice_signature = Some(crate::lattice::LatticeKeyPair::sign(&lattice_keys.secret_key, &tx_hash));
 
-    let tx_json = serde_json::to_string(&tx_pq).unwrap();
-    node_call("POST", "/send_tx", Some(tx_json)).await?;
+    // BROADCAST (Binaire pur !)
+    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
     let mut instant_cache = load_cache();
     for input in &tx_pq.inputs { instant_cache.known_spent_key_images.insert(input.mpc_ring.key_image.clone()); }
-    instant_cache.known_used_wots_pubkeys.insert(tx_pq.public_key.clone());
+    instant_cache.known_used_lattice_pubkeys.insert(tx_pq.public_key.clone());
     save_cache(&instant_cache);
-    crate::save_wots_index(real_wots_index + 1);
 
     Ok(format!("✅ {} WATT verrouillés avec succès pour le réseau L2 {} !", amount_watt, l2_target_name))
 }
 
 pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     use chrono::{DateTime, Utc, Local};
-    use std::collections::HashMap;
 
     let local_chain_path = get_local_chain_path()?;
     let res_str = std::fs::read_to_string(&local_chain_path).unwrap_or_else(|_| "[]".to_string());
@@ -3113,7 +2958,9 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
 
     let mut current_max_l1 = cache.last_scanned_height;
     let mut current_max_l2 = cache.last_scanned_micro_index;
-    let mut grouped_history: HashMap<String, HistoryItem> = HashMap::new();
+    
+    // On utilise directement un Vec
+    let mut final_history: Vec<HistoryItem> = Vec::new();
 
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
@@ -3185,19 +3032,17 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
                 let current_layer = if out.stealth_address.starts_with("L2_WATT_") { "L2".to_string() } else { "L1".to_string() };
                 let display_id = if is_l2 && micro_index > 0 { format!("MicroBloc #{}", micro_index) } else { format!("Bloc #{}", height) };
                 let status_full = format!("{} ({})", label, status_text);
-                let group_key = format!("{}_{}_{}", current_layer, display_id, status_full);
-
-                let entry = grouped_history.entry(group_key).or_insert(HistoryItem {
+                
+                final_history.push(HistoryItem {
                     id: display_id,
                     tx_type: "receive".to_string(),
-                    amount: 0.0,
+                    amount: amt_to_add,
                     coin: "WATT".to_string(),
                     date: date_str,
                     status: status_full,
                     layer: current_layer,
                     raw_timestamp: timestamp,
                 });
-                entry.amount += amt_to_add; 
             }
         }
     }
@@ -3206,7 +3051,6 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
     if current_max_l2 > cache.last_scanned_micro_index { cache.last_scanned_micro_index = current_max_l2; cache_updated = true; }
     if cache_updated { save_cache(&cache); }
 
-    let mut final_history: Vec<HistoryItem> = grouped_history.into_values().collect();
     final_history.sort_by(|a, b| b.raw_timestamp.cmp(&a.raw_timestamp));
 
     Ok(final_history)
@@ -3229,7 +3073,7 @@ pub async fn register_wns_domain(
     let json: serde_json::Value = res.json().await.map_err(|_| "Erreur JSON WNS")?;
     
     let balance = json["balance"].as_u64().unwrap_or(0);
-    let auth_key = json["authorized_wots_key"].as_str().unwrap_or("");
+    let auth_key = json["authorized_lattice_key"].as_str().unwrap_or("");
 
     // 2. On vérifie si on a assez de fonds
     if balance < fee {
@@ -3240,37 +3084,19 @@ pub async fn register_wns_domain(
         return Err("Votre compte WNS n'est pas initialisé. Faites un premier Bridge vers le WNS.".to_string());
     }
 
-    crate::set_status("🔐 Recherche de la clé WOTS+ correspondante...");
-
-    // 3. ANTI-DESYNC : On cherche mathématiquement quelle est la bonne clé secrète !
     let mut seed_bytes = [0u8; 32];
     let decoded_seed = hex::decode(&keys.master_seed_hex).unwrap_or_default();
     seed_bytes.copy_from_slice(&decoded_seed[0..32]);
     
-    let mut current_key_pair = None;
-    let mut current_index = 0;
-    
-    // On scanne nos propres clés générées jusqu'à trouver celle que le L2 attend
-    for i in 0..1000 {
-        let kp = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, i);
-        if kp.public_key == auth_key {
-            current_key_pair = Some(kp);
-            current_index = i;
-            break;
-        }
-    }
-
-    let key_n = current_key_pair.ok_or("Clé WOTS+ introuvable en local. Avez-vous restauré avec la bonne seed ?")?;
-    
-    // La clé vers laquelle on fait rouler le compte
-    let key_n_plus_1 = crate::wots::WotsKeyPair::generate_deterministic(&seed_bytes, current_index + 1);
+    // Une seule clé déterministe
+    let key_n = crate::lattice::LatticeKeyPair::generate_deterministic(&seed_bytes);
 
     crate::set_status("🏷️ Signature et achat du domaine...");
 
     let mut l2_tx = L2Transaction {
         account_address: keys.watt_address.clone(), 
         sender_pubkey: key_n.public_key.clone(),      
-        next_pubkey: key_n_plus_1.public_key.clone(), // On fait rouler d'un seul cran !
+        next_pubkey: key_n.public_key.clone(), // On utilise la MÊME clé
         action: WnsAction::Register,
         domain_name: domain.clone(),
         record_data,
@@ -3280,8 +3106,8 @@ pub async fn register_wns_domain(
     };
 
     let hash = l2_tx.hash_data();
-    let wots_sig = crate::wots::WotsKeyPair::sign(&key_n.secret_key, &key_n.public_seed, &hash);
-    l2_tx.signature = serde_json::to_string(&wots_sig).unwrap();
+    let lattice_sig = crate::lattice::LatticeKeyPair::sign(&key_n.secret_key, &hash);
+    l2_tx.signature = serde_json::to_string(&lattice_sig).unwrap();
 
     let url = format!("{}/send", resolver);
     let res = HTTP_CLIENT.post(&url)
@@ -3290,14 +3116,10 @@ pub async fn register_wns_domain(
         .send().await.map_err(|e| format!("Erreur réseau WNS : {}", e))?;
 
     if res.status().is_success() {
-        // On met à jour notre cache local pour dire que N et N+1 sont utilisées
+        // On met à jour notre cache local pour dire que la clé est utilisée
         let mut instant_cache = load_cache();
-        instant_cache.known_used_wots_pubkeys.insert(key_n.public_key);
-        instant_cache.known_used_wots_pubkeys.insert(key_n_plus_1.public_key);
+        instant_cache.known_used_lattice_pubkeys.insert(key_n.public_key.clone()); 
         save_cache(&instant_cache);
-        
-        // On sauvegarde l'index le plus élevé
-        crate::save_wots_index(current_index + 2);
         
         Ok(format!("✅ Réservation réussie ! '{}' vous appartient.", domain))
     } else {
@@ -3327,6 +3149,106 @@ pub async fn resolve_wns_domain_opsec(domain: &str) -> Result<String, String> {
     } else {
         Err(format!("Le domaine '{}' n'existe pas.", domain))
     }
+}
+
+pub async fn estimate_tx_weight(
+    amount: f64,
+    sender_kyber_secret_hex: &str,
+    sender_kyber_public_hex: &str, // Ajout de la clé publique
+    spend_from_l2: bool,
+    send_to_l2: bool
+) -> Result<(usize, f64), String> {
+    let amount_in_flames = (amount * 1_000_000_000.0) as u64;
+    let fee: u64 = if spend_from_l2 && send_to_l2 { 100 } else { 1000 };
+    let required_total = amount_in_flames + fee;
+
+    let res_str = get_all_transactions_cached().await?;
+    let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str).unwrap_or_default();
+    let current_height = get_current_block_height().await.unwrap_or(0);
+
+    let sk_bytes = hex::decode(sender_kyber_secret_hex).unwrap_or_default();
+    let mut cache = load_cache();
+    let mut cache_updated = false;
+    crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
+    let spent_keys_snapshot = cache.known_spent_key_images.clone();
+
+    let mut num_inputs = 0;
+    let mut collected_flames = 0u64;
+
+    // LE MÊME SCANNEUR QUE POUR L'ENVOI (Précision absolue)
+    for item in enriched {
+        let height = item["height"].as_u64().unwrap_or(0);
+        let is_l2 = item["is_l2"].as_bool().unwrap_or(false);
+        let micro_index = item["micro_index"].as_u64().unwrap_or(0);
+
+        let tx: Transaction = match serde_json::from_value(item["transaction"].clone()) { Ok(t) => t, Err(_) => continue, };
+
+        for out in tx.outputs.iter() {
+            let mut ki_hasher = sha2::Sha512::new();
+            ki_hasher.update(out.kyber_capsule.as_bytes());
+            ki_hasher.update(&sk_bytes);
+            if spent_keys_snapshot.contains(&hex::encode(ki_hasher.finalize())) { continue; }
+
+            let is_valid_source = if spend_from_l2 {
+                out.stealth_address.starts_with("L2_WATT_")
+            } else {
+                out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_")
+            };
+            if !is_valid_source { continue; }
+
+            let mut is_mature = true;
+            let is_system_reward = out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") || out.kyber_capsule.starts_with("MICRO_COINBASE_");
+            
+            if is_system_reward && height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) { 
+                is_mature = false; 
+            }
+            if !is_mature { continue; }
+
+            let mut is_mine = false;
+            let mut val = 0u64;
+
+            if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) 
+                || out.stealth_address == format!("JACKPOT_{}", sender_kyber_public_hex) 
+                || out.stealth_address == sender_kyber_public_hex 
+            {
+                val = out.aes_vault.parse::<u64>().unwrap_or(0); is_mine = true;
+            } 
+            else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
+                if let Some(payload_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
+                    let parts: Vec<&str> = payload_str.split('|').collect();
+                    if parts.len() >= 2 {
+                        if let Ok(amt) = parts[0].parse::<u64>() { 
+                            val = amt; is_mine = true; 
+                        }
+                    }
+                }
+            }
+
+            if is_mine && val > 0 {
+                num_inputs += 1;
+                collected_flames += val;
+                if collected_flames >= required_total { break; }
+            }
+        }
+        if collected_flames >= required_total { break; }
+    }
+
+    let change = if collected_flames > required_total { 1 } else { 0 };
+    let num_outputs = 1 + change;
+    
+    // LE VRAI CALCUL EXACT EN BINAIRE (bincode)
+    // 16 leurres = 16 * 8192 octets (clés publiques) + 16 * 8192 octets (vecteurs Z)
+    // = EXACTEMENT 262 144 octets (0.25 Mo) par Input !
+    // Zéro overhead JSON. Zéro doublon Hexa.
+    let input_size = 262_144.0;
+    let output_size = 8_250.0; // Commitment LWE + Capsule
+    
+    // L'ESTIMATEUR BINAIRE EXACT :
+    // Input = 262 Ko | Output = 8 Ko
+    let exact_bytes = (num_inputs as f64 * input_size) + (num_outputs as f64 * output_size);
+    let exact_size_mb = exact_bytes / (1024.0 * 1024.0);
+
+    Ok((num_inputs, exact_size_mb))
 }
 
 

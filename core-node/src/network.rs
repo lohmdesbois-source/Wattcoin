@@ -329,8 +329,9 @@ pub fn start_peer_connection(
                                     if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 }
                                 };
 
-                                mempool_clone.lock().unwrap().retain(|t| { 
-                                    let not_in_block = !block.transactions.iter().any(|mined_tx| mined_tx.public_key == t.public_key);
+                                let mined_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash_data()).collect();
+								mempool_clone.lock().unwrap().retain(|t| { 
+									let not_in_block = !mined_hashes.contains(&t.hash_data());
                                     // PURGE KISS : On détruit les parts périmées
                                     let is_valid_share = match &t.tx_type {
                                         TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
@@ -429,10 +430,11 @@ pub fn start_peer_connection(
 									if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
 										if hex::encode(&hash_bytes) == *hash {
 											let mut pool = mp_clone_bg.lock().unwrap();
-											if !pool.iter().any(|t| t.public_key == tx_clone.public_key) {
-												println!("⛏️ [P2POOL] Part de minage validée et ajoutée au réseau !");
-												let tx_to_propagate = tx_clone.clone();
-												pool.push(tx_clone);
+											let tx_hash = in_tx.hash_data();
+											if !pool.iter().any(|t| t.hash_data() == tx_hash) {
+												println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !");
+												let tx_to_propagate = in_tx.clone();
+												pool.push(in_tx);
 
 												let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
 												let mut json_str = serde_json::to_string(&envelope).unwrap();
@@ -552,7 +554,7 @@ pub fn start_peer_connection(
                                     let mut hash_arr = [0u8; 64];
                                     hash_arr.copy_from_slice(&hasher.finalize());
 
-                                    if crate::wots::WotsKeyPair::verify(&micro_block.sequencer_pubkey, &micro_block.sequencer_sig, &hash_arr) {
+									if crate::lattice::LatticeKeyPair::verify(&micro_block.sequencer_pubkey, &micro_block.sequencer_sig, &hash_arr) {
                                                         
                                         // 1. TRIBUNAL DES FRAIS
                                         if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
@@ -634,7 +636,7 @@ pub fn start_peer_connection(
                 },
 				
 				P2PMessage::RelayOnion { packet } => {
-                    // Le code du Nœud Relais que je t'ai donné tout à l'heure
+                    // Le code du Nœud Relais
                     let my_secret = "HEX_SECRET_KYBER_DU_NOEUD"; // Plus tard on chargera la vraie clé
                     match packet.peel(my_secret) {
                         Ok(hop_payload) => {
@@ -642,10 +644,13 @@ pub fn start_peer_connection(
                                 println!("🎯 [MIXNET] Destination finale atteinte. Traitement de la requête.");
                             } else {
                                 println!("🧅 [MIXNET] Couche épluchée. Transfert aveugle vers : {}", hop_payload.next_hop_address);
-                                if let Ok(next_packet) = serde_json::from_str::<OnionPacket>(&hop_payload.inner_data) {
+                                
+                                // 💡 CORRECTION ICI : Décodage Binaire au lieu de JSON
+                                if let Ok(next_packet) = bincode::deserialize::<OnionPacket>(&hop_payload.inner_data) {
                                     let target_ip = hop_payload.next_hop_address.clone();
                                     tokio::spawn(async move {
                                         if let Ok(mut stream) = tokio::net::TcpStream::connect(&target_ip).await {
+                                            use tokio::io::AsyncWriteExt;
                                             let envelope = P2PMessage::RelayOnion { packet: next_packet };
                                             let mut json_str = serde_json::to_string(&envelope).unwrap();
                                             json_str.push('\n');

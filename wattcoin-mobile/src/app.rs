@@ -67,6 +67,7 @@ enum AppMessage {
     FileHashed(String, String),
 	L2StatusFetched(String),
 	DomainStatus(String),
+	TxWeightEstimated(usize, f64),
 }
 
 struct WattcoinApp {
@@ -106,6 +107,7 @@ struct WattcoinApp {
     transfer_from_l2: bool,
     transfer_to_l2: bool,
 	transfer_asset: String, // "WATT" ou "BTC"
+	tx_weight_estimate: Option<(usize, f64)>,
 	
 	history_items: Vec<crate::HistoryItem>,
     history_tab: String, // "L1" ou "L2"
@@ -233,6 +235,7 @@ impl WattcoinApp {
 			transfer_from_l2: false,
 			transfer_to_l2: false,
 			transfer_asset: "WATT".to_string(), // Transfert WATT par défaut
+			tx_weight_estimate: None,
 			
 			history_items: Vec::new(),
             history_tab: "L1".to_string(), // Par défaut sur L1
@@ -567,10 +570,7 @@ impl eframe::App for WattcoinApp {
         // UTILISER 'WHILE' AU LIEU DE 'IF' POUR VIDER LE CACHE INSTANTANÉMENT
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                AppMessage::UnlockSuccess(mut keys) => {
-					// 💡 LECTURE SUR LE DISQUE : On force la récupération du VRAI index 
-					// qui a survécu à la fermeture du programme.
-					keys.wots_index = crate::get_saved_wots_index(keys.wots_index);
+                AppMessage::UnlockSuccess(keys) => {
 
 					self.decrypted_seed = keys.mnemonic.clone();
 					self.wallet_keys = Some(keys);
@@ -585,16 +585,6 @@ impl eframe::App for WattcoinApp {
                 },
                 AppMessage::Info(info) => {
 					self.sync_message = info.clone();
-					// Si le message contient la mise à jour de l'index
-					if info.contains("Nouvel index WOTS :") {
-						if let Some(ref mut keys) = self.wallet_keys {
-							if let Some(idx_str) = info.split(':').last() {
-								if let Ok(new_idx) = idx_str.trim().parse::<u32>() {
-									keys.wots_index = new_idx; // Sécurité anti-double signature
-								}
-							}
-						}
-					}
 				},
                 AppMessage::QrScanned(content) => {
 					// SÉCURITÉ : Le comportement dépend STRICTEMENT de l'écran actuel
@@ -691,7 +681,10 @@ impl eframe::App for WattcoinApp {
 				},
 				AppMessage::DomainStatus(status) => { 
 					self.wns_domain_status = status;
-				}
+				},
+				AppMessage::TxWeightEstimated(utxo_count, size_mb) => {
+                    self.tx_weight_estimate = Some((utxo_count, size_mb));
+                }
             }
         }
 
@@ -1338,7 +1331,25 @@ impl eframe::App for WattcoinApp {
 
 						ui.vertical(|ui| {
 							ui.label(format!("Montant ({}) :", self.transfer_asset));
-							ui.add(egui::TextEdit::singleline(&mut self.amount_input).hint_text("0.0"));
+							
+							// ON CAPTURE LA FRAPPE POUR ESTIMER LE POIDS
+							let response = ui.add(egui::TextEdit::singleline(&mut self.amount_input).hint_text("0.0"));
+							
+							if response.changed() && self.transfer_asset == "WATT" {
+								if let (Some(keys), Ok(amt)) = (&self.wallet_keys, self.amount_input.parse::<f64>()) {
+									let tx = self.tx.clone();
+									let keys = keys.clone();
+									let from_l2 = self.transfer_from_l2;
+									tokio::spawn(async move {
+										// ON LUI PASSE LA VRAIE ADRESSE (keys.watt_address)
+										if let Ok((utxos, size)) = crate::estimate_tx_weight(amt, &keys.kyber_secret_hex, &keys.watt_address, from_l2, false).await {
+											let _ = tx.send(AppMessage::TxWeightEstimated(utxos, size)).await;
+										}
+									});
+								} else {
+									self.tx_weight_estimate = None;
+								}
+							}
 							
 							// Conversion USD en direct !
 							if let Ok(amt) = self.amount_input.parse::<f64>() {
@@ -1348,6 +1359,19 @@ impl eframe::App for WattcoinApp {
 								}
 							}
 						});
+						
+						// L'AFFICHAGE DU POIDS ESTIMÉ
+						if let Some((utxos, size_mb)) = self.tx_weight_estimate {
+						    ui.add_space(10.0);
+						    let color = if size_mb > 16.0 { egui::Color32::RED } else if size_mb > 8.0 { egui::Color32::from_rgb(255, 165, 0) } else { egui::Color32::GREEN };
+						    egui::Frame::none().fill(item_bg).inner_margin(8.0).rounding(4.0).show(ui, |ui| {
+						        ui.label(egui::RichText::new(format!("⚖ Poids estimé : {:.2} Mo ({} UTXOs utilisés)", size_mb, utxos)).color(color));
+						        if size_mb > 16.0 {
+						            ui.label(egui::RichText::new("⚠ Transaction trop lourde ! Réduisez le montant pour utiliser moins d'UTXOs.").size(10.0).color(egui::Color32::RED));
+						        }
+						    });
+						}
+
 						ui.add_space(15.0);
 
 						// Options spécifiques au WATT
@@ -1359,10 +1383,22 @@ impl eframe::App for WattcoinApp {
 						ui.add_space(20.0);
 
 						if ui.add_sized([300.0, 40.0], egui::Button::new("🔥 Signer et Envoyer")).clicked() {
-							if let (Some(keys), Ok(amount)) = (&self.wallet_keys, self.amount_input.parse::<f64>()) {
+							// 1. VRAIE REMONTÉE D'ERREURS DÉTAILLÉE
+							if self.wallet_keys.is_none() {
+								self.sync_message = "❌ Erreur : Portefeuille verrouillé.".to_string();
+							} else if self.recipient_input.trim().is_empty() {
+								self.sync_message = "❌ Erreur : L'adresse de destination est vide.".to_string();
+							} else if self.amount_input.trim().is_empty() {
+								self.sync_message = "❌ Erreur : Le montant est vide.".to_string();
+							} else if let Err(_) = self.amount_input.trim().replace(",", ".").parse::<f64>() {
+								// Le .trim() nettoie les espaces invisibles, le replace() gère les virgules accidentelles
+								self.sync_message = "❌ Erreur : Format du montant invalide (ex: 10.5).".to_string();
+							} else {
+								// 2. TOUT EST BON, ON RÉCUPÈRE LES VARIABLES PROPRES
+								let amount = self.amount_input.trim().replace(",", ".").parse::<f64>().unwrap();
+								let keys = self.wallet_keys.as_ref().unwrap().clone();
+								let recipient = self.recipient_input.trim().to_string();
 								let tx = self.tx.clone();
-								let keys = keys.clone();
-								let recipient = self.recipient_input.clone();
 								
 								if self.transfer_asset == "WATT" {
 									self.sync_message = "Création de la transaction quantique...".to_string();
@@ -1387,21 +1423,15 @@ impl eframe::App for WattcoinApp {
 										}
 
 										// On envoie à la vraie adresse finale
-										match crate::send_wattcoin(
-											final_recipient, amount, keys.kyber_secret_hex, keys.watt_address,
-											keys.master_seed_hex, keys.wots_index, None, None, from_l2, to_l2,
-										).await {
-											Ok(new_wots_index) => {
-												let _ = tx.send(AppMessage::Info(format!("✅ Transfert WATT envoyé ! Nouvel index WOTS : {}", new_wots_index))).await;
-											},
+										match crate::send_wattcoin(final_recipient, amount, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, None, None, from_l2, to_l2).await {
+											Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 										}
 									});
-								}else if self.transfer_asset == "BTC" {
+								} else if self.transfer_asset == "BTC" {
 									self.sync_message = "Création de la transaction Bitcoin via Tor...".to_string();
 									
 									tokio::spawn(async move {
-										// On passe keys.master_seed_hex !
 										match crate::send_btc_direct(recipient, amount, keys.master_seed_hex).await {
 											Ok(msg) => {
 												let _ = tx.send(AppMessage::Info(msg)).await;
@@ -1410,8 +1440,6 @@ impl eframe::App for WattcoinApp {
 										}
 									});
 								}
-							} else {
-								self.sync_message = "❌ Erreur: Montant invalide ou portefeuille verrouillé.".to_string();
 							}
 						}
 
@@ -1656,13 +1684,8 @@ impl eframe::App for WattcoinApp {
 													let htlc_hash = swap.htlc_hash.clone();
 													
 													tokio::spawn(async move {
-														match crate::send_wattcoin(
-															recipient, amount_watt, keys_clone.kyber_secret_hex, keys_clone.watt_address,
-															keys_clone.master_seed_hex, keys_clone.wots_index, Some(htlc_hash), Some(999_999), false, false
-														).await {
-															Ok(new_wots_index) => {
-																let _ = tx.send(AppMessage::Info(format!("✅ WATT verrouillés (Index: {}) !", new_wots_index))).await;
-															},
+														match crate::send_wattcoin(recipient, amount_watt, keys_clone.kyber_secret_hex, keys_clone.watt_address, keys_clone.master_seed_hex, Some(htlc_hash), Some(999_999), false, false).await {
+															Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 															Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 														}
 													});
@@ -1800,16 +1823,8 @@ impl eframe::App for WattcoinApp {
 										let keys_clone = keys.clone();
 										
 										tokio::spawn(async move {
-											match crate::buy_lottery_ticket(
-												keys_clone.kyber_secret_hex, 
-												keys_clone.watt_address, 
-												keys_clone.master_seed_hex, 
-												keys_clone.wots_index,
-												ticket_price_flames
-											).await {
-												Ok(new_index) => {
-													let _ = tx.send(AppMessage::Info(format!("✅ Ticket de loto acheté ! (Nouvel index : {})", new_index))).await;
-												},
+											match crate::buy_lottery_ticket(keys_clone.kyber_secret_hex, keys_clone.watt_address, keys_clone.master_seed_hex, ticket_price_flames).await {
+												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 												Err(e) => {
 													let _ = tx.send(AppMessage::Error(e)).await;
 												}
@@ -1938,10 +1953,8 @@ impl eframe::App for WattcoinApp {
 												}
 											}
 
-											match crate::send_data(
-												final_recipient, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, keys.wots_index, "MSG".to_string(), content, use_l2
-											).await {
-												Ok(new_idx) => { let _ = tx.send(AppMessage::Info(format!("✅ Message envoyé ! (Index WOTS: {})", new_idx))).await; }
+											match crate::send_data(final_recipient, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, "MSG".to_string(), content, use_l2).await {
+												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 											}
 										});
@@ -1998,10 +2011,8 @@ impl eframe::App for WattcoinApp {
 										let recipient = keys.watt_address.clone();
 
 										tokio::spawn(async move {
-											match crate::send_data(
-												recipient, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, keys.wots_index, "POE".to_string(), hash_content, use_l2
-											).await {
-												Ok(new_idx) => { let _ = tx.send(AppMessage::Info(format!("✅ Preuve d'Existence gravée ! (Index WOTS: {})", new_idx))).await; }
+											match crate::send_data(recipient, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, "POE".to_string(), hash_content, use_l2).await {
+												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 											}
 										});
@@ -2108,7 +2119,7 @@ impl eframe::App for WattcoinApp {
 										let sequencer_pubkey = self.l2_sequencer_pubkey.clone();
 
 										tokio::spawn(async move {
-											match crate::stake_l2(l2_name, amt, keys.kyber_secret_hex, keys.watt_address, sequencer_pubkey, keys.master_seed_hex.clone(), keys.wots_index).await {
+											match crate::stake_l2(l2_name, amt, keys.kyber_secret_hex, keys.watt_address, sequencer_pubkey, keys.master_seed_hex.clone()).await {
 												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 											}
@@ -2132,7 +2143,7 @@ impl eframe::App for WattcoinApp {
 										let l2_name = self.l2_target_name.clone();
 
 										tokio::spawn(async move {
-											match crate::unstake_l2(l2_name, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex.clone(), keys.wots_index).await {
+											match crate::unstake_l2(l2_name, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex.clone()).await {
 												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 											}
@@ -2160,12 +2171,12 @@ impl eframe::App for WattcoinApp {
 						ui.label(egui::RichText::new("Verrouillez vos WATT sur le réseau principal (L1) de manière transparente. Ils seront crédités sur la blockchain secondaire (L2) de votre choix.").color(egui::Color32::GRAY));
 						ui.add_space(20.0);
 
-						ui.label("Nom du réseau L2 de destination (ex: WNS, TARTUFE) :");
+						ui.label("Nom du réseau L2 de destination (ex: WNS) :");
 						ui.add(egui::TextEdit::singleline(&mut self.bridge_l2_name));
 						ui.add_space(10.0);
 
 						ui.label("Clé publique du destinataire sur le L2 :");
-						let response = ui.add(egui::TextEdit::singleline(&mut self.bridge_receiver_pubkey).hint_text("Clé WOTS+ ou adresse Kyber"));
+						let response = ui.add(egui::TextEdit::singleline(&mut self.bridge_receiver_pubkey).hint_text("Clé Lattice ou adresse Kyber"));
 
 						response.context_menu(|ui| {
 							if ui.button("📋 Coller").clicked() {
@@ -2207,7 +2218,7 @@ impl eframe::App for WattcoinApp {
 									let receiver = self.bridge_receiver_pubkey.clone();
 
 									tokio::spawn(async move {
-										match crate::bridge_to_l2(l2_name, receiver, amt, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, keys.wots_index).await {
+										match crate::bridge_to_l2(l2_name, receiver, amt, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex).await {
 											Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 										}

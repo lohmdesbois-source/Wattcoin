@@ -12,7 +12,6 @@ pub mod blockchain;
 pub mod transaction;
 pub mod network;
 pub mod api;
-pub mod wots;
 pub mod merkle_ring;
 pub mod lattice;
 pub mod dht;

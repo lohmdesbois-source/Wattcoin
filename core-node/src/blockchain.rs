@@ -252,7 +252,7 @@ impl Blockchain {
 		self.get_jackpot_info(next_draw, l2_db_path)
 	}
 
-    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str, l2_db_path: Option<&str>, l2_keys: Vec<crate::wots::WotsKeyPair>) -> (Block, BigUint, Vec<crate::wots::WotsKeyPair>) {
+    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str, l2_db_path: Option<&str>, l2_keys: Vec<crate::lattice::LatticeKeyPair>) -> (Block, BigUint, Vec<crate::lattice::LatticeKeyPair>) {
         let current_height = self.chain.len() as u64;
         println!("\n⏳ Préparation du Bloc {}...", current_height);
 
@@ -578,17 +578,25 @@ impl Blockchain {
                 lattice_commitment: crate::lattice::LWECommitment::commit(final_finder_reward, &[0u64; crate::lattice::LATTICE_DIM]),
             });
 
-            // 2. Outputs pour la communauté
-            for (i, share_tx) in valid_shares.iter().enumerate() {
-                if let TransactionType::MiningShare { miner_address: share_addr, .. } = &share_tx.tx_type {
-                    coinbase_outputs.push(crate::transaction::TransactionOutput {
-                        stealth_address: format!("COINBASE_{}", share_addr), 
-                        kyber_capsule: format!("SHARE_CAPSULE_{}_{}", current_height, i),
-                        aes_vault: share_reward.to_string(), 
-                        lattice_commitment: crate::lattice::LWECommitment::commit(share_reward, &[0u64; crate::lattice::LATTICE_DIM]),
-                    });
-                }
-            }
+            // --- L'AGRÉGATION INTELLIGENTE DU P2POOL ---
+			// On regroupe toutes les parts par adresse de mineur
+			let mut aggregated_shares: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+			
+			for share_tx in valid_shares.iter() {
+				if let TransactionType::MiningShare { miner_address: share_addr, .. } = &share_tx.tx_type {
+					*aggregated_shares.entry(share_addr.clone()).or_insert(0) += share_reward;
+				}
+			}
+
+			// 2. Outputs pour la communauté (1 SEUL billet par mineur pour tout le bloc !)
+			for (i, (share_addr, total_reward)) in aggregated_shares.into_iter().enumerate() {
+				coinbase_outputs.push(crate::transaction::TransactionOutput {
+					stealth_address: format!("COINBASE_{}", share_addr), 
+					kyber_capsule: format!("SHARE_CAPSULE_{}_{}", current_height, i),
+					aes_vault: total_reward.to_string(), 
+					lattice_commitment: crate::lattice::LWECommitment::commit(total_reward, &[0u64; crate::lattice::LATTICE_DIM]),
+				});
+			}
         } else {
             // S'il est tout seul sur le réseau, il prend les 100% de la subvention + 100% des frais
             let total_solo_reward = allowed_subsidy + l1_miner_fees;
@@ -672,7 +680,7 @@ impl Blockchain {
                     inputs: vec![],
                     outputs: vec![payout_output],
                     fee: 0,
-                    public_key: "LOTTERY_PAYOUT".to_string(), wots_signature: None,
+                    public_key: "LOTTERY_PAYOUT".to_string(), lattice_signature: None,
                 };
 
                 valid_transactions.push(lottery_payout_tx);
@@ -685,7 +693,7 @@ impl Blockchain {
             inputs: vec![],
             outputs: coinbase_outputs,
             fee: 0,
-            public_key: "COINBASE_SIG".to_string(), wots_signature: None,
+            public_key: "COINBASE_SIG".to_string(), lattice_signature: None,
         };
         valid_transactions.insert(0, coinbase_tx);
 		
@@ -1300,14 +1308,14 @@ impl Blockchain {
                 let legit_sequencer = &candidates[winner_index];
 
                 // 3. Vérification de l'Usurpation
-                if let Ok(sig) = serde_json::from_str::<crate::wots::WotsSignature>(sequencer_signature) {
+				if let Ok(sig) = serde_json::from_str::<crate::lattice::LatticeSignature>(sequencer_signature) {
                     let mut hasher = sha2::Sha512::new();
                     hasher.update(state_root.as_bytes());
                     let mut hash_array = [0u8; 64];
                     hash_array.copy_from_slice(&hasher.finalize());
                     
                     // On vérifie que la signature appartient bien au GAGNANT DU VRF !
-                    if !crate::wots::WotsKeyPair::verify(legit_sequencer, &sig, &hash_array) {
+                    if !crate::lattice::LatticeKeyPair::verify(legit_sequencer, &sig, &hash_array) {
                         return Err(format!("❌ FRAUDE VRF : Le Séquenceur a soumis un bloc, mais il a perdu la loterie de ce tour !"));
                     }
                 } else {

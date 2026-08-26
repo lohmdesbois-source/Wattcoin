@@ -1,6 +1,6 @@
 [package]
 name = "wattcoin_core"
-version = "2.1.18"
+version = "2.2.1"
 edition = "2024"
 
 [dependencies]
@@ -22,3 +22,4 @@ sha2 = "0.10.6"
 bitcoin = { version = "0.32", features = ["rand-std"] }
 pqc_kyber = "0.7.1"
 aes-gcm = "0.11.0"
+bincode = "1.3"

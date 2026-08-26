@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 use serde::{Serialize, Deserialize};
 use sha2::{Sha512, Digest};
-use crate::wots::WotsSignature;
-use crate::lattice::LWECommitment;
+use crate::lattice::{LWECommitment, LatticeSignature};
 use crate::merkle_ring::MpcRingSignature;
 
 // ==================== WNS (LAYER 2) ====================
@@ -115,7 +114,7 @@ pub struct Transaction {
     pub inputs: Vec<TransactionInput>,
     pub outputs: Vec<TransactionOutput>,
     pub fee: u64,
-    pub wots_signature: Option<WotsSignature>, 
+    pub lattice_signature: Option<LatticeSignature>, 
     pub public_key: String, 
 }
 

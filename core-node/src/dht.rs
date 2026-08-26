@@ -4,19 +4,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use reqwest::Client; // Pour interroger l'API WNS
 
 // On importe tes outils cryptographiques existants
-use crate::wots::{WotsKeyPair, WotsSignature};
+use crate::lattice::{LatticeKeyPair, LatticeSignature};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DhtRecord {
     pub domain_name: String,      // ex: "watty.watt"
     pub mixnet_address: String,   // L'adresse de routage (le nœud d'entrée du Mixnet)
     pub timestamp: u64,           // Horodatage pour éviter les attaques par rejeu
-    pub signature: String,        // Signature WOTS+ prouvant l'authenticité
+    pub signature: String,        // Signature Lattice prouvant l'authenticité
 }
 
 impl DhtRecord {
     /// Le serveur/navigateur crée son enregistrement et le signe
-    pub fn new(domain_name: String, mixnet_address: String, secret_key: &[Vec<u8>], public_seed: &[u8; 32]) -> Self {
+    pub fn new(domain_name: String, mixnet_address: String, secret_key: &[u64]) -> Self {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
         let mut record = Self {
@@ -28,8 +28,8 @@ impl DhtRecord {
 
         let hash = record.hash_data();
         
-        // Signature quantique !
-        let sig = WotsKeyPair::sign(secret_key, public_seed, &hash);
+        // Signature Lattice Unifiée ! (Plus de public_seed nécessaire)
+        let sig = LatticeKeyPair::sign(secret_key, &hash);
         record.signature = serde_json::to_string(&sig).unwrap();
         
         record
@@ -48,22 +48,18 @@ impl DhtRecord {
     }
 
     /// Le Tribunal du Navigateur : Est-ce que cette route est légitime ?
-    /// `expected_pubkey` est la clé publique récupérée de force sur la blockchain L2 (WNS)
     pub fn is_valid(&self, expected_pubkey: &str) -> bool {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
-        // 1. Bouclier Temporel (Ex: L'information expire après 48h)
-        // Oblige le serveur à se manifester régulièrement pour dire "Je suis toujours là"
         if self.timestamp > now + 60 || self.timestamp < now - (48 * 3600) {
             println!("⏳ [DHT] Route rejetée : Horodatage expiré ou falsifié.");
             return false;
         }
 
-        // 2. Bouclier Quantique
-        if let Ok(sig) = serde_json::from_str::<WotsSignature>(&self.signature) {
+        // Bouclier Lattice
+        if let Ok(sig) = serde_json::from_str::<LatticeSignature>(&self.signature) {
             let hash = self.hash_data();
-            // On vérifie que la signature correspond bien au propriétaire déclaré sur le L2 WNS
-            WotsKeyPair::verify(expected_pubkey, &sig, &hash)
+            LatticeKeyPair::verify(expected_pubkey, &sig, &hash)
         } else {
             false
         }

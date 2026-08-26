@@ -110,93 +110,104 @@ pub async fn start_api_server(
 			warp::reply::json(&active_swaps)
 		});
 	
-	let secret_for_onion = node_kyber_secret.clone(); // 👈 Clonage pour la route
+	let secret_for_onion = node_kyber_secret.clone(); // Clonage pour la route
 
     // ===================================================================
     // ROUTE MIXNET : La porte d'entrée du réseau en Oignon
     // ===================================================================
     let relay_onion = warp::path!("relay_onion")
         .and(warp::post())
-        .and(warp::body::json())
-        .map(move |packet: crate::mixnet::OnionPacket| {
-            
-            // 💡 MAGIE : On utilise la VRAIE clé générée par le nœud !
-            match packet.peel(&secret_for_onion) {
-				Ok(hop_payload) => {
-					// COMPORTEMENT "EXIT NODE" (Proxy HTTP)
-					if hop_payload.next_hop_address.starts_with("http") {
-						println!("🎯 [MIXNET] Nœud de Sortie (Exit Node) ! Routage final vers : {}", hop_payload.next_hop_address);
-						
-						let target_url = hop_payload.next_hop_address.clone();
-						let payload = hop_payload.inner_data.clone();
-						
-						// Le Nœud L1 fait la requête HTTP POST à la place de l'utilisateur !
-						tokio::spawn(async move {
-							let client = reqwest::Client::new();
-							match client.post(&target_url)
-								.header("Content-Type", "application/json")
-								.body(payload)
-								.send()
-								.await {
+        .and(warp::body::content_length_limit(1024 * 1024 * 32)) // 32 Mo max
+        .and(warp::body::bytes()) // 👈 ON LIT LE BINAIRE PUR !
+        .then(move |body_bytes: warp::hyper::body::Bytes| {
+            let secret_for_onion = secret_for_onion.clone();
+            async move {
+                use warp::Reply;
+                
+                // 1. Décodage binaire
+                let packet: crate::mixnet::OnionPacket = match bincode::deserialize(&body_bytes) {
+                    Ok(p) => p,
+                    Err(e) => return warp::reply::with_status(warp::reply::json(&format!("❌ Format oignon binaire invalide: {}", e)), warp::http::StatusCode::BAD_REQUEST).into_response(),
+                };
+
+                // 2. Épluchage
+                match packet.peel(&secret_for_onion) {
+                    Ok(hop_payload) => {
+                        if hop_payload.next_hop_address.starts_with("http") {
+                            println!("🎯 [MIXNET] Nœud de Sortie (Exit Node) ! Routage final...");
+                            
+                            let target_url = hop_payload.next_hop_address.clone();
+                            let payload = hop_payload.inner_data.clone();
+                            
+                            let client = reqwest::Client::new();
+                            // 💡 ON ATTEND LE RESULTAT (Fini le mensonge du "OK" instantané)
+                            match client.post(&target_url)
+                                .header("Content-Type", "application/octet-stream") // C'est du binaire !
+                                .body(payload)
+                                .send()
+                                .await {
                                 Ok(res) => {
                                     let status = res.status();
                                     let text = res.text().await.unwrap_or_default();
                                     if status.is_success() {
-                                        println!("✅ [MIXNET] TX routée et acceptée par l'API locale !");
+                                        println!("✅ [MIXNET] TX routée et acceptée !");
+                                        warp::reply::with_status(warp::reply::json(&text), warp::http::StatusCode::OK).into_response()
                                     } else {
-                                        println!("❌ [MIXNET] L'API locale a refusé la TX. Code: {}, Raison: {}", status, text);
+                                        println!("❌ [MIXNET] Refusé par le réseau: {}", text);
+                                        warp::reply::with_status(warp::reply::json(&text), warp::http::StatusCode::BAD_REQUEST).into_response()
                                     }
                                 }
-                                Err(e) => println!("❌ [MIXNET] Erreur de connexion locale vers l'API : {}", e),
+                                Err(e) => warp::reply::with_status(warp::reply::json(&format!("Erreur Nœud Final: {}", e)), warp::http::StatusCode::BAD_GATEWAY).into_response()
                             }
-						});
-						
-					} else if !hop_payload.next_hop_address.is_empty() {
-						println!("🧅 [MIXNET] Couche épluchée. Relais P2P vers : {}", hop_payload.next_hop_address);
-						
-						if let Ok(next_packet) = serde_json::from_str::<crate::mixnet::OnionPacket>(&hop_payload.inner_data) {
-							let target_ip = hop_payload.next_hop_address.clone();
-							tokio::spawn(async move {
-								if let Ok(mut stream) = tokio::net::TcpStream::connect(&target_ip).await {
-									use tokio::io::AsyncWriteExt;
-									let envelope = crate::network::P2PMessage::RelayOnion { packet: next_packet };
-									let mut json_str = serde_json::to_string(&envelope).unwrap();
-									json_str.push('\n');
-									let _ = stream.write_all(json_str.as_bytes()).await;
-								}
-							});
-						}
-					}
-                    
-                    // On retourne un Reply HTTP valide pour le succès !
-                    warp::reply::with_status(
-                        warp::reply::json(&"✅ Paquet oignon épluché et relayé avec succès"), 
-                        warp::http::StatusCode::OK
-                    )
-				},
-				Err(e) => {
-					println!("❌ [MIXNET] Rejet du paquet en oignon : {}", e);
-                    
-                    // On retourne un Reply HTTP pour l'erreur !
-                    warp::reply::with_status(
-                        warp::reply::json(&format!("❌ Erreur de routage oignon : {}", e)), 
-                        warp::http::StatusCode::BAD_REQUEST
-                    )
-				}
-			}
+                        } else if !hop_payload.next_hop_address.is_empty() {
+                            println!("🧅 [MIXNET] Couche épluchée. Relais P2P...");
+                            if let Ok(next_packet) = bincode::deserialize::<crate::mixnet::OnionPacket>(&hop_payload.inner_data) {
+                                let target_ip = hop_payload.next_hop_address.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(mut stream) = tokio::net::TcpStream::connect(&target_ip).await {
+                                        use tokio::io::AsyncWriteExt;
+                                        let envelope = crate::network::P2PMessage::RelayOnion { packet: next_packet };
+                                        let mut json_str = serde_json::to_string(&envelope).unwrap();
+                                        json_str.push('\n');
+                                        let _ = stream.write_all(json_str.as_bytes()).await;
+                                    }
+                                });
+                            }
+                            warp::reply::with_status(warp::reply::json(&"Relayé"), warp::http::StatusCode::OK).into_response()
+                        } else {
+                            warp::reply::with_status(warp::reply::json(&"OK"), warp::http::StatusCode::OK).into_response()
+                        }
+                    },
+                    Err(e) => warp::reply::with_status(warp::reply::json(&format!("Erreur oignon: {}", e)), warp::http::StatusCode::BAD_REQUEST).into_response()
+                }
+            }
         });
 	
 	let send_tx = warp::post()
 		.and(warp::path("send_tx"))
-		.and(warp::body::content_length_limit(1024 * 1024 * 16).and(warp::body::json()))
+		.and(warp::body::content_length_limit(1024 * 1024 * 32))
+        .and(warp::body::bytes()) // ON LIT LE BINAIRE PUR !
         .and(mempool_filter.clone())
         .and(chain_filter.clone()) 
         .and(active_peers_filter.clone()) 
 		.and(btc_htlc_set_filter.clone())
-        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, 
+        .map(|body_bytes: warp::hyper::body::Bytes, mempool: Arc<Mutex<Vec<Transaction>>>, 
 										 chain_arc: Arc<Mutex<Blockchain>>, 
 										 active_peers: crate::network::ActivePeers,
 										 btc_htlcs: Arc<Mutex<HashSet<String>>>| {
+            
+            // DÉCODAGE BINAIRE ULTRA RAPIDE !
+            let tx: Transaction = match bincode::deserialize(&body_bytes) {
+                Ok(t) => t,
+                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
+            };
+
+            // BOUCLIER : Bloque les spams obèses (Max 25 récompenses de minage d'un coup)
+			/*
+            if tx.inputs.len() > 25 {
+                return warp::reply::with_status(warp::reply::json(&"❌ REJETÉ : Transaction trop lourde. Regroupez vos fonds par paquets de 25 maximum."), warp::http::StatusCode::BAD_REQUEST);
+            }
+			*/
             
             // PATCH ANTI-HACKING dans api.rs : Bloque TOUTES les transactions systèmes depuis l'API
 			if matches!(tx.tx_type, crate::transaction::TransactionType::Coinbase 

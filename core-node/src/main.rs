@@ -338,7 +338,7 @@ async fn main() {
                             // ON LAISSE RESPIRER LE RÉSEAU : 1ms de pause pour laisser passer les paquets TCP
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             
-                            chunk_keys.push(wattcoin_core::wots::WotsKeyPair::generate());
+                            chunk_keys.push(wattcoin_core::lattice::LatticeKeyPair::generate());
                         }
                         chunk_keys
                     }));
@@ -423,7 +423,7 @@ async fn main() {
                             outputs: vec![],
                             fee: 0,
                             public_key: "DEX_SETTLEMENT_ON_CHAIN".to_string(), 
-                            wots_signature: None,
+                            lattice_signature: None,
                         });
                     }
                 }
@@ -504,7 +504,7 @@ async fn main() {
                             break; 
                         }
                         
-                        // 🛡️ CORRECTION : On remplace le 'yield_now().await' par un mini-sleep natif
+                        // On remplace le 'yield_now().await' par un mini-sleep natif
                         // Cela force ce thread intensif à respirer 1 ms pour le système d'exploitation.
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
@@ -541,7 +541,7 @@ async fn main() {
                                 inputs: vec![], outputs: vec![], fee: 0,
                                 // On sépare par des :
 								public_key: format!("{}_{}_{}", candidate_block.header.l2_root, candidate_block.header.tx_root, candidate_block.header.nonce), 
-								wots_signature: None,
+								lattice_signature: None,
                             };
                             let mut pool = miner_mempool.lock().unwrap();
                             pool.push(share_tx.clone());
@@ -640,10 +640,11 @@ async fn main() {
                                     for tx in mp.iter() {
                                         let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
                                         
-                                        if is_pure_l2 && !already_sequenced.contains(&tx.public_key) {
-                                            txs_to_sequence.push(tx.clone());
-                                            already_sequenced.insert(tx.public_key.clone());
-                                        }
+                                        let tx_hash_hex = hex::encode(tx.hash_data());
+										if is_pure_l2 && !already_sequenced.contains(&tx_hash_hex) {
+											txs_to_sequence.push(tx.clone());
+											already_sequenced.insert(tx_hash_hex);
+										}
                                     }
                                 }
 
@@ -686,7 +687,7 @@ async fn main() {
                                     outputs: coinbase_outputs,
                                     fee: 0,
                                     public_key: "MICRO_COINBASE".to_string(),
-                                    wots_signature: None,
+                                    lattice_signature: None,
                                 };
 
                                 txs_to_sequence.insert(0, micro_coinbase);
@@ -702,7 +703,7 @@ async fn main() {
                                     transactions: txs_to_sequence,
                                     sequencer_pubkey: keypair.public_key.clone(),
                                     sequencer_reward_address: "FEE_GOES_TO_NEXT_L1_MINER".to_string(), 
-                                    sequencer_sig: wattcoin_core::wots::WotsSignature { chains: vec![] }, 
+                                    sequencer_sig: wattcoin_core::lattice::LatticeSignature { z_vector: vec![0; wattcoin_core::lattice::LATTICE_DIM], c_hash: String::new() },
                                     merkle_proof: l2_pubkeys.clone(), 
                                 };
 
@@ -713,7 +714,7 @@ async fn main() {
                                 let mut hash_arr = [0u8; 64];
                                 hash_arr.copy_from_slice(&hasher.finalize());
 
-                                micro_block.sequencer_sig = wattcoin_core::wots::WotsKeyPair::sign(&keypair.secret_key, &keypair.public_seed, &hash_arr);
+                                micro_block.sequencer_sig = wattcoin_core::lattice::LatticeKeyPair::sign(&keypair.secret_key, &hash_arr);
 
                                 wattcoin_core::network::broadcast_micro_block(micro_block.clone(), Arc::clone(&active_peers_seq)).await;
                                 
@@ -743,7 +744,7 @@ async fn main() {
                                     }
                                     
                                     let mut mp = mempool_seq.lock().unwrap();
-                                    mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.public_key == tx.public_key));
+                                    mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
                                 }
                             }
                             println!("⚡ [L2 SEQUENCER] Mon règne est terminé. J'attends le prochain bloc L1...");
@@ -770,17 +771,19 @@ async fn main() {
                         0 
                     };
 
-                    mp.retain(|tx| {
-                        let not_in_block = !candidate_block.transactions.iter().any(|mined_tx| {
-                            mined_tx.public_key == tx.public_key
-                        });
-                        // PURGE KISS : On détruit mathématiquement les parts du bloc précédent
-                        let is_valid_share = match &tx.tx_type {
-                            TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-                            _ => true
-                        };
-                        not_in_block && is_valid_share
-                    });
+                    // L'astuce : on liste les HASHES des transactions fraîchement minées
+					let mined_hashes: Vec<_> = candidate_block.transactions.iter().map(|tx| tx.hash_data()).collect();
+					
+					mp.retain(|tx| {
+						// On compare les HASHES uniques, plus la clé publique !
+						let not_in_block = !mined_hashes.contains(&tx.hash_data());
+						
+						let is_valid_share = match &tx.tx_type {
+							TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+							_ => true
+						};
+						not_in_block && is_valid_share
+					});
                 } // Le verrou `chain` est enfin relâché proprement ici !
             }
         });
