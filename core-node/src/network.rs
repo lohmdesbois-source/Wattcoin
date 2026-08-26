@@ -432,7 +432,8 @@ pub fn start_peer_connection(
 											let mut pool = mp_clone_bg.lock().unwrap();
 											let tx_hash = in_tx.hash_data();
 											if !pool.iter().any(|t| t.hash_data() == tx_hash) {
-												println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !");
+												// Séparation claire : icône de part de minage
+												println!("⛏️ [P2POOL] Nouvelle part de minage relayée !");
 												let tx_to_propagate = in_tx.clone();
 												pool.push(in_tx);
 
