@@ -438,11 +438,17 @@ pub async fn start_api_server(
 
     let submit_order = warp::post()
 		.and(warp::path("order"))
-		.and(warp::body::json())
+		.and(warp::body::bytes()) // 💡 On accepte le binaire du Mixnet
 		.and(dex_pool_filter.clone())
 		.and(active_peers_filter.clone()) 
-		.map(|order: Order, pool: SharedPool, active_peers: crate::network::ActivePeers| {
-			// 🔥 VALIDATION STRICTE : Un ordre d'achat DOIT avoir un hash HTLC
+		.map(|body_bytes: warp::hyper::body::Bytes, pool: SharedPool, active_peers: crate::network::ActivePeers| {
+            // On décode le JSON depuis les octets
+            let order: Order = match serde_json::from_slice(&body_bytes) {
+                Ok(o) => o,
+                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format JSON invalide"), warp::http::StatusCode::BAD_REQUEST),
+            };
+
+			// VALIDATION STRICTE : Un ordre d'achat DOIT avoir un hash HTLC
 			if order.order_type == "buy" && order.htlc_hash.is_none() {
 				return warp::reply::with_status(warp::reply::json(&"❌ Achat impossible : HTLC Hash manquant"), warp::http::StatusCode::BAD_REQUEST);
 			}
@@ -659,11 +665,17 @@ pub async fn start_api_server(
     // ===================== HTLC CLAIM (version ultra-permissive pour swap atomique) =====================
 	let htlc_claim = warp::post()
 		.and(warp::path!("htlc" / "claim"))
-		.and(warp::body::json())
+		.and(warp::body::bytes()) // Le Wallet envoie du Bincode pur
 		.and(chain_filter.clone())
 		.and(mempool_filter.clone())
 		.and(active_peers_filter.clone())
-		.map(|tx: Transaction, chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
+		.map(|body_bytes: warp::hyper::body::Bytes, chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
+
+            // Décodage du bincode
+            let tx: Transaction = match bincode::deserialize(&body_bytes) {
+                Ok(t) => t,
+                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
+            };
 
 			// === Extraction safe du secret ===
 			let secret = match &tx.tx_type {
@@ -891,10 +903,15 @@ pub async fn start_api_server(
 
 	let btc_send_to_htlc = warp::path!("btc" / "send" / "to_htlc")
 		.and(warp::post())
-		.and(warp::body::json())
-		.and(btc_htlc_set_filter.clone()) // ⚡ 1. On importe l'accès à la mémoire du nœud
-		.map(|payload: serde_json::Value, btc_htlcs: Arc<Mutex<HashSet<String>>>| {
+		.and(warp::body::bytes()) 
+		.and(btc_htlc_set_filter.clone()) 
+		.map(|body_bytes: warp::hyper::body::Bytes, btc_htlcs: Arc<Mutex<HashSet<String>>>| {
 			
+            let payload: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(p) => p,
+                Err(_) => return warp::reply::json(&serde_json::json!({"error": "Format JSON invalide"})),
+            };
+
 			// Le wallet passe le hash HTLC dans le champ "htlc_address"
 			let htlc_hash = payload["htlc_address"].as_str().unwrap_or_default().to_string();
 			
@@ -975,8 +992,13 @@ pub async fn start_api_server(
 	// 2. CORRECTION : Le vrai Broadcast (Pousse le raw_tx sur le réseau)
 	let btc_broadcast = warp::path!("btc" / "broadcast")
 		.and(warp::post())
-		.and(warp::body::json())
-		.and_then(|payload: serde_json::Value| async move {
+		.and(warp::body::bytes()) 
+		.and_then(|body_bytes: warp::hyper::body::Bytes| async move {
+            let payload: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(p) => p,
+                Err(_) => return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"success": false, "error": "Format JSON invalide"}))),
+            };
+
 			let raw_tx = payload["raw_tx"].as_str().unwrap_or_default().to_string();
 			let broadcast_url = "https://mempool.space/testnet/api/tx";
 			

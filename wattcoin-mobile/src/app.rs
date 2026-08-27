@@ -1568,7 +1568,12 @@ impl eframe::App for WattcoinApp {
 							let is_submitting_order = self.sync_message == "Envoi de l'ordre...";
 
 							if ui.add_enabled(!is_submitting_order, egui::Button::new("🚀 Soumettre l'ordre au réseau")).clicked() {
-								if let (Some(keys), Ok(amt), Ok(price)) = (&self.wallet_keys, self.dex_amount_input.parse::<f64>(), self.dex_price_input.parse::<f64>()) {
+								
+								// Nettoyage des virgules et des espaces
+								let safe_amt = self.dex_amount_input.trim().replace(",", ".");
+								let safe_price = self.dex_price_input.trim().replace(",", ".");
+
+								if let (Some(keys), Ok(amt), Ok(price)) = (&self.wallet_keys, safe_amt.parse::<f64>(), safe_price.parse::<f64>()) {
 									
 									let o_type = self.dex_order_type.clone();
 									let mut can_proceed = true;
