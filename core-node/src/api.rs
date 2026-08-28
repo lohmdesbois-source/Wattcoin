@@ -199,7 +199,10 @@ pub async fn start_api_server(
             // DÉCODAGE BINAIRE ULTRA RAPIDE !
             let tx: Transaction = match bincode::deserialize(&body_bytes) {
                 Ok(t) => t,
-                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
+                Err(e) => {
+                    println!("❌ [API] Échec du décodage binaire sur /send_tx : {}", e);
+                    return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST);
+                }
             };
 
             // BOUCLIER : Bloque les spams obèses (Max 25 récompenses de minage d'un coup)

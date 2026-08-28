@@ -135,13 +135,8 @@ impl Transaction {
 			| TransactionType::MicroCoinbase
             | TransactionType::DexSettlement { .. } 
             | TransactionType::LotteryPayout { .. }
-			| TransactionType::MiningShare { .. }
-            | TransactionType::HTLCLock { .. }  
+			| TransactionType::MiningShare { .. }  
             | TransactionType::HTLCRefund { .. } 
-			| TransactionType::L2Stake { .. } 
-            | TransactionType::L2Anchor { .. } 
-            | TransactionType::L2Unstake { .. } 
-			| TransactionType::L2BridgeLock { .. }
             ) {
             return true;
         }
