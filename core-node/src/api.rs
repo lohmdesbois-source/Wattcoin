@@ -650,10 +650,17 @@ pub async fn start_api_server(
 	// ==================== HTLC ROUTES (définies ici pour être dans le scope) ====================
     let htlc_lock = warp::post()
         .and(warp::path!("htlc" / "lock"))
-        .and(warp::body::json())
+        .and(warp::body::bytes()) // On accepte le binaire !
         .and(mempool_filter.clone())
         .and(active_peers_filter.clone())
-        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
+        .map(|body_bytes: warp::hyper::body::Bytes, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
+            
+            // Décodage binaire
+            let tx: Transaction = match bincode::deserialize(&body_bytes) {
+                Ok(t) => t,
+                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
+            };
+
             if !tx.is_valid() || !matches!(tx.tx_type, TransactionType::HTLCLock { .. }) {
                 return warp::reply::with_status(warp::reply::json(&"❌ HTLCLock invalide"), warp::http::StatusCode::BAD_REQUEST);
             }
