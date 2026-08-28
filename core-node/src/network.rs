@@ -470,7 +470,7 @@ pub fn start_peer_connection(
 					// 3. TRAITEMENT CLASSIQUE POUR LES AUTRES TRANSACTIONS (HTLC, Envoi Classique...)
 					if in_tx.is_valid() {
 						let mut pool = mempool.lock().unwrap(); // Ou mp_clone dans la boucle Tor
-						if !pool.iter().any(|t| t.public_key == in_tx.public_key) {
+						if !pool.iter().any(|t| t.hash_data() == in_tx.hash_data()) {
 							println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !"); 
 							let tx_to_propagate = in_tx.clone();          
 							pool.push(in_tx);
@@ -659,7 +659,7 @@ pub fn start_peer_connection(
                                         // 3. NETTOYAGE DU MEMPOOL
                                         {
                                             let mut mp = mp_clone.lock().unwrap();
-                                            mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.public_key == tx.public_key));
+                                            mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
                                         }
                                         
                                         let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };

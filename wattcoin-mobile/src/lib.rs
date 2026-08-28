@@ -1169,7 +1169,9 @@ pub async fn send_wattcoin(
 
         // 1. UNIQUE OUTPUT POUR LE DESTINATAIRE (Montant entier)
         let current_bf = &balanced_bfs[bf_index];
-        let (kyber_capsule, shared_secret) = pqc_kyber::encapsulate(&recipient_bytes, &mut rand::thread_rng()).unwrap();
+        // Ne panique plus si l'adresse ou le domaine WNS est mal formaté
+		let (kyber_capsule, shared_secret) = pqc_kyber::encapsulate(&recipient_bytes, &mut rand::thread_rng())
+			.map_err(|_| "❌ Erreur : La clé Kyber du destinataire est invalide ou corrompue.".to_string())?;
         let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
         
         let bf_json = serde_json::to_string(current_bf).unwrap();
@@ -1198,7 +1200,8 @@ pub async fn send_wattcoin(
             let my_pk_bytes = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).unwrap();
             let change_prefix = if spend_from_l2 { "L2_WATT_" } else { "pq_watt_" };
 
-            let (kyber_capsule_change, my_shared_secret) = pqc_kyber::encapsulate(&my_pk_bytes, &mut rand::thread_rng()).unwrap();
+            let (kyber_capsule_change, my_shared_secret) = pqc_kyber::encapsulate(&my_pk_bytes, &mut rand::thread_rng())
+				.map_err(|_| "❌ Erreur de chiffrement interne (Change).".to_string())?;
             let mut otp_c = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp_c);
             
             let bf_json_c = serde_json::to_string(change_bf).unwrap();
@@ -1424,7 +1427,9 @@ pub async fn send_data_internal(
     let stealth_prefix = if use_l2 { "L2_WATT_" } else { "pq_watt_" };
 
     let data_bf = &balanced_bfs[bf_index];
-    let (kyber_capsule, shared_secret) = encapsulate(&recipient_bytes, &mut rand::thread_rng()).unwrap();
+    // Ne panique plus si l'adresse ou le domaine WNS est mal formaté
+    let (kyber_capsule, shared_secret) = pqc_kyber::encapsulate(&recipient_bytes, &mut rand::thread_rng())
+        .map_err(|_| "❌ Erreur : La clé Kyber du destinataire est invalide ou corrompue.".to_string())?;
     let mut otp = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp);
     
     let payload = format!("0|{}|{}:{}", hex::encode(otp), data_type, content);
@@ -1443,9 +1448,10 @@ pub async fn send_data_internal(
     bf_index += 1;
 
     if change_amount > 0 {
-        let change_bf = &balanced_bfs[bf_index];
+		let change_bf = &balanced_bfs[bf_index];
         let my_pk_bytes = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).unwrap();
-        let (kyber_capsule_change, my_shared_secret) = encapsulate(&my_pk_bytes, &mut rand::thread_rng()).unwrap();
+        let (kyber_capsule_change, my_shared_secret) = pqc_kyber::encapsulate(&my_pk_bytes, &mut rand::thread_rng())
+            .map_err(|_| "❌ Erreur de chiffrement interne (Change).".to_string())?;
         let mut otp2 = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp2);
         
         let bf_json = serde_json::to_string(change_bf).unwrap();
