@@ -384,8 +384,25 @@ pub fn start_peer_connection(
                                     not_in_block && is_valid_share
                                 });
                                 
-                                dex_pool_clone.lock().unwrap().clear();
-                                println!("🧹 [DEX] Nouveau bloc reçu : La session FBA est clôturée, Dark Pool vidé.");
+                                {
+									let now = chrono::Utc::now().timestamp();
+									let mut dp = dex_pool_clone.lock().unwrap();
+									
+									for tx in &block.transactions {
+										if let TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
+											for swap in swaps {
+												if let Some(buy) = dp.iter_mut().find(|o| o.order_type == "buy" && o.htlc_hash.as_ref() == Some(&swap.htlc_hash)) {
+													buy.amount_flames = buy.amount_flames.saturating_sub(swap.watt_amount_flames);
+												}
+												if let Some(sell) = dp.iter_mut().find(|o| o.order_type == "sell" && o.watt_address == swap.seller_watt_address && o.amount_flames >= swap.watt_amount_flames) {
+													sell.amount_flames = sell.amount_flames.saturating_sub(swap.watt_amount_flames);
+												}
+											}
+										}
+									}
+									dp.retain(|o| o.amount_flames > 0 && o.expires_at > now);
+									println!("🧹 [DEX] Bloc reçu : Dark Pool synchronisé (ordres restants: {}).", dp.len());
+								}
                                 
                                 let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port_clone };
                                 let mut json_str = serde_json::to_string(&env).unwrap();

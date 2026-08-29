@@ -798,9 +798,29 @@ async fn main() {
 						not_in_block && is_valid_share
 					});
 					
-					// On pense à vider le mempool
-					miner_dex_pool.lock().unwrap().clear();
-					println!("🧹 [DEX] Bloc forgé : La session FBA est clôturée, Dark Pool vidé.");
+					{
+						let now = chrono::Utc::now().timestamp();
+						let mut dp = miner_dex_pool.lock().unwrap();
+						
+						// On déduit les montants qui ont été validés dans ce bloc
+						for tx in &candidate_block.transactions {
+							if let TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
+								for swap in swaps {
+									// Déduction côté Acheteur
+									if let Some(buy) = dp.iter_mut().find(|o| o.order_type == "buy" && o.htlc_hash.as_ref() == Some(&swap.htlc_hash)) {
+										buy.amount_flames = buy.amount_flames.saturating_sub(swap.watt_amount_flames);
+									}
+									// Déduction côté Vendeur
+									if let Some(sell) = dp.iter_mut().find(|o| o.order_type == "sell" && o.watt_address == swap.seller_watt_address && o.amount_flames >= swap.watt_amount_flames) {
+										sell.amount_flames = sell.amount_flames.saturating_sub(swap.watt_amount_flames);
+									}
+								}
+							}
+						}
+						// On purge UNIQUEMENT les ordres vidés ou expirés !
+						dp.retain(|o| o.amount_flames > 0 && o.expires_at > now);
+						println!("🧹 [DEX] Bloc forgé : Dark Pool mis à jour (ordres restants: {}).", dp.len());
+					}
 					
                 } // Le verrou `chain` est enfin relâché proprement ici !
             }
