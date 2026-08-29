@@ -217,18 +217,36 @@ pub fn start_peer_connection(
 					if chain.resolve_partial_fork(blocks.clone()) { 
 						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
 						
-                        let cutoff_time = if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 };
+						let cutoff_time = if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 };
 
-                        let mut mp = mempool.lock().unwrap();
+						let mut mp = mempool.lock().unwrap();
 						mp.retain(|tx| { 
-                            let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
-                            // PURGE KISS
-                            let is_valid_share = match &tx.tx_type {
-                                TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-                                _ => true
-                            };
-                            not_in_block && is_valid_share
-                        });
+							let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
+							let is_valid_share = match &tx.tx_type {
+								TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+								_ => true
+							};
+							not_in_block && is_valid_share
+						});
+
+						// On relaie la bonne nouvelle au reste du réseau !
+						if let Some(last_block) = blocks.last() {
+							let env = P2PMessage::NewBlock { 
+								block: last_block.clone(), 
+								sender_port: my_port.clone() 
+							};
+							let mut json_str = serde_json::to_string(&env).unwrap();
+							json_str.push('\n');
+							
+							let ap = active_peers.lock().unwrap().clone();
+							for (peer_id, sender) in ap.iter() {
+								// On ne renvoie pas au pair qui vient de nous synchroniser
+								if peer_id != &actual_peer_id {
+									let _ = sender.try_send(json_str.clone());
+								}
+							}
+						}
+
 					} else {
 						println!("❌ [SYNC] Échec de la fusion !");
 					}
@@ -305,14 +323,12 @@ pub fn start_peer_connection(
 
                         // 4. Gestion du résultat réseau
                         match validation_result {
-                            Err((my_genesis, my_height, locator_hashes)) => {
+                            Err((_, my_height, locator_hashes)) => {
                                 // SI LE BLOC EST INVALIDE, ON RELÂCHE LE KILL SWITCH POUR LE MINEUR !
                                 // ASTUCE : my_height contient DÉJÀ la longueur de la chaîne (renvoyée par le closure) !
                                 // Zéro latence, pas besoin de refaire un lock() sur bc_clone.
                                 crate::network::HIGHEST_KNOWN_BLOCK.store(my_height.saturating_sub(1), Ordering::Relaxed);
 
-                                // On envoie sans cooldown ici pour l'instant (laissons le réseau se corriger)
-                                send_message_to_channel(&tx_clone, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() }).await;
                                 send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port_clone.clone() }).await;
                             },
                             Ok(is_new) => {
