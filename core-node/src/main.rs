@@ -359,7 +359,7 @@ async fn main() {
                 // 0. LE MOTEUR DEX (FBA) ON-CHAIN - VERSION SÉCURISÉE
                 let mut dex_settlement_tx = None;
                 {
-                    let mut p = miner_dex_pool.lock().unwrap();
+                    let p = miner_dex_pool.lock().unwrap();
                     let mut buys: Vec<_> = p.iter().filter(|o| o.order_type == "buy").cloned().collect();
                     let mut sells: Vec<_> = p.iter().filter(|o| o.order_type == "sell").cloned().collect();
                     buys.sort_by(|a, b| b.price_sats.cmp(&a.price_sats));
@@ -403,11 +403,6 @@ async fn main() {
                             break;
                         }
                     }
-
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-                    p.clear();
-                    for buy in buys { if buy.amount_flames > 0 && buy.expires_at > now { p.push(buy); } }
-                    for sell in sells { if sell.amount_flames > 0 && sell.expires_at > now { p.push(sell); } }
 
                     if total_volume_flames > 0 {
                         println!("\n⚖️ [DEX] Matching réussi → {} WATT à {} Sats", 
@@ -496,11 +491,23 @@ async fn main() {
 						// LECTURE DU KILL SWITCH (0 latence)
 						if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= candidate_block.header.index {
 							println!("🛑 [ALERTE RAPIDE] Un bloc concurrent a été détecté ! Arrêt immédiat.");
+							
+							if let Some(task) = current_sequencer_task.take() {
+								println!("🛑 [L2 SEQUENCER] Fin de règne (Nouveau bloc reçu du réseau).");
+								task.abort();
+							}
+							
 							break;
 						}
 						let chain = miner_chain.lock().unwrap();
                         if chain.chain.len() as u64 > candidate_block.header.index {
                             println!("🛑 [ALERTE] Le réseau a trouvé le Bloc {} avant nous ! Annulation du minage.", candidate_block.header.index);
+							
+							if let Some(task) = current_sequencer_task.take() {
+								println!("🛑 [L2 SEQUENCER] Fin de règne (Nouveau bloc reçu du réseau).");
+								task.abort();
+							}
+							
                             break; 
                         }
                         
@@ -559,6 +566,12 @@ async fn main() {
                     
                     if chain.chain.len() as u64 > candidate_block.header.index {
                          println!("🗑️ [INFO] Hachage trouvé, mais la chaîne a été synchronisée entre temps. Bloc jeté.");
+						 
+						 if let Some(task) = current_sequencer_task.take() {
+							println!("🛑 [L2 SEQUENCER] Fin de règne (Nouveau bloc reçu du réseau).");
+							task.abort();
+						}
+						
                     } 
                     else if chain.chain.len() as u64 == candidate_block.header.index {
                         
@@ -621,7 +634,7 @@ async fn main() {
                             use sha2::Digest; 
                             let mut already_sequenced = std::collections::HashSet::new();
 
-                            // 💡 LECTURE DU VRAI COMPTEUR GLOBAL
+                            // LECTURE DU VRAI COMPTEUR GLOBAL
                             let mut global_l2_index = 0;
                             if let Ok(data) = std::fs::read_to_string(&l2_db_seq) {
                                 if let Ok(l2_chain) = serde_json::from_str::<Vec<wattcoin_core::block::MicroBlock>>(&data) {
@@ -775,7 +788,7 @@ async fn main() {
 					let mined_hashes: Vec<_> = candidate_block.transactions.iter().map(|tx| tx.hash_data()).collect();
 					
 					mp.retain(|tx| {
-						// On compare les HASHES uniques, plus la clé publique !
+						// On compare les HASHES uniques
 						let not_in_block = !mined_hashes.contains(&tx.hash_data());
 						
 						let is_valid_share = match &tx.tx_type {
@@ -784,6 +797,11 @@ async fn main() {
 						};
 						not_in_block && is_valid_share
 					});
+					
+					// On pense à vider le mempool
+					miner_dex_pool.lock().unwrap().clear();
+					println!("🧹 [DEX] Bloc forgé : La session FBA est clôturée, Dark Pool vidé.");
+					
                 } // Le verrou `chain` est enfin relâché proprement ici !
             }
         });
