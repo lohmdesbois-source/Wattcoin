@@ -231,6 +231,24 @@ pub fn start_peer_connection(
 
 						// On relaie la bonne nouvelle au reste du réseau !
 						if let Some(last_block) = blocks.last() {
+							
+							// --- NOUVEL AFFICHAGE VISUEL POUR LE RELAIS ---
+							let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+							let tx_count = last_block.transactions.len();
+							let tx_detail = if tx_count == 1 { 
+								"1 Coinbase".to_string() 
+							} else { 
+								format!("1 Coinbase + {} Publique/Swap", tx_count - 1) 
+							};
+
+							println!("\n====================================================================");
+							println!("🔄 [SYNC] BLOC {} RATTRAPÉ ET REDIFFUSÉ !", last_block.header.index);
+							println!("🕒 Synchronisé le : {}", now);
+							println!("🔗 Hash           : {}", last_block.header.hash);
+							println!("📝 Contenu        : {} transactions incluses ({})", tx_count, tx_detail);
+							println!("====================================================================");
+							// ----------------------------------------------
+
 							let env = P2PMessage::NewBlock { 
 								block: last_block.clone(), 
 								sender_port: my_port.clone() 
