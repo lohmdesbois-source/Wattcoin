@@ -48,9 +48,10 @@ Une taxe inaltérable de 1 % sur tous les frais du réseau (L1 et L2) alimente u
 
 ### Compilation
 
-Pour le Nœud Core :
+Pour le Nœud Core et le Wallet :
 ```bash
 git clone [https://github.com/lohmdesbois-source/wattcoin.git](https://github.com/lohmdesbois-source/wattcoin.git)
+Pour le Nœud Core :
 cd wattcoin/core-node
 cargo build --release
 # Compilation croisée pour Windows :
