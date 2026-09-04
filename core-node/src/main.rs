@@ -738,7 +738,7 @@ async fn main() {
                                 println!("🔗 Parent L1     : {}", micro_block.l1_parent_hash);
                                 println!("🕒 Date et Heure : {}", chrono::Local::now().format("%d-%m-%Y %H:%M:%S"));
                                 println!("📝 Transactions  : {} incluses (Instantanées)", true_tx_count);
-                                println!("💰 Frais perçus  : {} Flames", expected_fees);
+                                println!("💰 Frais perçus  : {} Flames", sequencer_reward);
                                 println!("====================================================================\n");
 
                                 // MISE À JOUR SÉCURISÉE DE L'ÉTAT LOCAL DU SÉQUENCEUR
