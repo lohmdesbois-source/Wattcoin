@@ -1,6 +1,6 @@
 [package]
 name = "wattcoin-l2-sdk"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -13,5 +13,6 @@ sha2 = "0.10"
 rand = "0.8"
 dotenv = "0.15" 
 warp = "0.3" # 💡 LE SERVEUR WEB DU L2
+bincode = "1.3"
 
 wattcoin_core = { path = "../core-node" }

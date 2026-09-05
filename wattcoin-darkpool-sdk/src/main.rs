@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use wattcoin_core::transaction::{Transaction, TransactionType};
-use wattcoin_core::wots::WotsKeyPair;
+use wattcoin_core::lattice::LatticeKeyPair;
 
 use wattcoin_darkpool_sdk::api::start_api_server;
-use wattcoin_darkpool_sdk::state::DarkpoolState; // 💡 On importe le nouveau state
+use wattcoin_darkpool_sdk::state::DarkpoolState;
 
 #[tokio::main]
 async fn main() {
@@ -34,10 +34,10 @@ async fn main() {
     });
 
     let hot_wallet = if let Ok(data) = fs::read_to_string("sequencer_keys.json") {
-        serde_json::from_str::<WotsKeyPair>(&data).unwrap()
+        serde_json::from_str::<LatticeKeyPair>(&data).unwrap()
     } else {
         println!("🔧 Génération du Hot Wallet...");
-        let keys = WotsKeyPair::generate();
+        let keys = LatticeKeyPair::generate();
         fs::write("sequencer_keys.json", serde_json::to_string(&keys).unwrap()).unwrap();
         keys
     };
@@ -78,6 +78,11 @@ async fn main() {
             
             (root, idx, count, f)
         };
+		
+		// On passe notre tour s'il n'y a rien à faire !
+        if tx_count == 0 {
+            continue; 
+        }
 
         println!("=====================================================");
         println!("🥷  NOUVEAU MICRO-BLOC DARKPOOL FORGÉ ! (Index: #{})", block_idx);
@@ -89,30 +94,32 @@ async fn main() {
         println!("⚓  Ancrage ZKP sur le L1 Wattcoin en cours...");
         println!("=====================================================\n");
 
-        // C. Signature (Le reste de ton code ne change pas)
-        let mut hasher = Sha512::new();
-        hasher.update(state_root.as_bytes());
-        let mut hash_array = [0u8; 64];
-        hash_array.copy_from_slice(&hasher.finalize());
-        let wots_sig = WotsKeyPair::sign(&hot_wallet.secret_key, &hot_wallet.public_seed, &hash_array);
+        // C. Signature Lattice
+		let mut hasher = Sha512::new();
+		hasher.update(state_root.as_bytes());
+		let mut hash_array = [0u8; 64];
+		hash_array.copy_from_slice(&hasher.finalize());
+		let lattice_sig = LatticeKeyPair::sign(&hot_wallet.secret_key, &hash_array); 
 
-        let anchor_tx = Transaction {
-            tx_type: TransactionType::L2Anchor {
-                l2_name: l2_name.clone(),
-                state_root: state_root.clone(),
-                sequencer_signature: serde_json::to_string(&wots_sig).unwrap(),
-            },
-            inputs: vec![],
-            outputs: vec![],
-            fee: 1000,
-            wots_signature: None,
-            public_key: pubkey.clone(),
-        };
+		let anchor_tx = Transaction {
+			tx_type: TransactionType::L2Anchor {
+				l2_name: l2_name.clone(),
+				state_root: state_root.clone(),
+				sequencer_signature: serde_json::to_string(&lattice_sig).unwrap(), 
+				withdrawals: vec![], 
+			},
+			inputs: vec![],
+			outputs: vec![],
+			fee: 1000,
+			lattice_signature: None, 
+			public_key: pubkey.clone(),
+		};
 
-        let tx_json = serde_json::to_string(&anchor_tx).unwrap();
-        let _ = client.post(&format!("{}/send_tx", l1_node_url))
-            .header("Content-Type", "application/json")
-            .body(tx_json)
-            .send().await;
+        // On envoie le bloc d'ancrage en BINAIRE PUR (Bincode) !
+		let tx_bytes = bincode::serialize(&anchor_tx).expect("Erreur de sérialisation binaire");
+		let _ = client.post(&format!("{}/send_tx", l1_node_url))
+			.header("Content-Type", "application/octet-stream")
+			.body(tx_bytes)
+			.send().await;
     }
 }

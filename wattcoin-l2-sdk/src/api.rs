@@ -1,7 +1,7 @@
 use warp::Filter;
 use crate::state::SharedL2State;
 use crate::transaction::L2Transaction;
-use wattcoin_core::wots::{WotsKeyPair, WotsSignature};
+use wattcoin_core::lattice::{LatticeKeyPair, LatticeSignature};
 
 pub async fn start_api_server(port: u16, state: SharedL2State) {
     let state_filter = warp::any().map(move || state.clone());
@@ -38,10 +38,10 @@ pub async fn start_api_server(port: u16, state: SharedL2State) {
         .and(state_filter.clone())
         .map(|tx: L2Transaction, state: SharedL2State| {
             
-            // 1. Vérification Cryptographique WOTS+
+            // 1. Vérification Cryptographique Lattice
             let hash = tx.hash_data();
-            if let Ok(sig) = serde_json::from_str::<WotsSignature>(&tx.signature) {
-                if !WotsKeyPair::verify(&tx.sender_pubkey, &sig, &hash) {
+            if let Ok(sig) = serde_json::from_str::<LatticeSignature>(&tx.signature) {
+                if !LatticeKeyPair::verify(&tx.sender_pubkey, &sig, &hash) {
                     return warp::reply::with_status(
                         warp::reply::json(&serde_json::json!({"error": "Signature Invalide"})),
                         warp::http::StatusCode::BAD_REQUEST,

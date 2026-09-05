@@ -86,8 +86,8 @@ pub async fn sync_wns_directory() {
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
 // ===================================================================
-const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
-//const LOCAL_DEV_MODE: bool = true; 
+//const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
+const LOCAL_DEV_MODE: bool = true; 
 // ===================================================================
 
 #[derive(Debug)]

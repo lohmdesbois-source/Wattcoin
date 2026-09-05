@@ -5,7 +5,7 @@ use std::fs; // AJOUT POUR LE FICHIER
 use sha2::{Sha512, Digest};
 use crate::transaction::L2Transaction;
 
-#[derive(Serialize, Deserialize, Clone, Debug)] // PERMET LA TRADUCTION EN JSON
+#[derive(Serialize, Deserialize, Clone, Debug)] 
 pub struct L2State {
     pub balances: HashMap<String, u64>,
     pub mempool: Vec<L2Transaction>,
@@ -55,7 +55,7 @@ impl L2State {
 
     /// Traite le Mempool, incrémente l'index, et paie le Séquenceur
     pub fn process_mempool(&mut self, sequencer_address: &str) -> (u64, usize, u64) {
-        self.block_index += 1; // 💡 Le bloc avance !
+        self.block_index += 1; // Le bloc avance !
         
         let txs = std::mem::take(&mut self.mempool);
         let tx_count = txs.len();
@@ -66,11 +66,7 @@ impl L2State {
             let total_cost = tx.amount + tx.fee;
 
             if sender_balance >= total_cost {
-                self.balances.remove(&tx.sender_pubkey);
-                let remaining_balance = sender_balance - total_cost;
-                if remaining_balance > 0 {
-                    self.balances.insert(tx.next_pubkey.clone(), remaining_balance);
-                }
+                self.balances.insert(tx.sender_pubkey.clone(), sender_balance - total_cost);
                 
                 let receiver_balance = *self.balances.get(&tx.receiver_address).unwrap_or(&0);
                 self.balances.insert(tx.receiver_address.clone(), receiver_balance + tx.amount);
@@ -78,7 +74,7 @@ impl L2State {
             }
         }
 
-        // 👑 Le Séquenceur encaisse son salaire (Frais + Coinbase) !
+        // Le Séquenceur encaisse son salaire (Frais + Coinbase) !
         let seq_balance = *self.balances.get(sequencer_address).unwrap_or(&0);
         self.balances.insert(
             sequencer_address.to_string(), 
