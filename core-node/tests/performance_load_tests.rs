@@ -3,18 +3,19 @@
 // Lancer avec : cargo test --release --test performance_load_tests -- --nocapture
 
 use wattcoin_core::transaction::{Transaction, TransactionType, TransactionInput, TransactionOutput};
-use wattcoin_core::wots::{WotsKeyPair, WotsSignature};
 use wattcoin_core::lattice::{LWECommitment, LATTICE_DIM};
-use wattcoin_core::merkle_ring::MpcRingSignature;
 use wattcoin_core::blockchain::Blockchain;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Helper : Crée une transaction cryptographiquement parfaite pour les tests
+fn dummy_l2_keys() -> Vec<(Vec<[u8; 32]>, Vec<u8>)> {
+    vec![(vec![[0u8; 32]; 34], vec![0u8; 32]); 128]
+}
+
 fn build_heavy_valid_tx() -> Transaction {
-    let keypair = WotsKeyPair::generate();
-    let mut decoys = vec![keypair.public_key.clone()];
-    for _ in 1..64 { decoys.push(WotsKeyPair::generate().public_key); }
+    // 💡 Nouveau WOTS+ (Module externe)
+    let seed = [0u8; 32];
+    let (sk, pk) = wots::Wots::generate_keypair(&seed, 0);
 
     let bf_in = vec![1u64; LATTICE_DIM];
     let bf_out = vec![1u64; LATTICE_DIM];
@@ -23,13 +24,7 @@ fn build_heavy_valid_tx() -> Transaction {
     let out_commit = LWECommitment::commit(90, &bf_out);
 
     let input = TransactionInput {
-        mpc_ring: MpcRingSignature {
-            key_image: "test_ki".to_string(),
-            ring_root: "root".to_string(),
-            ring_decoys: decoys.clone(),
-            real_wots_sig: WotsSignature { chains: vec![] },
-            merkle_proof: vec![],
-        },
+        // 💡 Suppression de mpc_ring
         commitment: in_commit,
         source_height: 0,
     };
@@ -44,17 +39,15 @@ fn build_heavy_valid_tx() -> Transaction {
     let mut tx = Transaction {
         tx_type: TransactionType::Standard,
         inputs: vec![input], outputs: vec![output], fee: 10,
-        public_key: keypair.public_key.clone(),
+        public_key: hex::encode(&pk),
         wots_signature: None,
     };
 
-    let tx_hash = tx.hash_data();
-    tx.inputs[0].mpc_ring = MpcRingSignature::sign(
-        &keypair.secret_key, &tx_hash, &decoys, 0, "capsule", b"secret"
-    );
-    tx.wots_signature = Some(WotsKeyPair::sign(
-        &keypair.secret_key, &keypair.public_seed, &tx_hash
-    ));
+    let tx_hash_64 = tx.hash_data();
+    let mut tx_hash_32 = [0u8; 32];
+    tx_hash_32.copy_from_slice(&tx_hash_64[0..32]);
+
+    tx.wots_signature = Some(wots::Wots::sign(&sk, 0, &tx_hash_32, &pk));
 
     tx
 }
@@ -65,11 +58,9 @@ fn test_crypto_validation_tps() {
     let tx = build_heavy_valid_tx();
     assert!(tx.is_valid(), "La transaction de base doit être valide.");
 
-    let iterations = 50; // On vérifie la même TX 50 fois pour moyenner le temps
-    
+    let iterations = 50; 
     let start = Instant::now();
     for _ in 0..iterations {
-        // Cela lance la vérification WOTS+, Lattice LWE (1024 dims) et Ring Signature (64 clés)
         let _is_valid = tx.is_valid(); 
     }
     let duration = start.elapsed();
@@ -82,7 +73,6 @@ fn test_crypto_validation_tps() {
     println!("📈 Capacité théorique du CPU local (1 Thread) : {:.0} TPS L1", tps);
     println!("--------------------------------------\n");
 
-    // On s'assure que le code ne tourne pas au ralenti extrême
     assert!(tps > 2.0, "🚨 ALERTE : Le nœud est trop lent (< 2 TPS). Optimisation requise !");
 }
 
@@ -103,7 +93,6 @@ async fn test_mempool_concurrent_writes() {
 
     let start = Instant::now();
 
-    // On lance 10 threads (tâches asynchrones) qui spamment le mempool simultanément
     for i in 0..num_tasks {
         let pool_clone = Arc::clone(&mempool);
         let tx_clone = tx.clone();
@@ -112,8 +101,6 @@ async fn test_mempool_concurrent_writes() {
             for j in 0..txs_per_task {
                 let mut my_tx = tx_clone.clone();
                 my_tx.public_key = format!("SPAM_TX_{}_{}", i, j);
-                
-                // Embuscade sur le Mutex
                 let mut p = pool_clone.lock().unwrap();
                 p.push(my_tx);
             }
@@ -121,11 +108,7 @@ async fn test_mempool_concurrent_writes() {
         handles.push(handle);
     }
 
-    // On attend que toutes les attaques simultanées soient terminées
-    for handle in handles {
-        handle.await.unwrap();
-    }
-    
+    for handle in handles { handle.await.unwrap(); }
     let duration = start.elapsed();
     let final_len = mempool.lock().unwrap().len();
 
@@ -139,9 +122,9 @@ async fn test_mempool_concurrent_writes() {
 #[test]
 fn test_block_preparation_speed() {
     println!("\n🚀 --- DÉMARRAGE DU BENCHMARK ASSEMBLAGE DE BLOC ---");
-    let mut chain = Blockchain::new();
+    let _ = std::fs::remove_dir_all(".test_db_perf");
+    let mut chain = Blockchain::new(".test_db_perf").unwrap();
     
-    // On génère 500 fausses transactions (on ne fait pas la crypto pour tester juste la logique de tri)
     let mut massive_mempool = Vec::new();
     for i in 0..500 {
         let mut tx = Transaction {
@@ -149,22 +132,17 @@ fn test_block_preparation_speed() {
             inputs: vec![], outputs: vec![], fee: 1000,
             public_key: format!("TX_{}", i), wots_signature: None,
         };
-        // On by-pass la validation lourde juste pour tester la tuyauterie de 'prepare_block_template'
         if i == 0 { tx.tx_type = TransactionType::HTLCRefund { hash: "missing_hash".to_string() }; } 
         massive_mempool.push(tx);
     }
 
     let start = Instant::now();
-    
-    // 💡 Astuce : On passe `None` pour le L2 DB pour isoler le benchmark du L1
-    let (block, _, _) = chain.prepare_block_template(massive_mempool, "miner_bench", None);
-    
+    let (block, _, _) = chain.prepare_block_template(massive_mempool, "miner_bench", dummy_l2_keys());
     let duration = start.elapsed();
     
     println!("⏱️ Temps d'assemblage d'un bloc avec 500 TXs : {:?}", duration);
     println!("📦 Transactions retenues dans le bloc : {}", block.transactions.len());
     println!("--------------------------------------\n");
 
-    // L'assemblage ne devrait prendre que quelques millisecondes maximum
     assert!(duration.as_millis() < 500, "🚨 ALERTE : L'assemblage du bloc est trop lent ! (> 500ms)");
 }

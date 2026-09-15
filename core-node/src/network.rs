@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
+use sha2::Digest;
 use crate::block::Block;
 use crate::blockchain::Blockchain;
 use crate::transaction::{Transaction, TransactionType};
@@ -48,7 +49,7 @@ async fn send_message_to_channel(sender: &mpsc::Sender<String>, message: P2PMess
     let _ = sender.send(json_str).await;
 }
 
-pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers, l2_db_file: String) {
+pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers) {
     let address = format!("{}:{}", host_ip, port);
     let listener = TcpListener::bind(&address).await.unwrap();
     println!("📡 Serveur P2P (Tunnels Persistants) à l'écoute sur TCP/{}...", port);
@@ -65,7 +66,7 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
         start_peer_connection(
             socket, peer_ip, my_port.clone(), 
             Arc::clone(&blockchain), Arc::clone(&mempool), Arc::clone(&dex_pool), 
-            Arc::clone(&known_peers), Arc::clone(&active_peers), l2_db_file.clone()
+            Arc::clone(&known_peers), Arc::clone(&active_peers)
         );
     }
 }
@@ -73,7 +74,7 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
 pub fn start_peer_connection(
     socket: TcpStream, peer_ip: String, my_port: String,
     blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool,
-    known_peers: crate::SharedPeers, active_peers: ActivePeers, l2_db_file: String
+    known_peers: crate::SharedPeers, active_peers: ActivePeers
 ) {
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
@@ -96,7 +97,7 @@ pub fn start_peer_connection(
         // Le "Hello" immédiat ! Dès qu'on se connecte, on annonce notre hauteur.
         let (my_height, my_genesis) = {
             let chain = blockchain.lock().unwrap();
-            (chain.chain.len() as u64, chain.chain[0].header.hash.clone())
+            (chain.current_height + 1, chain.get_block_by_height(0).unwrap().header.hash.clone())
         };
         send_message_to_channel(&tx, P2PMessage::Handshake { 
             genesis_hash: my_genesis, 
@@ -120,12 +121,12 @@ pub fn start_peer_connection(
 					
                     let (is_behind, i_am_ahead, my_height, genesis_valid) = {
                         let chain = blockchain.lock().unwrap(); 
-                        let my_h = chain.chain.len() as u64;
+                        let my_h = chain.current_height + 1;
                         (
                             current_height > my_h, 
                             my_h > current_height, 
                             my_h, 
-                            genesis_hash == chain.chain[0].header.hash
+                            genesis_hash == chain.get_block_by_height(0).unwrap().header.hash
                         )
                     }; 
 
@@ -136,20 +137,20 @@ pub fn start_peer_connection(
                         let locator_hashes = {
                             let chain = blockchain.lock().unwrap(); 
                             let mut locators = Vec::new();
-                            let len = chain.chain.len();
+                            let len = (chain.current_height + 1) as usize;
                             
                             if len > 0 {
-                                locators.push(chain.chain[len - 1].header.hash.clone());
-                                if len > 1 { locators.push(chain.chain[len - 2].header.hash.clone()); }
+                                locators.push(chain.get_block_by_height((len - 1) as u64).unwrap().header.hash.clone());
+                                if len > 1 { locators.push(chain.get_block_by_height((len - 2) as u64).unwrap().header.hash.clone()); }
                                 
                                 let mut idx = len.saturating_sub(2).saturating_sub(5);
                                 while idx > 0 && locators.len() < 10 {
-                                    locators.push(chain.chain[idx].header.hash.clone());
+                                    locators.push(chain.get_block_by_height(idx as u64).unwrap().header.hash.clone());
                                     idx = idx.saturating_sub(5);
                                 }
                                 // Le parachute final : on s'assure que le Genesis est toujours là
-                                if locators.last() != Some(&chain.chain[0].header.hash) {
-                                    locators.push(chain.chain[0].header.hash.clone()); 
+                                if locators.last() != Some(&chain.get_block_by_height(0).unwrap().header.hash) {
+                                    locators.push(chain.get_block_by_height(0).unwrap().header.hash.clone()); 
                                 }
                             }
                             locators
@@ -168,15 +169,24 @@ pub fn start_peer_connection(
                         
                         // RECHERCHE DYNAMIQUE DE L'ANCÊTRE
                         for locator in locator_hashes {
-                            if let Some(pos) = chain.chain.iter().position(|b| b.header.hash == locator) {
-                                found_idx = pos;
-                                break;
+                            let mut found = false;
+                            for i in (0..=chain.current_height).rev() {
+                                if chain.get_block_by_height(i).unwrap().header.hash == locator {
+                                    found_idx = i as usize;
+                                    found = true;
+                                    break;
+                                }
                             }
+                            if found { break; }
                         }
                         
                         // On envoie uniquement les blocs APRÈS l'ancêtre commun
-                        if found_idx + 1 < chain.chain.len() {
-                            Some(chain.chain[(found_idx + 1)..].to_vec())
+                        if (found_idx as u64) < chain.current_height {
+                            let mut blocks = Vec::new();
+                            for i in (found_idx as u64 + 1)..=chain.current_height {
+                                blocks.push(chain.get_block_by_height(i).unwrap());
+                            }
+                            Some(blocks)
                         } else {
                             None
                         }
@@ -196,7 +206,7 @@ pub fn start_peer_connection(
 					
 					let incoming_last = blocks.last().unwrap();
 					let mut chain = blockchain.lock().unwrap(); 
-					let current_height = chain.chain.len() as u64;
+					let current_height = chain.current_height + 1;
 
 					// ====================================================================
 					// BOUCLIER ANTI-SPAM & ANTI-FAUX POSITIF MESS
@@ -204,10 +214,8 @@ pub fn start_peer_connection(
 					// c'est un lot en double. On le détruit silencieusement.
 					// ====================================================================
 					if incoming_last.header.index < current_height {
-						let our_hash = &chain.chain[incoming_last.header.index as usize].header.hash;
+						let our_hash = &chain.get_block_by_height(incoming_last.header.index).unwrap().header.hash;
 						if our_hash == &incoming_last.header.hash {
-							// Optionnel : Tu peux décommenter la ligne dessous pour voir le bouclier agir
-							// println!("🛡️ [SYNC] Lot doublon intercepté et détruit (Index {}).", incoming_last.header.index);
 							continue;
 						}
 					}
@@ -215,9 +223,9 @@ pub fn start_peer_connection(
 					println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, incoming_last.header.index);
 					
 					if chain.resolve_partial_fork(blocks.clone()) { 
-						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.chain.len());
+						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
 						
-						let cutoff_time = if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 };
+						let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
 
 						let mut mp = mempool.lock().unwrap();
 						mp.retain(|tx| { 
@@ -307,11 +315,11 @@ pub fn start_peer_connection(
                         let bc_clone_blocking = Arc::clone(&bc_clone); 
                         let validation_result = tokio::task::spawn_blocking(move || {
 							let mut chain = bc_clone_blocking.lock().unwrap();
-							let current_height = chain.chain.len() as u64;
+							let current_height = chain.current_height + 1;
 							
 							// Anti-doublon ultra-rapide avant la grosse validation
 							if block_clone.header.index < current_height {
-								let our_hash = &chain.chain[block_clone.header.index as usize].header.hash;
+								let our_hash = &chain.get_block_by_height(block_clone.header.index).unwrap().header.hash;
 								if our_hash == &block_clone.header.hash {
 									return Ok(false); // 👈 FAUX : Bloc déjà connu, on arrête les frais.
 								}
@@ -320,20 +328,20 @@ pub fn start_peer_connection(
 							if let Err(_) = chain.validate_and_add_external_block(block_clone) {
                                 // Préparation des locators pour la synchro en cas de rejet
                                 let mut locators = Vec::new();
-                                let len = chain.chain.len();
+                                let len = (chain.current_height + 1) as usize;
                                 if len > 0 {
-                                    locators.push(chain.chain[len - 1].header.hash.clone());
-                                    if len > 1 { locators.push(chain.chain[len - 2].header.hash.clone()); }
+                                    locators.push(chain.get_block_by_height((len - 1) as u64).unwrap().header.hash.clone());
+                                    if len > 1 { locators.push(chain.get_block_by_height((len - 2) as u64).unwrap().header.hash.clone()); }
                                     let mut idx = len.saturating_sub(2).saturating_sub(5);
                                     while idx > 0 && locators.len() < 10 {
-                                        locators.push(chain.chain[idx].header.hash.clone());
+                                        locators.push(chain.get_block_by_height(idx as u64).unwrap().header.hash.clone());
                                         idx = idx.saturating_sub(5);
                                     }
-                                    if locators.last() != Some(&chain.chain[0].header.hash) {
-                                        locators.push(chain.chain[0].header.hash.clone()); 
+                                    if locators.last() != Some(&chain.get_block_by_height(0).unwrap().header.hash) {
+                                        locators.push(chain.get_block_by_height(0).unwrap().header.hash.clone()); 
                                     }
                                 }
-                                Err((chain.chain[0].header.hash.clone(), len as u64, locators))
+                                Err((chain.get_block_by_height(0).unwrap().header.hash.clone(), len as u64, locators))
                             } else {
 								Ok(true) // VRAI : C'est un vrai nouveau bloc validé !
 							}
@@ -343,8 +351,6 @@ pub fn start_peer_connection(
                         match validation_result {
                             Err((_, my_height, locator_hashes)) => {
                                 // SI LE BLOC EST INVALIDE, ON RELÂCHE LE KILL SWITCH POUR LE MINEUR !
-                                // ASTUCE : my_height contient DÉJÀ la longueur de la chaîne (renvoyée par le closure) !
-                                // Zéro latence, pas besoin de refaire un lock() sur bc_clone.
                                 crate::network::HIGHEST_KNOWN_BLOCK.store(my_height.saturating_sub(1), Ordering::Relaxed);
 
                                 send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port_clone.clone() }).await;
@@ -370,7 +376,7 @@ pub fn start_peer_connection(
                                 // LA RÈGLE D'OR : On récupère l'heure de l'avant-dernier bloc
                                 let cutoff_time = {
                                     let chain = bc_clone.lock().unwrap(); 
-                                    if chain.chain.len() >= 2 { chain.chain[chain.chain.len() - 2].header.timestamp } else { 0 }
+                                    if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 }
                                 };
 
                                 let mined_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash_data()).collect();
@@ -443,8 +449,8 @@ pub fn start_peer_connection(
 						
 						let (target, current_height, previous_hash, seed) = {
 							let chain = blockchain.lock().unwrap();
-							let height = chain.chain.len() as u64;
-							let prev_hash = if height > 0 { chain.chain.last().unwrap().header.hash.clone() } else { String::new() };
+							let height = chain.current_height + 1;
+							let prev_hash = if height > 0 { chain.get_last_block().header.hash.clone() } else { String::new() };
 							(chain.target.clone(), height, prev_hash, chain.get_epoch_seed(height))
 						};
 
@@ -552,12 +558,12 @@ pub fn start_peer_connection(
                     for t in txs {
                         let mut spent = false;
                         if t.tx_type != TransactionType::Coinbase {
-                            for input in &t.inputs {
-                                if chain.spent_key_images.contains(&input.mpc_ring.key_image) {
-                                    spent = true;
-                                    break;
-                                }
-                            }
+                            if let Some(sig) = &t.wots_signature {
+								let ki = hex::encode(&sig.public_key);
+								if chain.spent_key_images.contains(&ki) {
+									spent = true;
+								}
+							}
                         }
                         if !local_mp.iter().any(|x| x.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) && !spent {
                             local_mp.push(t);
@@ -580,7 +586,6 @@ pub fn start_peer_connection(
                     let mp_clone = Arc::clone(&mempool);
                     let ap_clone = Arc::clone(&active_peers);
                     let actual_peer_id_clone = actual_peer_id.clone();
-                    let l2_db_file_clone = l2_db_file.clone();
 
                     tokio::spawn(async move {
                         let mut parent_l1_block = None;
@@ -590,7 +595,14 @@ pub fn start_peer_connection(
                         for _ in 0..120 {
                             {
                                 let chain = bc_clone.lock().unwrap();
-                                parent_l1_block = chain.chain.iter().rev().take(10).find(|b| b.header.hash == micro_block.l1_parent_hash).cloned();
+                                for i in (0..=chain.current_height).rev().take(10) {
+                                    if let Some(b) = chain.get_block_by_height(i) {
+                                        if b.header.hash == micro_block.l1_parent_hash {
+                                            parent_l1_block = Some(b);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             if parent_l1_block.is_some() { break; }
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -602,8 +614,11 @@ pub fn start_peer_connection(
                             if micro_block.merkle_proof.len() == 128 {
                                 let mut calculated_root = micro_block.merkle_proof[0].clone();
                                 for i in 1..128 {
-                                    calculated_root = crate::merkle_ring::MpcRingSignature::hash_nodes(&calculated_root, &micro_block.merkle_proof[i]);
-                                }
+									let mut hasher = sha2::Sha512::new();
+									hasher.update(calculated_root.as_bytes());
+									hasher.update(micro_block.merkle_proof[i].as_bytes());
+									calculated_root = hex::encode(hasher.finalize());
+								}
                                                 
                                 if calculated_root == current_l2_root && micro_block.merkle_proof[micro_block.key_index as usize] == micro_block.sequencer_pubkey {
                                     
@@ -614,7 +629,10 @@ pub fn start_peer_connection(
                                     let mut hash_arr = [0u8; 64];
                                     hash_arr.copy_from_slice(&hasher.finalize());
 
-									if crate::lattice::LatticeKeyPair::verify(&micro_block.sequencer_pubkey, &micro_block.sequencer_sig, &hash_arr) {
+									let mut hash_arr_32 = [0u8; 32];
+									hash_arr_32.copy_from_slice(&hash_arr[0..32]);
+
+									if wots::Wots::verify(&micro_block.sequencer_sig, &hash_arr_32) {
                                                         
                                         if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
                                             println!("❌ [L2 REJETÉ] Le séquenceur a oublié la MicroCoinbase !");
@@ -634,12 +652,13 @@ pub fn start_peer_connection(
                                         {
                                             let chain_lock = bc_clone.lock().unwrap();
                                             for tx in micro_block.transactions.iter().skip(1) {
-                                                for input in &tx.inputs {
-                                                    if chain_lock.spent_key_images.contains(&input.mpc_ring.key_image) {
-                                                        is_duplicate = true;
-                                                        break;
-                                                    }
-                                                }
+                                                if let Some(sig) = &tx.wots_signature {
+													let ki = hex::encode(&sig.public_key);
+													if chain_lock.spent_key_images.contains(&ki) {
+														is_duplicate = true;
+														break;
+													}
+												}
                                                 if is_duplicate { break; }
                                             }
                                         }
@@ -674,17 +693,15 @@ pub fn start_peer_connection(
                                             let chain_lock = bc_clone.lock().unwrap(); 
                                             
                                             for tx in micro_block.transactions.iter().skip(1) {
-                                                let mut double_spend = false;
-                                                for input in &tx.inputs {
-                                                    let ki = &input.mpc_ring.key_image;
-                                                    if chain_lock.spent_key_images.contains(ki) || temp_spent.contains(ki) {
-                                                        double_spend = true;
-                                                        break;
-                                                    }
-                                                    temp_spent.insert(ki.clone());
-                                                }
-                                                if double_spend { all_valid = false; break; }
-                                            }
+												if let Some(sig) = &tx.wots_signature {
+													let ki = hex::encode(&sig.public_key);
+													if chain_lock.spent_key_images.contains(&ki) || temp_spent.contains(&ki) {
+														all_valid = false; // 👈 Déclare le bloc invalide
+														break;             // 👈 Sort de la boucle 'for' immédiatement
+													}
+													temp_spent.insert(ki);
+												}
+											}
                                         }
 
                                         if !all_valid {
@@ -699,12 +716,12 @@ pub fn start_peer_connection(
                                             let mut chain = bc_clone.lock().unwrap();
                                             for tx in &micro_block.transactions {
                                                 if tx.tx_type != TransactionType::MicroCoinbase {
-                                                    for input in &tx.inputs {
-                                                        chain.spent_key_images.insert(input.mpc_ring.key_image.clone());
-                                                    }
+                                                    if let Some(sig) = &tx.wots_signature {
+														chain.spent_key_images.insert(hex::encode(&sig.public_key));
+													}
                                                 }
                                             }
-                                            crate::blockchain::Blockchain::save_microblock_to_disk(&l2_db_file_clone, &micro_block);
+                                            let _ = chain.push_microblock(&micro_block);
                                         }
 
                                         // 3. NETTOYAGE DU MEMPOOL

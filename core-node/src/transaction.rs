@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 use serde::{Serialize, Deserialize};
 use sha2::{Sha512, Digest};
-use crate::lattice::{LWECommitment, LatticeSignature};
-use crate::merkle_ring::MpcRingSignature;
+use crate::lattice::LWECommitment;
+use wots::WotsSignature;
+
 
 // ==================== WNS (LAYER 2) ====================
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -91,12 +92,12 @@ pub enum TransactionType {
     },
 }
 
-// L'Input Anonyme (MPC Ring Signature + Montant Masqué)
+// L'Input Anonyme Allégé (On vire la Ring Signature individuelle !)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
-    pub mpc_ring: MpcRingSignature, 
     pub commitment: LWECommitment,  
     pub source_height: u64,
+    // 💡 Optionnel mais recommandé : Ajouter la référence exacte de l'UTXO précédent (ex: tx_hash)
 }
 
 // L'Output Masqué (Capsule Kyber + Montant Masqué)
@@ -113,8 +114,8 @@ pub struct Transaction {
     pub tx_type: TransactionType,
     pub inputs: Vec<TransactionInput>,
     pub outputs: Vec<TransactionOutput>,
-    pub fee: u64,
-    pub lattice_signature: Option<LatticeSignature>, 
+    pub fee: u64, 
+    pub wots_signature: Option<WotsSignature>,
     pub public_key: String, 
 }
 
@@ -137,6 +138,7 @@ impl Transaction {
             | TransactionType::LotteryPayout { .. }
 			| TransactionType::MiningShare { .. }  
             | TransactionType::HTLCRefund { .. } 
+            | TransactionType::L2Anchor { .. } 
             ) {
             return true;
         }
@@ -148,40 +150,34 @@ impl Transaction {
             return real_hash == self.public_key; 
         }
 		
-        // =========================================================
-        // BOUCLIER ANTI-OOM BOMB (Adapté au système de Billets)
-        // =========================================================
-        // 1. Limite élargie pour accommoder la fragmentation du Wallet
         if self.inputs.len() > 256 || self.outputs.len() > 256 {
-            println!("❌ [CONSENSUS] Rejet : Trop d'inputs/outputs (Max 256). Anti-DDoS actif.");
             return false;
         }
 
-        // 2. Limite globale du payload crypté (8 Mo MAX pour TOUTE la transaction)
         let mut total_vault_size = 0;
-        for out in &self.outputs {
-            total_vault_size += out.aes_vault.len();
-        }
-        
-        // On passe à 8_388_608 (8 Mo)
-        if total_vault_size > 8_388_608 { 
-            println!("❌ [CONSENSUS] Rejet : Le payload aes_vault cumulé dépasse 8 Mo (Anti-Spam/OOM)");
-            return false;
-        }
-        // =========================================================
+        for out in &self.outputs { total_vault_size += out.aes_vault.len(); }
+        if total_vault_size > 8_388_608 { return false; }
 
-        // 1. Vérification Homomorphe des Montants (Lattice LWE)
         let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
         let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
+        // Validation Homomorphe LWE des montants
         if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { 
             return false; 
         }
 
-        let tx_hash = self.hash_data();
+        let tx_hash_64 = self.hash_data();
+        // Conversion du hash 64 octets (SHA512) en 32 octets pour la vérification WOTS+ (qui tourne en SHA256)
+        let mut tx_hash_32 = [0u8; 32];
+        tx_hash_32.copy_from_slice(&tx_hash_64[0..32]);
 
-        // 2. Vérification de l'Anonymat de l'Expéditeur (MPC)
-        for input in &self.inputs {
-            if !input.mpc_ring.verify(&tx_hash) { return false; }
+        // 2. Vérification de la signature WOTS+ (L'Expéditeur)
+        if !self.inputs.is_empty() {
+            if let Some(wots_sig) = &self.wots_signature {
+                // Le Nœud utilise la fonction native de ta librairie WOTS !
+                if !wots::Wots::verify(wots_sig, &tx_hash_32) { return false; }
+            } else {
+                return false; // Pas de signature, rejet !
+            }
         }
 		
 		true

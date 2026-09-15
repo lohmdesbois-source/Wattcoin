@@ -466,22 +466,26 @@ impl WattcoinApp {
 							}
                         }
                     } else {
-                        // VENDEUR
-                        if let Ok(secret) = crate::get_revealed_secret(swap.htlc_hash.clone()).await {
-                            println!("🔍 [WATCHTOWER] Secret de l'acheteur révélé sur le réseau : {} !", secret);
-                            let _ = tx.send(AppMessage::Info("👁️ Watchtower: Secret révélé ! Auto-Claim BTC en cours...".to_string())).await;
-                            
-                            // ON GÈRE LE RÉSULTAT DU CLAIM BTC POUR NETTOYER LE CACHE
-                            match crate::auto_claim_btc_swap(swap.htlc_hash.clone(), "".to_string()).await {
-                                Ok(_) => {
-                                    crate::remove_swap_from_cache(&swap.htlc_hash);
-                                    let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(AppMessage::Error(format!("Erreur Watchtower BTC: {}", e))).await;
-                                }
-                            }
-                        }
+                        // VENDEUR (Watchtower)
+						if let Ok(secret) = crate::get_revealed_secret(swap.htlc_hash.clone()).await {
+							println!("🔍 [WATCHTOWER] Secret de l'acheteur révélé sur le réseau : {} !", secret);
+							let _ = tx.send(AppMessage::Info("👁️ Watchtower: Secret révélé ! Auto-Claim BTC en cours...".to_string())).await;
+							
+							let swap_clone = swap.clone();
+							let master_seed = keys.master_seed_hex.clone();
+							
+							// ON GÈRE LE RÉSULTAT DU VRAI CLAIM BTC P2WSH
+							match crate::auto_claim_btc_swap(swap_clone, secret, master_seed).await {
+								Ok(msg) => {
+									crate::remove_swap_from_cache(&swap.htlc_hash);
+									let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
+									let _ = tx.send(AppMessage::Info(msg)).await;
+								}
+								Err(e) => {
+									let _ = tx.send(AppMessage::Error(format!("Erreur Watchtower BTC: {}", e))).await;
+								}
+							}
+						}
                     }
                 }
                 
@@ -549,15 +553,18 @@ impl eframe::App for WattcoinApp {
         if should_refresh {
             self.last_watchtower_tick = Some(now);
             
-            // 1. Rafraîchissement du DEX et du Watchtower (Uniquement si on y est)
-            if self.view == AppView::Dex {
-                self.refresh_dex(ctx.clone());
-            }
+            // On s'assure que le portefeuille est bien déverrouillé avant de scanner
+            if self.wallet_keys.is_some() {
+                
+                // 1. Le Watchtower tourne en tâche de fond PERMANENTE (plus de condition sur la vue !)
+                if !self.is_loading_dex {
+                    self.refresh_dex(ctx.clone());
+                }
 
-            // 2. Rafraîchissement GLOBAL de l'économie (Prix WATT, Jackpot, Blocs, Soldes)
-            // Tourne en tâche de fond en permanence tant que le portefeuille est déverrouillé !
-            if self.wallet_keys.is_some() && !self.is_refreshing {
-                self.refresh_dashboard(ctx.clone());
+                // 2. Rafraîchissement GLOBAL de l'économie (Prix WATT, Jackpot, Blocs, Soldes)
+                if !self.is_refreshing {
+                    self.refresh_dashboard(ctx.clone());
+                }
             }
         }
         
@@ -1103,6 +1110,19 @@ impl eframe::App for WattcoinApp {
                                 ui.add_space(10.0);
 
                                 if let Some(keys) = &self.wallet_keys {
+									// 1. L'Adresse Courte (Pour le minage et l'identification)
+									ui.label(egui::RichText::new("⛏ Adresse de Minage (Légère) :").color(egui::Color32::from_rgb(255, 165, 0)));
+									ui.horizontal(|ui| {
+										ui.label(egui::RichText::new(&keys.watt_short_address).monospace().color(egui::Color32::DARK_GRAY));
+										if ui.button("📋 Copier").clicked() {
+											set_clipboard_text(ui.ctx(), &keys.watt_short_address);
+										}
+									});
+									
+									ui.add_space(8.0);
+									
+									// 2. La Longue Clé Kyber (Pour les transferts chiffrés)
+									ui.label(egui::RichText::new("🔒 Clé de Réception (Chiffrement Kyber) :").color(egui::Color32::GRAY));
                                     let addr = &keys.watt_address;
                                     let display_addr = if addr.len() > 16 { format!("{}...", &addr[0..16]) } else { addr.clone() };
                                     
@@ -1409,7 +1429,7 @@ impl eframe::App for WattcoinApp {
 										let mut final_recipient = recipient.clone();
 
 										// LA MAGIE WNS OPSEC : Traduction automatique de l'alias en RAM !
-										if final_recipient.ends_with(".watt") {
+										if final_recipient.ends_with(".watt") || final_recipient.ends_with(".chain") {
 											let _ = tx.send(AppMessage::Info("🔍 Recherche locale (OpSec) dans l'annuaire...".to_string())).await;
 											match crate::resolve_wns_domain_opsec(&final_recipient).await {
 												Ok(pubkey) => {
@@ -1469,6 +1489,7 @@ impl eframe::App for WattcoinApp {
 						ui.horizontal(|ui| {
 							if ui.selectable_value(&mut self.history_tab, "L1".to_string(), "⚡ Réseau L1").clicked() {}
 							if ui.selectable_value(&mut self.history_tab, "L2".to_string(), "🌐 Réseau L2").clicked() {}
+							if ui.selectable_value(&mut self.history_tab, "BTC".to_string(), "₿ Bitcoin").clicked() {}
 						});
 						ui.separator();
 						ui.add_space(10.0);
@@ -1501,13 +1522,27 @@ impl eframe::App for WattcoinApp {
 									egui::Frame::none().fill(item_bg).inner_margin(12.0).rounding(8.0).show(ui, |ui| {
 										ui.horizontal(|ui| {
 											ui.vertical(|ui| {
-												let status_color = if item.status.contains("Disponible") { egui::Color32::GREEN } else { egui::Color32::GRAY };
+												// On met en vert tout ce qui est positif ou disponible
+												let status_color = if item.status.contains("Disponible") || item.status.contains("Reçu") || item.status.contains("Confirmé") { 
+													egui::Color32::GREEN 
+												} else { 
+													egui::Color32::GRAY 
+												};
+												
 												ui.label(egui::RichText::new(&item.status).strong().color(status_color));
 												ui.label(egui::RichText::new(&item.date).size(12.0).color(egui::Color32::DARK_GRAY));
 												ui.label(egui::RichText::new(format!("Source: {}", item.id)).size(10.0).color(egui::Color32::GRAY));
 											});
+											
 											ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-												ui.label(egui::RichText::new(format!("{:.9} {}", item.amount, item.coin)).strong().size(18.0).color(text_color));
+												// On ajoute un '+' ou un '-' et on colorise le montant !
+												let sign = if item.tx_type == "send" { "-" } else { "+" };
+												let amount_color = if item.tx_type == "send" { egui::Color32::from_rgb(255, 80, 80) } else { text_color };
+												
+												ui.label(egui::RichText::new(format!("{}{} {}", sign, item.amount, item.coin))
+													.strong()
+													.size(18.0)
+													.color(amount_color));
 											});
 										});
 									});
@@ -1664,13 +1699,13 @@ impl eframe::App for WattcoinApp {
 											if is_buyer {
 												// ACTIONS ACHETEUR
 												if ui.button("1. Verrouiller mes BTC").clicked() {
-													self.sync_message = "Envoi des BTC vers le contrat HTLC...".to_string();
+													self.sync_message = "Création du contrat HTLC Bitcoin et envoi...".to_string();
 													let tx = self.tx.clone();
-													let htlc_address = swap.htlc_hash.clone(); // Le noeud gèrera l'adresse finale via le hash
-													let amount_btc = swap.btc_amount_sats as f64 / 100_000_000.0;
+													let swap_clone = swap.clone();
+													let master_seed = keys.master_seed_hex.clone();
 													
 													tokio::spawn(async move {
-														match crate::send_btc_to_htlc(htlc_address, amount_btc, None).await {
+														match crate::send_btc_to_htlc(swap_clone, master_seed).await {
 															Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 															Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 														}
@@ -1945,7 +1980,7 @@ impl eframe::App for WattcoinApp {
 											let mut final_recipient = recipient.clone();
 
 											// MAGIE WNS OPSEC : Résolution locale pour les messages !
-											if final_recipient.ends_with(".watt") {
+											if final_recipient.ends_with(".watt") || final_recipient.ends_with(".chain") {
 												let _ = tx.send(AppMessage::Info("🔍 Recherche locale (OpSec)...".to_string())).await;
 												match crate::resolve_wns_domain_opsec(&final_recipient).await {
 													Ok(pubkey) => {
@@ -2257,9 +2292,9 @@ impl eframe::App for WattcoinApp {
 						ui.separator();
 						ui.add_space(15.0);
 
-						ui.label("Nom de domaine souhaité (doit finir par .watt) :");
+						ui.label("Nom de domaine souhaité (doit finir par .watt ou .chain) :");
 						// On capture l'action de l'utilisateur sur le champ
-						let response = ui.add(egui::TextEdit::singleline(&mut self.wns_domain_input).hint_text("ex: watty.watt"));
+						let response = ui.add(egui::TextEdit::singleline(&mut self.wns_domain_input).hint_text("ex: watty.chain"));
 
 						// Dès que le texte change, on lance une vérification
 						if response.changed() {
@@ -2269,11 +2304,13 @@ impl eframe::App for WattcoinApp {
 							// On récupère notre propre adresse pour voir si le domaine est à nous
 							let my_address = self.wallet_keys.as_ref().map(|k| k.watt_address.clone()).unwrap_or_default();
 							
+							let is_valid_watt = domain.ends_with(".watt") && domain.len() > 5;
+                            let is_valid_chain = domain.ends_with(".chain") && domain.len() > 6;
+
 							if domain.is_empty() {
 								self.wns_domain_status.clear();
-							// AJOUT DU FILTRE DE LONGUEUR (len <= 5)
-							} else if !domain.ends_with(".watt") || domain.len() <= 5 { 
-								self.wns_domain_status = "⚠ Entrez un nom avant .watt (ex: watty.watt)".to_string();
+							} else if !is_valid_watt && !is_valid_chain { 
+								self.wns_domain_status = "⚠ Entrez un nom avant .watt ou .chain (ex: watty.chain)".to_string();
 							} else {
 								self.wns_domain_status = "🔍 Vérification...".to_string();
 								
@@ -2355,9 +2392,12 @@ impl eframe::App for WattcoinApp {
 						if ui.add_sized([250.0, 40.0], egui::Button::new("🔥 Enregistrer le Domaine")).clicked() {
 							if let (Some(keys), Ok(fee_watt)) = (&self.wallet_keys, self.wns_bid_amount.parse::<f64>()) {
 								
+								let is_valid_watt = self.wns_domain_input.ends_with(".watt") && self.wns_domain_input.len() > 5;
+                                let is_valid_chain = self.wns_domain_input.ends_with(".chain") && self.wns_domain_input.len() > 6;
+
 								// AJOUT DU MÊME FILTRE ICI
-								if !self.wns_domain_input.ends_with(".watt") || self.wns_domain_input.len() <= 5 {
-									self.sync_message = "❌ Le nom de domaine est invalide (trop court).".to_string();
+								if !is_valid_watt && !is_valid_chain {
+									self.sync_message = "❌ Le nom de domaine est invalide (trop court ou extension non gérée).".to_string();
 								} else {
 									self.sync_message = "Création de la transaction WNS en cours...".to_string();
 									let tx = self.tx.clone();
@@ -2470,11 +2510,12 @@ impl eframe::App for WattcoinApp {
                         ui.horizontal(|ui| {
                             if ui.add_sized([180.0, 40.0], egui::Button::new("🐧 Script Linux (.sh)")).clicked() {
                                 if let Some(keys) = &self.wallet_keys {
-                                    match crate::save_miner_script("linux".to_string(), keys.watt_address.clone()) {
-                                        Ok(msg) => self.sync_message = format!("✅ {}", msg),
-                                        Err(e) => self.sync_message = format!("❌ {}", e),
-                                    }
-                                } else {
+									// On passe la short_address pour alléger les blocs !
+									match crate::save_miner_script("linux".to_string(), keys.watt_short_address.clone()) { 
+										Ok(msg) => self.sync_message = format!("✅ {}", msg),
+										Err(e) => self.sync_message = format!("❌ {}", e),
+									}
+								} else {
                                     self.sync_message = "❌ Portefeuille verrouillé.".to_string();
                                 }
                             }

@@ -47,16 +47,18 @@ pub async fn start_api_server(
         let mut found_price = false;
         
         // On remonte le temps depuis le bloc le plus récent
-        for block in chain_lock.chain.iter().rev() {
-            for tx in block.transactions.iter().rev() {
-                if let crate::transaction::TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
-                    LAST_PRICE_SATS.store(*clearing_price_sats, Ordering::Relaxed);
-                    println!("📈 [MARCHÉ] Prix officiel synchronisé depuis la blockchain : {} Sats", clearing_price_sats);
-                    found_price = true;
-                    break;
+        for i in (0..=chain_lock.current_height).rev() {
+            if let Some(block) = chain_lock.get_block_by_height(i) {
+                for tx in block.transactions.iter().rev() {
+                    if let crate::transaction::TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
+                        LAST_PRICE_SATS.store(*clearing_price_sats, Ordering::Relaxed);
+                        println!("📈 [MARCHÉ] Prix officiel synchronisé depuis la blockchain : {} Sats", clearing_price_sats);
+                        found_price = true;
+                        break;
+                    }
                 }
+                if found_price { break; }
             }
-            if found_price { break; }
         }
         if !found_price { println!("📈 [MARCHÉ] Aucun prix historique trouvé. En attente du premier croisement..."); }
     }
@@ -81,30 +83,35 @@ pub async fn start_api_server(
 			let mut claimed_hashes = std::collections::HashSet::new();
 
 			// 1. On détecte tous les HTLC déjà claimés ou remboursés
-			for block in &chain_lock.chain {
-				for tx in &block.transactions {
-					if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
-						let secret_bytes = hex::decode(secret).unwrap_or_default();
-						let hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
-						claimed_hashes.insert(hash);
-					}
-					if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
-						claimed_hashes.insert(hash.clone());
-					}
-				}
+			for i in 0..=chain_lock.current_height {
+                if let Some(block) = chain_lock.get_block_by_height(i) {
+                    for tx in &block.transactions {
+                        if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
+                            let secret_bytes = hex::decode(secret).unwrap_or_default();
+                            let hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
+                            claimed_hashes.insert(hash);
+                        }
+                        if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
+                            claimed_hashes.insert(hash.clone());
+                        }
+                    }
+                }
 			}
 
 			// 2. On récupère les swaps en cours (DexSettlement + HTLCLock non claimés)
-			for block in chain_lock.chain.iter().rev().take(200) {
-				for tx in &block.transactions {
-					if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
-						for swap in swaps {
-							if !claimed_hashes.contains(&swap.htlc_hash) {
-								active_swaps.push(swap.clone());
-							}
-						}
-					}
-				}
+            let start = chain_lock.current_height.saturating_sub(200);
+			for i in (start..=chain_lock.current_height).rev() {
+                if let Some(block) = chain_lock.get_block_by_height(i) {
+                    for tx in &block.transactions {
+                        if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
+                            for swap in swaps {
+                                if !claimed_hashes.contains(&swap.htlc_hash) {
+                                    active_swaps.push(swap.clone());
+                                }
+                            }
+                        }
+                    }
+                }
 			}
 
 			warp::reply::json(&active_swaps)
@@ -190,11 +197,9 @@ pub async fn start_api_server(
         .and(mempool_filter.clone())
         .and(chain_filter.clone()) 
         .and(active_peers_filter.clone()) 
-		.and(btc_htlc_set_filter.clone())
         .map(|body_bytes: warp::hyper::body::Bytes, mempool: Arc<Mutex<Vec<Transaction>>>, 
 										 chain_arc: Arc<Mutex<Blockchain>>, 
-										 active_peers: crate::network::ActivePeers,
-										 btc_htlcs: Arc<Mutex<HashSet<String>>>| {
+										 active_peers: crate::network::ActivePeers| {
             
             // DÉCODAGE BINAIRE ULTRA RAPIDE !
             let tx: Transaction = match bincode::deserialize(&body_bytes) {
@@ -204,13 +209,6 @@ pub async fn start_api_server(
                     return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST);
                 }
             };
-
-            // BOUCLIER : Bloque les spams obèses (Max 25 récompenses de minage d'un coup)
-			/*
-            if tx.inputs.len() > 25 {
-                return warp::reply::with_status(warp::reply::json(&"❌ REJETÉ : Transaction trop lourde. Regroupez vos fonds par paquets de 25 maximum."), warp::http::StatusCode::BAD_REQUEST);
-            }
-			*/
             
             // PATCH ANTI-HACKING dans api.rs : Bloque TOUTES les transactions systèmes depuis l'API
 			if matches!(tx.tx_type, crate::transaction::TransactionType::Coinbase 
@@ -249,44 +247,40 @@ pub async fn start_api_server(
             if !tx.is_valid() {
                 return warp::reply::with_status(warp::reply::json(&"❌ Preuve ZKP ou signature invalide"), warp::http::StatusCode::BAD_REQUEST);
             }
-			
-			// ===================== BLINDAGE ATOMIC SWAP =====================
-			if let TransactionType::HTLCLock { hash, .. } = &tx.tx_type {
-				let btc_side_exists = {
-					let set = btc_htlcs.lock().unwrap();
-					set.contains(hash)
-				};
-
-				if !btc_side_exists {
-					return warp::reply::with_status(
-						warp::reply::json(&"❌ HTLC BTC correspondant non trouvé. Alice doit d’abord verrouiller les BTC."),
-						warp::http::StatusCode::BAD_REQUEST
-					);
-				}
-			}
 
             if tx.tx_type != crate::transaction::TransactionType::Coinbase {
                 let chain_lock = chain_arc.lock().unwrap();
                 let pool_lock = mempool.lock().unwrap();
 
-                for input in &tx.inputs {
-                    let ki = &input.mpc_ring.key_image;
-                    if chain_lock.spent_key_images.contains(ki) { return warp::reply::with_status(warp::reply::json(&"❌ Fonds déjà dépensés"), warp::http::StatusCode::BAD_REQUEST); }
-                    if pool_lock.iter().any(|m_tx| m_tx.inputs.iter().any(|m_in| &m_in.mpc_ring.key_image == ki)) { return warp::reply::with_status(warp::reply::json(&"❌ TX déjà en attente"), warp::http::StatusCode::BAD_REQUEST); }
-                }
+                if let Some(sig) = &tx.wots_signature {
+					let ki = hex::encode(&sig.public_key); // 👈 L'empreinte WOTS+ devient le nullifier !
+					if chain_lock.spent_key_images.contains(&ki) { 
+						return warp::reply::with_status(warp::reply::json(&"❌ Fonds déjà dépensés"), warp::http::StatusCode::BAD_REQUEST); 
+					}
+					// Vérifie si la transaction est déjà en attente dans le mempool
+					if pool_lock.iter().any(|m_tx| {
+						if let Some(m_sig) = &m_tx.wots_signature {
+							hex::encode(&m_sig.public_key) == ki
+						} else { false }
+					}) { 
+						return warp::reply::with_status(warp::reply::json(&"❌ TX déjà en attente"), warp::http::StatusCode::BAD_REQUEST); 
+					}
+				}
             }
             
             if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
                 let chain_lock = chain_arc.lock().unwrap();
-                let current_height = chain_lock.chain.len() as u64;
+                let current_height = chain_lock.current_height;
                 let mut timeout_passed = false;
                 
-                for block in &chain_lock.chain {
-                    for past_tx in &block.transactions {
-                        if let crate::transaction::TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
-                            if lock_hash == hash {
-                                if current_height >= *timeout_block { timeout_passed = true; }
-                                break;
+                for i in 0..=chain_lock.current_height {
+                    if let Some(block) = chain_lock.get_block_by_height(i) {
+                        for past_tx in &block.transactions {
+                            if let crate::transaction::TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
+                                if lock_hash == hash {
+                                    if current_height >= *timeout_block { timeout_passed = true; }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -330,15 +324,17 @@ pub async fn start_api_server(
                 let chain_lock = chain_arc.lock().unwrap();
                 
                 // 1. Lecture de la chaîne L1 (en RAM)
-                for block in &chain_lock.chain {
-                    hash_to_height.insert(block.header.hash.clone(), block.header.index);
-                    for tx in &block.transactions {
-                        enriched_txs.push(serde_json::json!({
-                            "height": block.header.index,
-                            "timestamp": block.header.timestamp,
-                            "transaction": tx,
-                            "is_l2": false
-                        }));
+                for i in 0..=chain_lock.current_height {
+                    if let Some(block) = chain_lock.get_block_by_height(i) {
+                        hash_to_height.insert(block.header.hash.clone(), block.header.index);
+                        for tx in &block.transactions {
+                            enriched_txs.push(serde_json::json!({
+                                "height": block.header.index,
+                                "timestamp": block.header.timestamp,
+                                "transaction": tx,
+                                "is_l2": false
+                            }));
+                        }
                     }
                 }
             } // Le `chain_lock` est détruit exactement ici ! Le Mutex est libre.
@@ -384,18 +380,20 @@ pub async fn start_api_server(
 
             {
                 let chain_lock = chain_arc.lock().unwrap();
-                for block in &chain_lock.chain {
-                    hash_to_height.insert(block.header.hash.clone(), block.header.index);
-                    
-                    // On n'envoie que les NOUVEAUX blocs L1
-                    if block.header.index > last_l1 {
-                        for tx in &block.transactions {
-                            new_txs.push(serde_json::json!({
-                                "height": block.header.index,
-                                "timestamp": block.header.timestamp,
-                                "transaction": tx,
-                                "is_l2": false
-                            }));
+                for i in 0..=chain_lock.current_height {
+                    if let Some(block) = chain_lock.get_block_by_height(i) {
+                        hash_to_height.insert(block.header.hash.clone(), block.header.index);
+                        
+                        // On n'envoie que les NOUVEAUX blocs L1
+                        if block.header.index > last_l1 {
+                            for tx in &block.transactions {
+                                new_txs.push(serde_json::json!({
+                                    "height": block.header.index,
+                                    "timestamp": block.header.timestamp,
+                                    "transaction": tx,
+                                    "is_l2": false
+                                }));
+                            }
                         }
                     }
                 }
@@ -424,14 +422,6 @@ pub async fn start_api_server(
             Ok::<_, warp::Rejection>(warp::reply::json(&new_txs))
         });
         
-    let get_decoys = warp::get()
-        .and(warp::path!("get_decoys" / usize))
-        .and(chain_filter.clone())
-        .map(|count: usize, chain_arc: Arc<Mutex<Blockchain>>| {
-            let chain_lock = chain_arc.lock().unwrap();
-            warp::reply::json(&chain_lock.get_random_decoys(count))
-        });
-
     let get_pool = warp::get()
         .and(warp::path("pool"))
         .and(dex_pool_filter.clone())
@@ -498,15 +488,7 @@ pub async fn start_api_server(
 				}
 			};
 
-			let last_block = match chain_lock.chain.last() {
-				Some(b) => b,
-				None => {
-					return warp::reply::json(&serde_json::json!({
-						"error": "no_blocks",
-						"blocks": 0
-					}));
-				}
-			};
+			let last_block = chain_lock.get_last_block();
 			
 			// Lecture sécurisée du nombre de Micro-Blocs L2
             let mut l2_blocks_count = 0;
@@ -561,12 +543,11 @@ pub async fn start_api_server(
     let get_jackpot = warp::path("jackpot")
 		.and(warp::get())
 		.and(chain_filter.clone())
-		.and(l2_file_filter.clone()) 
-		.map(|chain_arc: Arc<Mutex<Blockchain>>, l2_file: String| {
+		.map(|chain_arc: Arc<Mutex<Blockchain>>| {
 			let chain_lock = chain_arc.lock().unwrap();
 			
-			// On passe le chemin du fichier L2
-			let pot = chain_lock.get_current_jackpot(Some(&l2_file)); 
+			// La blockchain L1 lit Sled en toute autonomie
+			let pot = chain_lock.get_current_jackpot(); 
 			
 			warp::reply::json(&pot.0)
 		});
@@ -589,16 +570,18 @@ pub async fn start_api_server(
 			// 1. Déterminer combien de blocs sont concernés par la période
 			let mut blocks_in_range = 0;
 			if is_all {
-				blocks_in_range = chain_lock.chain.len();
+				blocks_in_range = (chain_lock.current_height + 1) as usize;
 			} else {
-				for block in chain_lock.chain.iter().rev() {
-					if let Some(h) = hours {
-						if now - block.header.timestamp > h * 3600 { break; }
-					}
-					if let Some(d) = days {
-						if now - block.header.timestamp > d * 86400 { break; }
-					}
-					blocks_in_range += 1;
+				for i in (0..=chain_lock.current_height).rev() {
+                    if let Some(block) = chain_lock.get_block_by_height(i) {
+                        if let Some(h) = hours {
+                            if now - block.header.timestamp > h * 3600 { break; }
+                        }
+                        if let Some(d) = days {
+                            if now - block.header.timestamp > d * 86400 { break; }
+                        }
+                        blocks_in_range += 1;
+                    }
 				}
 			}
 
@@ -614,32 +597,34 @@ pub async fn start_api_server(
 			let hundred = num_bigint::BigUint::from(100u32);
 
 			// 3. Échantillonnage de la blockchain
-			for block in chain_lock.chain.iter().rev() {
-				if !is_all {
-					if let Some(h) = hours {
-						if now - block.header.timestamp > h * 3600 { break; }
-					}
-					if let Some(d) = days {
-						if now - block.header.timestamp > d * 86400 { break; }
-					}
-				}
+			for i in (0..=chain_lock.current_height).rev() {
+                if let Some(block) = chain_lock.get_block_by_height(i) {
+                    if !is_all {
+                        if let Some(h) = hours {
+                            if now - block.header.timestamp > h * 3600 { break; }
+                        }
+                        if let Some(d) = days {
+                            if now - block.header.timestamp > d * 86400 { break; }
+                        }
+                    }
 
-				// On ne prend qu'un bloc sur "step"
-				if counter % step == 0 {
-					let target_big = num_bigint::BigUint::parse_bytes(block.header.target_hex.as_bytes(), 16)
-						.unwrap_or_else(|| max_target.clone());
+                    // On ne prend qu'un bloc sur "step"
+                    if counter % step == 0 {
+                        let target_big = num_bigint::BigUint::parse_bytes(block.header.target_hex.as_bytes(), 16)
+                            .unwrap_or_else(|| max_target.clone());
 
-					let difficulty_x100 = (&initial_target * &hundred) / &target_big;
-					let diff_int = &difficulty_x100 / &hundred;
-					let diff_dec = &difficulty_x100 % &hundred;
+                        let difficulty_x100 = (&initial_target * &hundred) / &target_big;
+                        let diff_int = &difficulty_x100 / &hundred;
+                        let diff_dec = &difficulty_x100 % &hundred;
 
-					history.push(serde_json::json!({
-						"height": block.header.index,
-						"difficulty_decimal": format!("{}.{:02}", diff_int, diff_dec),
-						"timestamp": block.header.timestamp
-					}));
-				}
-				counter += 1;
+                        history.push(serde_json::json!({
+                            "height": block.header.index,
+                            "difficulty_decimal": format!("{}.{:02}", diff_int, diff_dec),
+                            "timestamp": block.header.timestamp
+                        }));
+                    }
+                    counter += 1;
+                }
 			}
 
 			history.reverse();
@@ -721,29 +706,30 @@ pub async fn start_api_server(
 			let mut lock_exists = false;
 			let mut already_claimed_or_refunded = false;
 
-			for block in &chain.chain {
-				for past_tx in &block.transactions {
-					if let TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
-						for swap in swaps {
-							if swap.htlc_hash == hash_to_find {
-								buyer_watt_address = Some(swap.buyer_watt_address.clone());
-								watt_amount = swap.watt_amount_flames;   // ← u64 flames, précision exacte
-								//println!("🔍 [NODE TRIBUNAL] Swap trouvé → hash={}, buyer_watt={}, amount_flames={}", hash_to_find, swap.buyer_watt_address, watt_amount);
-							}
-						}
-					}
-					if let TransactionType::HTLCLock { hash: lock_hash, .. } = &past_tx.tx_type {
-						if lock_hash == &hash_to_find { lock_exists = true; }
-					}
-					if let TransactionType::HTLCClaim { secret: claimed_secret } = &past_tx.tx_type {
-						let claimed_bytes = hex::decode(claimed_secret).unwrap_or_default();
-						let claimed_hash = hex::encode(sha2::Sha256::digest(&claimed_bytes));
-						if claimed_hash == hash_to_find { already_claimed_or_refunded = true; }
-					}
-					if let TransactionType::HTLCRefund { hash: refunded_hash } = &past_tx.tx_type {
-						if refunded_hash == &hash_to_find { already_claimed_or_refunded = true; }
-					}
-				}
+			for i in 0..=chain.current_height {
+                if let Some(block) = chain.get_block_by_height(i) {
+                    for past_tx in &block.transactions {
+                        if let TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
+                            for swap in swaps {
+                                if swap.htlc_hash == hash_to_find {
+                                    buyer_watt_address = Some(swap.buyer_watt_address.clone());
+                                    watt_amount = swap.watt_amount_flames;   
+                                }
+                            }
+                        }
+                        if let TransactionType::HTLCLock { hash: lock_hash, .. } = &past_tx.tx_type {
+                            if lock_hash == &hash_to_find { lock_exists = true; }
+                        }
+                        if let TransactionType::HTLCClaim { secret: claimed_secret } = &past_tx.tx_type {
+                            let claimed_bytes = hex::decode(claimed_secret).unwrap_or_default();
+                            let claimed_hash = hex::encode(sha2::Sha256::digest(&claimed_bytes));
+                            if claimed_hash == hash_to_find { already_claimed_or_refunded = true; }
+                        }
+                        if let TransactionType::HTLCRefund { hash: refunded_hash } = &past_tx.tx_type {
+                            if *refunded_hash == hash_to_find { already_claimed_or_refunded = true; }
+                        }
+                    }
+                }
 			}
 
 			if buyer_watt_address.is_none() || !lock_exists || already_claimed_or_refunded {
@@ -806,21 +792,22 @@ pub async fn start_api_server(
 			let chain = chain_arc.lock().unwrap();
 
 			// 🔒 Chaîne confirmée UNIQUEMENT
-			for block in &chain.chain {
-				for tx in &block.transactions {
-					if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
-						let secret_bytes = hex::decode(secret).unwrap_or_default();
-						let calculated = hex::encode(sha2::Sha256::digest(&secret_bytes));
-						if calculated == requested_hash {
-							//println!("✅ [NODE] Secret trouvé dans un BLOC MINÉ (match parfait) → {}", secret);
-							return warp::reply::json(&serde_json::json!({
-								"success": true,
-								"secret": secret,
-								"message": "Secret révélé (confirmé)"
-							}));
-						}
-					}
-				}
+			for i in 0..=chain.current_height {
+                if let Some(block) = chain.get_block_by_height(i) {
+                    for tx in &block.transactions {
+                        if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
+                            let secret_bytes = hex::decode(secret).unwrap_or_default();
+                            let calculated = hex::encode(sha2::Sha256::digest(&secret_bytes));
+                            if calculated == requested_hash {
+                                return warp::reply::json(&serde_json::json!({
+                                    "success": true,
+                                    "secret": secret,
+                                    "message": "Secret révélé (confirmé)"
+                                }));
+                            }
+                        }
+                    }
+                }
 			}
 
 			warp::reply::json(&serde_json::json!({
@@ -962,15 +949,17 @@ pub async fn start_api_server(
 		.map(|hash: String, chain_arc: Arc<Mutex<Blockchain>>| {
 			let chain = chain_arc.lock().unwrap();
 			let mut exists = false;
-			for block in &chain.chain {
-				for tx in &block.transactions {
-					if let TransactionType::HTLCLock { hash: lock_hash, .. } = &tx.tx_type {
-						if lock_hash == &hash {
-							exists = true;
-							break;
-						}
-					}
-				}
+			for i in 0..=chain.current_height {
+                if let Some(block) = chain.get_block_by_height(i) {
+                    for tx in &block.transactions {
+                        if let TransactionType::HTLCLock { hash: lock_hash, .. } = &tx.tx_type {
+                            if lock_hash == &hash {
+                                exists = true;
+                                break;
+                            }
+                        }
+                    }
+                }
 				if exists { break; }
 			}
 			warp::reply::json(&serde_json::json!({
@@ -1051,6 +1040,26 @@ pub async fn start_api_server(
 			}
 		});
 		
+	// HISTORIQUE BTC (Proxy)
+	let get_btc_txs_route = warp::path!("btc" / "txs")
+		.and(warp::get())
+		.and(warp::query::<std::collections::HashMap<String, String>>())
+		.and_then(|params: std::collections::HashMap<String, String>| async move {
+			let address = params.get("address").cloned().unwrap_or_default();
+			let url = format!("https://mempool.space/testnet/api/address/{}/txs", address);
+			
+			match btc_proxy("GET", &url, None).await {
+				Ok(text) => {
+					let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!([]));
+					Ok::<_, warp::Rejection>(warp::reply::json(&json))
+				},
+				Err(e) => {
+					println!("❌ [NODE BTC TXS] Erreur proxy : {}", e);
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!([])))
+				}
+			}
+		});
+		
 	// ===================================================================
     // 🌐 ROUTE INTEROPÉRABILITÉ : Statut d'une L2 Souveraine (AVEC VRF)
     // Permet à n'importe qui de vérifier si une L2 est légitime et 
@@ -1068,24 +1077,24 @@ pub async fn start_api_server(
             let mut total_anchors = 0u64;
 
             // 1. On scanne l'historique pour trouver TOUS les stakers
-            for block in chain_guard.chain.iter() {
-                for tx in &block.transactions {
-                    match &tx.tx_type {
-                        TransactionType::L2Stake { l2_name: name, sequencer_pubkey: pubkey } => {
-                            if name == &l2_name { active_sequencers.insert(pubkey.clone()); }
-                        },
-                        TransactionType::L2Unstake { l2_name: name } => {
-                            // (Note: En version simplifiée, un unstake coupe toute la L2. 
-                            // Plus tard on liera le Unstake à une clé précise).
-                            if name == &l2_name { active_sequencers.clear(); }
-                        },
-                        TransactionType::L2Anchor { l2_name: name, state_root, .. } => {
-                            if name == &l2_name && !active_sequencers.is_empty() {
-                                last_state_root = state_root.clone();
-                                total_anchors += 1;
-                            }
-                        },
-                        _ => {}
+            for i in 0..=chain_guard.current_height {
+                if let Some(block) = chain_guard.get_block_by_height(i) {
+                    for tx in &block.transactions {
+                        match &tx.tx_type {
+                            TransactionType::L2Stake { l2_name: name, sequencer_pubkey: pubkey } => {
+                                if name == &l2_name { active_sequencers.insert(pubkey.clone()); }
+                            },
+                            TransactionType::L2Unstake { l2_name: name } => {
+                                if name == &l2_name { active_sequencers.clear(); }
+                            },
+                            TransactionType::L2Anchor { l2_name: name, state_root, .. } => {
+                                if name == &l2_name && !active_sequencers.is_empty() {
+                                    last_state_root = state_root.clone();
+                                    total_anchors += 1;
+                                }
+                            },
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -1097,8 +1106,7 @@ pub async fn start_api_server(
                 let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
                 candidates.sort(); // 💡 CRITIQUE : Trie alphabétiquement pour un déterminisme total
 
-                // On prend le hash du TOUT DERNIER bloc L1 (Notre source d'entropie)
-                let last_block_hash = &chain_guard.chain.last().unwrap().header.hash;
+                let last_block_hash = &chain_guard.get_last_block().header.hash;
                 
                 // On hache (Seed + Nom de la L2)
                 use sha2::Digest;
@@ -1147,17 +1155,19 @@ pub async fn start_api_server(
             let official_bridge_address = format!("BRIDGE_L2_{}", l2_name.to_uppercase());
 
             // On scanne toute la blockchain L1
-            for block in chain_guard.chain.iter() {
-                for tx in &block.transactions {
-                    if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
-                        // On vérifie que c'est bien la bonne L2
-                        if l2_target_name.to_uppercase() == l2_name.to_uppercase() {
-                            for out in &tx.outputs {
-                                // On ne compte QUE les outputs envoyés à l'adresse morte
-                                if out.stealth_address == official_bridge_address {
-                                    // Le montant a été forcé en texte clair par le consensus L1 !
-                                    let amount: u64 = out.aes_vault.parse().unwrap_or(0);
-                                    total_peg_flames += amount;
+            for i in 0..=chain_guard.current_height {
+                if let Some(block) = chain_guard.get_block_by_height(i) {
+                    for tx in &block.transactions {
+                        if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
+                            // On vérifie que c'est bien la bonne L2
+                            if l2_target_name.to_uppercase() == l2_name.to_uppercase() {
+                                for out in &tx.outputs {
+                                    // On ne compte QUE les outputs envoyés à l'adresse morte
+                                    if out.stealth_address == official_bridge_address {
+                                        // Le montant a été forcé en texte clair par le consensus L1 !
+                                        let amount: u64 = out.aes_vault.parse().unwrap_or(0);
+                                        total_peg_flames += amount;
+                                    }
                                 }
                             }
                         }
@@ -1183,7 +1193,6 @@ pub async fn start_api_server(
 		.or(relay_onion)
         .or(get_all_txs)
 		.or(sync_blocks)
-        .or(get_decoys)
         .or(get_pool)
         .or(submit_order)
         .or(cancel_order)
@@ -1202,6 +1211,7 @@ pub async fn start_api_server(
 		.or(btc_utxos_route)
 		.or(btc_broadcast)
 		.or(get_btc_balance_route)
+		.or(get_btc_txs_route)
 		.or(get_l2_status)
 		.or(get_l2_peg)
         .with(cors);

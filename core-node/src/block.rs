@@ -1,6 +1,7 @@
+// src/block.rs
 use serde::{Serialize, Deserialize};
 use crate::transaction::{Transaction, TransactionOutput};
-use crate::lattice::LatticeSignature;
+use wots::WotsSignature;
 use num_bigint::BigUint;
 use sha2::Digest;
 
@@ -32,7 +33,7 @@ pub struct MicroBlock {
     pub transactions: Vec<Transaction>, // Les transactions instantanées
     pub sequencer_pubkey: String,       // La clé WOTS publique spécifique à ce microbloc
 	pub sequencer_reward_address: String, // Pour payer le bon séquenceur !
-    pub sequencer_sig: LatticeSignature,   // La signature Lattice de ce microbloc
+    pub sequencer_sig: WotsSignature,   // La signature Wots+ de ce microbloc
     pub merkle_proof: Vec<String>,      // La preuve que cette clé fait partie du l2_root
 }
 
@@ -74,7 +75,7 @@ impl Block {
 
         let mut transactions = Vec::new();
 
-        // 1. La vraie transaction Coinbase du Genesis (Index 0)
+        // La vraie transaction Coinbase du Genesis (Index 0)
         let coinbase_tx = Transaction {
             tx_type: crate::transaction::TransactionType::Coinbase,
             inputs: vec![],
@@ -82,29 +83,15 @@ impl Block {
                 TransactionOutput {
                     stealth_address: "GENESIS".to_string(),
                     kyber_capsule: "GENESIS_KEY".to_string(),
-                    aes_vault: "Wattcoin: L'énergie libre, anonyme et post-quantique. 09/Juillet/2026 - Le monde change aujourd'hui.".to_string(),
+                    aes_vault: "Wattcoin Nertwork: L'énergie libre, anonyme et post-quantique. 07/Septembre/2026 - Wattcoin casse les règles.".to_string(),
                     lattice_commitment: crate::lattice::LWECommitment::commit(0, &[0u64; crate::lattice::LATTICE_DIM]),
                 }
             ],
             fee: 0,
             public_key: "GENESIS".to_string(),
-            lattice_signature: None,
+			wots_signature: None,
         };
         transactions.push(coinbase_tx);
-
-        // 2. INJECTION MAINNET : 64 Transactions factices pour l'amorçage des leurres ZKP
-        for i in 0..64 {
-            let dummy_tx = Transaction {
-                tx_type: crate::transaction::TransactionType::Standard,
-                inputs: vec![], // Transaction fantôme, aucun input
-                outputs: vec![], // Aucun output
-                fee: 0,
-                // On génère 64 clés publiques uniques qui serviront de leurres initiaux
-                public_key: format!("GENESIS_DECOY_WOTS_PUBKEY_{:02}", i),
-                lattice_signature: None,
-            };
-            transactions.push(dummy_tx);
-        }
 
         let header = BlockHeader {
             index: 0,
@@ -118,10 +105,8 @@ impl Block {
         };
 
         let mut genesis_block = Block { header, transactions };
-        
-        // 3. Calcul automatique du tx_root incluant les 65 transactions
+        // Calcul automatique du tx_root incluant les 65 transactions
         genesis_block.header.tx_root = genesis_block.calculate_tx_root();
-
         genesis_block
     }
 }

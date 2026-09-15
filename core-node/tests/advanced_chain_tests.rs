@@ -6,16 +6,23 @@ use wattcoin_core::blockchain::Blockchain;
 use wattcoin_core::transaction::{Transaction, TransactionType};
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXVM};
 
+fn dummy_l2_keys() -> Vec<(Vec<[u8; 32]>, Vec<u8>)> {
+    vec![(vec![[0u8; 32]; 34], vec![0u8; 32]); 128]
+}
+
 #[test]
 fn test_robin_hood_slashing_for_fast_blocks() {
-    let mut chain = Blockchain::new();
+    let _ = std::fs::remove_dir_all(".test_db_adv_1");
+    let mut chain = Blockchain::new(".test_db_adv_1").unwrap();
+    
     for i in 1..=18 {
-        let mut block = chain.chain.last().unwrap().clone();
+        let mut block = chain.get_block_by_height(i - 1).unwrap().clone();
         block.header.index = i;
         block.header.timestamp = chrono::Utc::now().timestamp();
-        chain.chain.push(block);
+        chain.push_block(&block).unwrap();
     }
-    let (template, _, _) = chain.prepare_block_template(vec![], "greedy_mining_farm", None);
+    
+    let (template, _, _) = chain.prepare_block_template(vec![], "greedy_mining_farm", dummy_l2_keys());
     
     let mut has_reserve = false;
     let mut reserve_amount = 0;
@@ -35,16 +42,15 @@ fn test_robin_hood_slashing_for_fast_blocks() {
 
 #[test]
 fn test_p2pool_80_20_distribution() {
-    let mut chain = Blockchain::new();
+    let _ = std::fs::remove_dir_all(".test_db_adv_2");
+    let mut chain = Blockchain::new(".test_db_adv_2").unwrap();
     
-    // ⚡ FIX : AUCUN UNDERSCORE DANS CES VARIABLES !
-    // Si on met un '_', le nœud va lire de travers à cause du .split('_')
     let share_height = 0;
-    let share_prev_hash = chain.chain[0].header.hash.clone();
+    let share_prev_hash = chain.get_block_by_height(0).unwrap().header.hash.clone();
     let timestamp = chrono::Utc::now().timestamp();
     let nonce = 12345;
-    let l2_root = "L2ROOTTEST"; // Sans underscore
-    let tx_root = "TXROOTTEST"; // Sans underscore
+    let l2_root = "L2ROOTTEST"; 
+    let tx_root = "TXROOTTEST"; 
 
     let flags = RandomXFlag::get_recommended_flags();
     let cache = RandomXCache::new(flags, chain.get_epoch_seed(share_height).as_bytes()).unwrap();
@@ -61,14 +67,12 @@ fn test_p2pool_80_20_distribution() {
             hash: real_hash, 
             timestamp,
         },
-        inputs: vec![],
-        outputs: vec![],
-        fee: 0,
+        inputs: vec![], outputs: vec![], fee: 0,
         public_key: format!("{}_{}_{}", l2_root, tx_root, nonce),
         wots_signature: None,
     };
     
-    let (template, _, _) = chain.prepare_block_template(vec![share_tx], "main_miner", None);
+    let (template, _, _) = chain.prepare_block_template(vec![share_tx], "main_miner", dummy_l2_keys());
     
     let mut main_miner_amount = 0;
     let mut little_laptop_amount = 0;
@@ -90,9 +94,7 @@ fn test_p2pool_80_20_distribution() {
 fn test_l2_micro_coinbase_validation_rule() {
     let micro_tx = Transaction {
         tx_type: TransactionType::MicroCoinbase,
-        inputs: vec![],
-        outputs: vec![],
-        fee: 0,
+        inputs: vec![], outputs: vec![], fee: 0,
         public_key: "MICRO_COINBASE".to_string(),
         wots_signature: None,
     };

@@ -1,19 +1,20 @@
 Roadmap
-[x] Moteur UTXO & HTLC
 
 [x] Intégration RandomX (Warm-Up asynchrone)
+
+[x] Moteur UTXO & HTLC
 
 [x] Engagements Lattice/LWE
 
 [x] Logique DEX FBA On-Chain
 
-[x] P2P anonymisé (Tor/Arti)
+[x] Layer 2 Intégré (Blocs 1s)
 
-[ ] Layer 2 Intégré (Blocs 1s)
+[x] P2P anonymisé (Mixnet)
 
-[ ] Tests unitaires & intégration complets -> [Aide bienvenue]
+[x] Tests unitaires & intégration complets -> [Aide bienvenue]
 
-[ ] Audit externe de la signature Ring Lattice
+[ ] Audit externe
 
 [ ] Lancement Mainnet Genesis
 

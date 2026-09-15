@@ -112,11 +112,11 @@ async fn main() {
     };
 
     let role_prefix = if is_relay_mode { "relay" } else { "miner" };
-    let l1_db_file = format!("{}/{}_l1_chain_{}.json", db_dir, role_prefix, port);
-    let l2_db_file = format!("{}/{}_l2_chain_{}.json", db_dir, role_prefix, port);
+	let l1_db_file = format!("{}/{}_l1_chain_{}", db_dir, role_prefix, port);
+	let l2_db_file = format!("{}/{}_l2_chain_{}", db_dir, role_prefix, port);
 
     // On utilise maintenant l1_db_file pour charger la chaîne
-    let shared_chain = Arc::new(Mutex::new(Blockchain::load_from_disk(&l1_db_file).unwrap_or_else(|_| Blockchain::new())));
+    let shared_chain = Arc::new(Mutex::new(Blockchain::new(&l1_db_file).unwrap()));
     let mempool: SharedMempool = Arc::new(Mutex::new(Vec::new()));
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
 	
@@ -125,7 +125,7 @@ async fn main() {
     // ====================================================================
     let (genesis_timestamp, genesis_hash) = {
         let chain = shared_chain.lock().unwrap();
-        let genesis_block = &chain.chain[0];
+        let genesis_block = &chain.get_block_by_height(0).unwrap();
         (genesis_block.header.timestamp, genesis_block.header.hash.clone())
     };
 
@@ -172,12 +172,11 @@ async fn main() {
     let p2p_active = Arc::clone(&active_peers);
     let port_clone = port.clone();
     let bind_ip_p2p = p2p_bind_ip.to_string(); 
-	let p2p_l2_db = l2_db_file.clone(); 
     
     // LE SERVEUR P2P 
     tokio::spawn(async move {
         wattcoin_core::network::start_p2p_server(
-            &bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active, p2p_l2_db
+            &bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active
         ).await;
     });
 	
@@ -203,7 +202,6 @@ async fn main() {
         let p2p_dex_hs = Arc::clone(&dex_pool);
         let p2p_peers_hs = Arc::clone(&known_peers);
         let p2p_active_hs = Arc::clone(&active_peers);
-        let p2p_l2_db_tunnel = l2_db_file.clone(); 
         
         tokio::spawn(async move {
             let address = if target_clone.contains(':') { 
@@ -236,8 +234,7 @@ async fn main() {
                                 Arc::clone(&p2p_mempool_hs), 
                                 Arc::clone(&p2p_dex_hs), 
                                 Arc::clone(&p2p_peers_hs), 
-                                Arc::clone(&p2p_active_hs),
-                                p2p_l2_db_tunnel.clone() 
+                                Arc::clone(&p2p_active_hs)
                             );
                         }
                         Err(e) => { 
@@ -257,7 +254,7 @@ async fn main() {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             let chain = shared_chain.lock().expect("Mutex empoisonné (panic précédent)");
-            chain.save_to_disk(&l1_db_file);
+            let _ = chain.db.flush(); // On s'assure juste que Sled a bien écrit sur le disque
         }
     } else {
         // 💡 On force le mineur à attendre la synchro initiale
@@ -279,8 +276,6 @@ async fn main() {
         let miner_active_peers = Arc::clone(&active_peers);
         let miner_address_clone = miner_address.clone();
         let miner_port_clone = port.clone();
-        let miner_l1_db = l1_db_file.clone();
-		let miner_l2_db = l2_db_file.clone();
 
         // 🚀 On lance le minage lourd dans le pool de threads bloquants de Tokio.
         // Cela libère à 100% l'API Web et le serveur P2P qui tourneront sur les autres threads !
@@ -309,10 +304,11 @@ async fn main() {
         
             loop {
                 // BOUCLIER ANTI-SPINLOCK
-                let current_height = { miner_chain.lock().unwrap().chain.len() as u64 };
+                let current_height = { miner_chain.lock().unwrap().current_height };
                 let highest_known = wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed);
                 
-                if highest_known >= current_height {
+                // 💡 CORRECTION : On vérifie si le réseau a déjà trouvé le PROCHAIN bloc (+1) !
+                if highest_known >= current_height + 1 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     continue; 
                 }
@@ -330,15 +326,17 @@ async fn main() {
                     handles.push(std::thread::spawn(move || {
                         let mut chunk_keys = Vec::with_capacity(chunk_size);
                         for _ in 0..chunk_size {
-                            // LECTURE DU KILL SWITCH DANS LE THREAD WOTS+ !
-                            if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height {
+                            // 💡 CORRECTION DU KILL SWITCH WOTS+ (+1) !
+                            if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height + 1 {
                                 break; // On avorte la génération instantanément !
                             }
                             
                             // ON LAISSE RESPIRER LE RÉSEAU : 1ms de pause pour laisser passer les paquets TCP
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             
-                            chunk_keys.push(wattcoin_core::lattice::LatticeKeyPair::generate());
+                            // Génération WOTS+ (master_seed aléatoire, index 0)
+                            let master_seed: [u8; 32] = rand::random();
+                            chunk_keys.push(wots::Wots::generate_keypair(&master_seed, 0));
                         }
                         chunk_keys
                     }));
@@ -350,9 +348,8 @@ async fn main() {
                     pre_generated_l2_keys.extend(keys);
                 }
 
-                // 2. VÉRIFICATION DU KILL SWITCH (Au cas où un bloc est arrivé)
-                // OU si les threads ont été avortés (moins de 128 clés générées)
-                if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height || pre_generated_l2_keys.len() < 128 {
+                // CORRECTION DU KILL SWITCH GLOBAL (+1) !
+                if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height + 1 || pre_generated_l2_keys.len() < 128 {
                     continue; // On annule tout et on laisse la place au réseau !
                 }
 
@@ -418,7 +415,7 @@ async fn main() {
                             outputs: vec![],
                             fee: 0,
                             public_key: "DEX_SETTLEMENT_ON_CHAIN".to_string(), 
-                            lattice_signature: None,
+							wots_signature: None,
                         });
                     }
                 }
@@ -431,8 +428,8 @@ async fn main() {
                         pending_txs.push(dex_tx);
                     }
                     
-                    // On passe les clés pré-générées !
-                    chain.prepare_block_template(pending_txs, &miner_address_clone, Some(&miner_l2_db), pre_generated_l2_keys)
+                    // On passe les clés pré-générées
+                    chain.prepare_block_template(pending_txs, &miner_address_clone, pre_generated_l2_keys)
                 };
 
                 let target_epoch = (candidate_block.header.index - 1) / EPOCH_BLOCKS;
@@ -500,7 +497,7 @@ async fn main() {
 							break;
 						}
 						let chain = miner_chain.lock().unwrap();
-                        if chain.chain.len() as u64 > candidate_block.header.index {
+                        if chain.current_height >= candidate_block.header.index {
                             println!("🛑 [ALERTE] Le réseau a trouvé le Bloc {} avant nous ! Annulation du minage.", candidate_block.header.index);
 							
 							if let Some(task) = current_sequencer_task.take() {
@@ -548,7 +545,7 @@ async fn main() {
                                 inputs: vec![], outputs: vec![], fee: 0,
                                 // On sépare par des :
 								public_key: format!("{}_{}_{}", candidate_block.header.l2_root, candidate_block.header.tx_root, candidate_block.header.nonce), 
-								lattice_signature: None,
+								wots_signature: None,
                             };
                             let mut pool = miner_mempool.lock().unwrap();
                             pool.push(share_tx.clone());
@@ -564,7 +561,7 @@ async fn main() {
                 if mined {
                     let mut chain = miner_chain.lock().unwrap();
                     
-                    if chain.chain.len() as u64 > candidate_block.header.index {
+                    if chain.current_height >= candidate_block.header.index {
                          println!("🗑️ [INFO] Hachage trouvé, mais la chaîne a été synchronisée entre temps. Bloc jeté.");
 						 
 						 if let Some(task) = current_sequencer_task.take() {
@@ -573,7 +570,7 @@ async fn main() {
 						}
 						
                     } 
-                    else if chain.chain.len() as u64 == candidate_block.header.index {
+                    else if chain.current_height + 1 == candidate_block.header.index {
                         
                         let date_str = chrono::Local::now().format("%d-%m-%Y %H:%M:%S").to_string();
                         let nb_tx = candidate_block.transactions.len();
@@ -601,26 +598,24 @@ async fn main() {
 							}
 
 							if tx.tx_type != TransactionType::Coinbase {
-								for input in &tx.inputs {
-									chain.spent_key_images.insert(input.mpc_ring.key_image.clone());
+								if let Some(sig) = &tx.wots_signature {
+									chain.spent_key_images.insert(hex::encode(&sig.public_key));
 								}
 							}
 						}
 
-                        chain.chain.push(candidate_block.clone()); 
+                        let _ = chain.push_block(&candidate_block);
                         chain.update_target(); 
-                        chain.save_to_disk(&miner_l1_db);
                         
                         let l1_parent_hash = candidate_block.header.hash.clone();
                         let sequencer_keys = l2_keys.clone();
                         let mempool_seq = Arc::clone(&miner_mempool);
                         let active_peers_seq = Arc::clone(&miner_active_peers);
 						
-						let l2_pubkeys: Vec<String> = sequencer_keys.iter().map(|k| k.public_key.clone()).collect();
+						let l2_pubkeys: Vec<String> = sequencer_keys.iter().map(|k| hex::encode(&k.1)).collect();
                         
                         // On prépare la blockchain et le fichier L2 pour l'état local
                         let chain_seq = Arc::clone(&miner_chain);
-                        let l2_db_seq = miner_l2_db.clone();
 
                         // RÉGICIDE : On tue brutalement l'ancien séquenceur s'il tourne encore
                         if let Some(task) = current_sequencer_task.take() {
@@ -634,12 +629,15 @@ async fn main() {
                             use sha2::Digest; 
                             let mut already_sequenced = std::collections::HashSet::new();
 
-                            // LECTURE DU VRAI COMPTEUR GLOBAL
+                            // LECTURE DU VRAI COMPTEUR GLOBAL VIA SLED
                             let mut global_l2_index = 0;
-                            if let Ok(data) = std::fs::read_to_string(&l2_db_seq) {
-                                if let Ok(l2_chain) = serde_json::from_str::<Vec<wattcoin_core::block::MicroBlock>>(&data) {
-                                    if let Some(last_mb) = l2_chain.last() {
-                                        global_l2_index = last_mb.micro_index;
+                            {
+                                let chain = chain_seq.lock().unwrap();
+                                if let Ok(l2_tree) = chain.db.open_tree("l2_blocks") {
+                                    if let Some(Ok((_, value))) = l2_tree.iter().rev().next() {
+                                        if let Ok(last_mb) = bincode::deserialize::<wattcoin_core::block::MicroBlock>(&value) {
+                                            global_l2_index = last_mb.micro_index;
+                                        }
                                     }
                                 }
                             }
@@ -677,7 +675,7 @@ async fn main() {
                                 // 1. La part du Séquenceur
                                 let mut coinbase_outputs = vec![
                                     wattcoin_core::transaction::TransactionOutput {
-                                        stealth_address: format!("L2_WATT_{}", keypair.public_key),
+                                        stealth_address: format!("L2_WATT_{}", hex::encode(&keypair.1)),
                                         kyber_capsule: format!("MICRO_COINBASE_{}", global_l2_index), // 💡 Propre
                                         aes_vault: sequencer_reward.to_string(),
                                         lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(sequencer_reward, &[0u64; wattcoin_core::lattice::LATTICE_DIM]),
@@ -700,7 +698,7 @@ async fn main() {
                                     outputs: coinbase_outputs,
                                     fee: 0,
                                     public_key: "MICRO_COINBASE".to_string(),
-                                    lattice_signature: None,
+									wots_signature: None,
                                 };
 
                                 txs_to_sequence.insert(0, micro_coinbase);
@@ -714,9 +712,9 @@ async fn main() {
                                     key_index: i as u32,          // L'index pour la sécurité WOTS
                                     timestamp: chrono::Utc::now().timestamp(),
                                     transactions: txs_to_sequence,
-                                    sequencer_pubkey: keypair.public_key.clone(),
+                                    sequencer_pubkey: hex::encode(&keypair.1),
                                     sequencer_reward_address: "FEE_GOES_TO_NEXT_L1_MINER".to_string(), 
-                                    sequencer_sig: wattcoin_core::lattice::LatticeSignature { z_vector: vec![0; wattcoin_core::lattice::LATTICE_DIM], c_hash: String::new() },
+                                    sequencer_sig: wots::WotsSignature { index: 0, public_key: vec![], signature_bytes: vec![] },
                                     merkle_proof: l2_pubkeys.clone(), 
                                 };
 
@@ -727,7 +725,18 @@ async fn main() {
                                 let mut hash_arr = [0u8; 64];
                                 hash_arr.copy_from_slice(&hasher.finalize());
 
-                                micro_block.sequencer_sig = wattcoin_core::lattice::LatticeKeyPair::sign(&keypair.secret_key, &hash_arr);
+                                // On extrait les 32 premiers octets du hash SHA512 pour WOTS+
+								let mut hash_arr_32 = [0u8; 32];
+								hash_arr_32.copy_from_slice(&hash_arr[0..32]);
+
+								// Note: Wots::sign prend en paramètre : 
+								// (secret_key: &[[u8; 32]], index: u64, message_hash: &[u8; 32], public_key: &[u8])
+								micro_block.sequencer_sig = wots::Wots::sign(
+									&keypair.0, // <-- keypair.0 correspond à secret_key dans le tuple renvoyé par generate_keypair
+									micro_block.micro_index,
+									&hash_arr_32,
+									&keypair.1  // <-- keypair.1 correspond à la clé publique
+								);
 
                                 wattcoin_core::network::broadcast_micro_block(micro_block.clone(), Arc::clone(&active_peers_seq)).await;
                                 
@@ -742,18 +751,19 @@ async fn main() {
                                 println!("====================================================================\n");
 
                                 // MISE À JOUR SÉCURISÉE DE L'ÉTAT LOCAL DU SÉQUENCEUR
-                                // 1. Enregistrement direct sur le disque pour que le Wallet le voie
-                                Blockchain::save_microblock_to_disk(&l2_db_seq, &micro_block);
-
-                                // 2. Protection Anti-Double Dépense & Nettoyage Mempool
+                                // 1 & 2. Enregistrement direct dans Sled + Protection Anti-Double Dépense & Nettoyage Mempool
                                 {
                                     let mut chain = chain_seq.lock().unwrap();
+                                    
+                                    // SAUVEGARDE L2 VIA SLED
+                                    let _ = chain.push_microblock(&micro_block);
+                                    
                                     for tx in &micro_block.transactions {
                                         if tx.tx_type != TransactionType::MicroCoinbase {
-                                            for input in &tx.inputs {
-                                                chain.spent_key_images.insert(input.mpc_ring.key_image.clone());
-                                            }
-                                        }
+											if let Some(sig) = &tx.wots_signature {
+												chain.spent_key_images.insert(hex::encode(&sig.public_key));
+											}
+										}
                                     }
                                     
                                     let mut mp = mempool_seq.lock().unwrap();
@@ -777,11 +787,12 @@ async fn main() {
                     
                     let mut mp = miner_mempool.lock().unwrap();
                     
-                    // On utilise `chain` qui est déjà verrouillé plus haut !
-                    let cutoff_time = if chain.chain.len() >= 2 {
-                        chain.chain[chain.chain.len() - 2].header.timestamp
-                    } else { 
-                        0 
+                    let cutoff_time = {
+                        if chain.current_height >= 1 {
+                            chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp
+                        } else { 
+                            0 
+                        }
                     };
 
                     // L'astuce : on liste les HASHES des transactions fraîchement minées

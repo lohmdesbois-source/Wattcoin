@@ -13,11 +13,11 @@ Wattcoin is an experimental Layer-1 blockchain designed to solve the critical vu
 
 ## 🏗️ Architecture & Fonctionnalités
 
-### 1. 🛡️ Confidentialité Post-Quantique (LWE Ring Signatures)
+### 1. 🛡️ Confidentialité Post-Quantique (WOTS+ Signatures)
 Wattcoin implémente la confidentialité nativement via la cryptographie sur les réseaux euclidiens (Learning With Errors).
 * **Stealth Addresses:** Adresses masquées et intraçables.
 * **LWE Commitments:** Les montants des transactions sont vérifiés de manière homomorphe.
-* **PQ Ring Signatures:** Protection de l'expéditeur au niveau du protocole de base.
+* **WOTS+ Signatures:** Protection de l'expéditeur au niveau du protocole de base.
 
 ### 2. 🌊 DEX Natif On-Chain (Frequent Batch Auctions)
 Pas de "Liquidity Pools" vulnérables ici. Le moteur d'échange est intégré au consensus.
@@ -43,8 +43,8 @@ Une taxe inaltérable de 1 % sur tous les frais du réseau (L1 et L2) alimente u
 ## 🚀 Installation & Lancement
 
 ### Prérequis
-* Chaîne d'outils Rust (Edition 2021+)
-* Minimum 4Go de RAM (8Go+ recommandés)
+* Chaîne d'outils Rust (Edition 2024+)
+* Minimum 6Go de RAM (8Go+ recommandés)
 
 ### Compilation
 
