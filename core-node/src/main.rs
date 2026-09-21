@@ -34,11 +34,14 @@ unsafe impl Sync for WarmUpContainer {}
 async fn main() {
     let args: Vec<String> = env::args().collect();
     let is_live_mode = args.contains(&"--live".to_string());
-    let clean_args: Vec<String> = args.into_iter().filter(|a| a != "--live").collect();
+	let is_vps_mode = args.contains(&"--vps".to_string());
+    let clean_args: Vec<String> = args.into_iter()
+        .filter(|a| a != "--live" && a != "--vps") 
+        .collect();
 
     if clean_args.len() < 3 {
-        eprintln!("🛑 Usage Mineur : cargo run <PORT> <MINER_ADDRESS> [PEER_IP:PORT] [--live]");
-        eprintln!("🛡️  Usage Relais : cargo run <PORT> --relay [PEER_IP:PORT] [--live]");
+        eprintln!("🛑 Usage Mineur : cargo run <PORT> <MINER_ADDRESS> [PEER_IP:PORT] [--live] [--vps]");
+        eprintln!("🛡️  Usage Relais : cargo run <PORT> --relay [PEER_IP:PORT] [--live] [--vps]");
         return;
     }
 
@@ -111,12 +114,14 @@ async fn main() {
         sec_hex
     };
 
-    // 💡 1. ON LANCE L'UPnP SI ON EST EN MODE LIVE
-    if is_live_mode {
+    // 1. ON LANCE L'UPnP SI ON EST EN MODE LIVE ET PAS SUR UN VPS
+    if is_live_mode && !is_vps_mode {
         wattcoin_core::network::setup_upnp(port.parse::<u16>().unwrap());
+    } else if is_vps_mode {
+        println!("🌍 [VPS] UPnP désactivé (IP publique directe assumée).");
     }
 
-    // 💡 2. ON CHARGE LA MÉMOIRE LOCALE (ÉMANCIPATION DU SEED)
+    // 2. ON CHARGE LA MÉMOIRE LOCALE (ÉMANCIPATION DU SEED)
     let peers_file = format!("{}/known_peers.json", db_dir);
     let known_peers: wattcoin_core::SharedPeers = Arc::new(Mutex::new(HashSet::new()));
     
