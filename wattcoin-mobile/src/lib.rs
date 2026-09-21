@@ -42,8 +42,8 @@ const FLAME: u64 = 1_000_000_000;
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
 // ===================================================================
-//const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
-const LOCAL_DEV_MODE: bool = true; 
+const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
+//const LOCAL_DEV_MODE: bool = true; 
 // ===================================================================
 
 #[derive(Debug)]
