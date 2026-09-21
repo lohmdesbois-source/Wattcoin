@@ -111,11 +111,32 @@ async fn main() {
         sec_hex
     };
 
+    // 💡 1. ON LANCE L'UPnP SI ON EST EN MODE LIVE
+    if is_live_mode {
+        wattcoin_core::network::setup_upnp(port.parse::<u16>().unwrap());
+    }
+
+    // 💡 2. ON CHARGE LA MÉMOIRE LOCALE (ÉMANCIPATION DU SEED)
+    let peers_file = format!("{}/known_peers.json", db_dir);
+    let known_peers: wattcoin_core::SharedPeers = Arc::new(Mutex::new(HashSet::new()));
+    
+    if let Ok(data) = std::fs::read_to_string(&peers_file) {
+        if let Ok(saved_peers) = serde_json::from_str::<Vec<String>>(&data) {
+            let mut kp = known_peers.lock().unwrap();
+            for peer in saved_peers { kp.insert(peer); }
+            println!("💾 [BOOTSTRAP] {} adresses chargées depuis la mémoire locale.", kp.len());
+        }
+    }
+
+    // On ajoute le seed cible (s'il y en a un fourni dans la console)
+    if let Some(target) = &peer_target { 
+        known_peers.lock().unwrap().insert(target.clone()); 
+    }
+
     let role_prefix = if is_relay_mode { "relay" } else { "miner" };
 	let l1_db_file = format!("{}/{}_l1_chain_{}", db_dir, role_prefix, port);
-	let l2_db_file = format!("{}/{}_l2_chain_{}", db_dir, role_prefix, port);
 
-    // On utilise maintenant l1_db_file pour charger la chaîne
+    // On utilise maintenant l1_db_file pour charger la chaîne (L1 + L2 unifié)
     let shared_chain = Arc::new(Mutex::new(Blockchain::new(&l1_db_file).unwrap()));
     let mempool: SharedMempool = Arc::new(Mutex::new(Vec::new()));
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
@@ -146,7 +167,6 @@ async fn main() {
     let now_ts = chrono::Utc::now().timestamp();
     if now_ts < genesis_timestamp {
         let wait_seconds = genesis_timestamp - now_ts;
-        //println!("⏳ [MAINNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
 		println!("⏳ [TESTNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
         println!("⏳ Le nœud est en mode veille. Lancement automatique dans {} secondes...", wait_seconds);
         println!("⏳ Laissez ce terminal ouvert. Les moteurs s'allumeront à l'heure H.\n");
@@ -154,15 +174,12 @@ async fn main() {
         // Le nœud s'endort ici et se réveillera exactement à l'heure du Genesis !
         tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds as u64)).await;
         
-        //println!("🚀 [MAINNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
 		println!("🚀 [TESTNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
     }
     // ====================================================================
 
     // L'initialisation se fera juste avant le minage
     
-    let known_peers: wattcoin_core::SharedPeers = Arc::new(Mutex::new(HashSet::new()));
-    if let Some(target) = &peer_target { known_peers.lock().unwrap().insert(target.clone()); }
     let active_peers: wattcoin_core::network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
 
     let p2p_chain = Arc::clone(&shared_chain);
@@ -184,12 +201,11 @@ async fn main() {
     let api_mempool = Arc::clone(&mempool);
     let api_dex_pool = Arc::clone(&dex_pool);
     let api_active_peers = Arc::clone(&active_peers);
-    let api_l2_db = l2_db_file.clone(); 
-	let api_kyber_secret = node_kyber_secret.clone(); // On clone pour le thread
+	let api_kyber_secret = node_kyber_secret.clone(); // Clonage pour la route
 	
     tokio::spawn(async move { 
         wattcoin_core::api::start_api_server(
-            api_port, api_bind_ip, api_mempool, api_chain, api_dex_pool, api_active_peers, api_l2_db, api_kyber_secret
+            api_port, api_bind_ip, api_mempool, api_chain, api_dex_pool, api_active_peers, api_kyber_secret
         ).await; 
     });
 	
@@ -204,28 +220,32 @@ async fn main() {
         let p2p_active_hs = Arc::clone(&active_peers);
         
         tokio::spawn(async move {
-            let address = if target_clone.contains(':') { 
+            let mut address = if target_clone.contains(':') { 
                 target_clone.clone() 
             } else { 
                 format!("127.0.0.1:{}", target_clone) 
             };
+			
+			// On ajoute un compteur d'échecs
+			let mut consecutive_failures = 0;
             
             // LE CHIEN DE GARDE (Watchdog Auto-Reconnect)
             loop {
-                // 1. On vérifie si l'IP cible est toujours dans la liste des pairs actifs
+                // On vérifie si l'IP cible est toujours dans la liste des pairs actifs
                 let is_connected = {
                     let ap = p2p_active_hs.lock().unwrap();
                     let target_ip = address.split(':').next().unwrap_or("");
                     ap.keys().any(|k| k.starts_with(target_ip))
                 };
 
-                // 2. Si la connexion est tombée (ou n'a jamais réussi), on relance !
+                // Si la connexion est tombée (ou n'a jamais réussi), on relance !
                 if !is_connected {
                     println!("🔓 Tentative de connexion P2P vers {}...", address);
                     
                     match tokio::net::TcpStream::connect(&address).await {
                         Ok(socket) => {
                             println!("✅ Connexion P2P réussie vers {} !", address);
+							consecutive_failures = 0; // On réinitialise si succès
                             wattcoin_core::network::start_peer_connection(
                                 socket, 
                                 address.split(':').next().unwrap_or("127.0.0.1").to_string(), 
@@ -239,12 +259,37 @@ async fn main() {
                         }
                         Err(e) => { 
                             println!("❌ Échec de connexion au réseau : {}", e); 
+							consecutive_failures += 1;
+                
+							// SI ON EST TOTALEMENT ISOLÉ (3 échecs = ~30 secondes)
+							if consecutive_failures >= 3 {
+								println!("⚠️ [RELAIS] Isolement détecté. Rafraîchissement de l'annuaire WNS...");
+								// 1. On force la mise à jour de l'annuaire RAM depuis le WNS (via network.rs)
+								wattcoin_core::network::WNS_CACHE.lock().await.clear();
+								let is_local = !is_live_mode; // Si on n'est pas en --live, on est en local
+								wattcoin_core::network::sync_wns_directory(is_local).await;
+								
+								// On essaie de se connecter à un autre nœud connu de notre carnet local !
+								let alternative_peer = {
+									let kp = p2p_peers_hs.lock().unwrap();
+									kp.iter().next().cloned() // On prend le premier dispo
+								};
+								
+								if let Some(new_target) = alternative_peer {
+									println!("🔄 [RELAIS] Bascule vers un nœud de secours : {}", new_target);
+									address = new_target; // On change la cible de notre boucle de reconnexion
+									consecutive_failures = 0; // On laisse sa chance au nouveau nœud
+								}
+							}
                             println!("⚠️ Nouvelle tentative automatique dans 10 secondes...");
                         }
                     }
-                }
+                } else {
+					// Si on est connecté, tout va bien, le compteur reste à 0
+					consecutive_failures = 0;
+				}
 
-                // 3. On dort 10 secondes avant de revérifier (zéro impact CPU)
+                // On dort 10 secondes avant de revérifier (zéro impact CPU)
                 tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         });
@@ -493,7 +538,6 @@ async fn main() {
 								println!("🛑 [L2 SEQUENCER] Fin de règne (Nouveau bloc reçu du réseau).");
 								task.abort();
 							}
-							
 							break;
 						}
 						let chain = miner_chain.lock().unwrap();
@@ -504,7 +548,6 @@ async fn main() {
 								println!("🛑 [L2 SEQUENCER] Fin de règne (Nouveau bloc reçu du réseau).");
 								task.abort();
 							}
-							
                             break; 
                         }
                         
@@ -646,13 +689,26 @@ async fn main() {
                                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                 
                                 let mut txs_to_sequence = Vec::new();
+                                let mut expected_fees = 0u64; // On calcule les vrais frais
+                                let mut current_mb_size = 1024; // 1 Ko de base pour l'en-tête
+
                                 {
                                     let mp = mempool_seq.lock().unwrap();
                                     for tx in mp.iter() {
                                         let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
-                                        
                                         let tx_hash_hex = hex::encode(tx.hash_data());
+                                        
 										if is_pure_l2 && !already_sequenced.contains(&tx_hash_hex) {
+                                            let tx_size = bincode::serialized_size(tx).unwrap_or(0) as usize;
+                                            
+                                            // LE BOUCLIER L2 : Limite stricte à 2 Mo par MicroBloc !
+                                            if current_mb_size + tx_size > 2 * 1024 * 1024 {
+                                                println!("⚠️ [L2] MicroBloc plein ! (2 Mo max). Fin du remplissage pour ce tour.");
+                                                break;
+                                            }
+
+                                            current_mb_size += tx_size;
+                                            expected_fees += tx.fee; // On additionne les vrais frais payés !
 											txs_to_sequence.push(tx.clone());
 											already_sequenced.insert(tx_hash_hex);
 										}
@@ -663,9 +719,7 @@ async fn main() {
                                 
                                 // On incrémente SEULEMENT parce qu'on a trouvé des transactions !
                                 global_l2_index += 1; 
-
                                 let true_tx_count = txs_to_sequence.len(); 
-                                let expected_fees = txs_to_sequence.len() as u64 * 100;
                                 let keypair = &sequencer_keys[i];
 
                                 // Répartition 99% Séquenceur / 1% Loto
@@ -718,12 +772,26 @@ async fn main() {
                                     merkle_proof: l2_pubkeys.clone(), 
                                 };
 
-                                // On hache TOUT pour la signature
-                                let mb_data = format!("{}{}{}{}", micro_block.l1_parent_hash, micro_block.micro_index, micro_block.key_index, micro_block.timestamp);
-                                let mut hasher = sha2::Sha512::new();
-                                hasher.update(mb_data.as_bytes());
-                                let mut hash_arr = [0u8; 64];
-                                hash_arr.copy_from_slice(&hasher.finalize());
+                                // On scelle cryptographiquement les transactions !
+								let mut tx_hasher = sha2::Sha512::new();
+								for tx in &micro_block.transactions {
+									tx_hasher.update(&tx.hash_data());
+								}
+								let txs_hash = hex::encode(tx_hasher.finalize());
+
+								// On hache TOUT pour la signature (incluant les transactions)
+								let mb_data = format!("{}{}{}{}{}", 
+									micro_block.l1_parent_hash, 
+									micro_block.micro_index, 
+									micro_block.key_index, 
+									micro_block.timestamp, 
+									txs_hash // Le contenu est maintenant verrouillé !
+								);
+
+								let mut hasher = sha2::Sha512::new();
+								hasher.update(mb_data.as_bytes());
+								let mut hash_arr = [0u8; 64];
+								hash_arr.copy_from_slice(&hasher.finalize());
 
                                 // On extrait les 32 premiers octets du hash SHA512 pour WOTS+
 								let mut hash_arr_32 = [0u8; 32];

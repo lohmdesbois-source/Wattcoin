@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use sha2::{Sha512, Digest};
+use sha2::{Sha256, Sha512, Digest};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct L2Transaction {
@@ -12,15 +12,18 @@ pub struct L2Transaction {
 
 impl L2Transaction {
     /// Hache les données pour vérifier la signature
-    pub fn hash_data(&self) -> [u8; 64] {
+    pub fn hash_data(&self) -> [u8; 32] { 
         let mut hasher = Sha512::new();
         hasher.update(self.sender_pubkey.as_bytes());
-		hasher.update(self.receiver_address.as_bytes());
+        hasher.update(self.receiver_address.as_bytes());
         hasher.update(&self.amount.to_be_bytes());
         hasher.update(&self.fee.to_be_bytes());
         
-        let mut result = [0u8; 64];
-        result.copy_from_slice(&hasher.finalize());
+        let mut final_hasher = Sha256::new();
+        final_hasher.update(hasher.finalize());
+        
+        let mut result = [0u8; 32];
+        result.copy_from_slice(&final_hasher.finalize());
         result
     }
 }

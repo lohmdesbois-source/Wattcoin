@@ -1,18 +1,37 @@
 use dotenv::dotenv;
 use reqwest::Client;
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::Digest;
 use std::env;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use wattcoin_core::transaction::{Transaction, TransactionType};
-use wattcoin_core::lattice::LatticeKeyPair;
+
 
 // On importe nos nouveaux modules !
 use wattcoin_l2_sdk::api::start_api_server;
 use wattcoin_l2_sdk::state::L2State;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SequencerKeys {
+    public_key: String,
+    secret_key_hex: String,
+}
+
+
+
+fn decode_wots_sk(hex_str: &str) -> Vec<[u8; 32]> {
+    let bytes = hex::decode(hex_str).unwrap();
+    let mut sk = Vec::new();
+    for chunk in bytes.chunks_exact(32) {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(chunk);
+        sk.push(arr);
+    }
+    sk
+}
 
 
 
@@ -44,19 +63,25 @@ async fn main() {
     });
 
     // 3. Gestion du Hot Wallet
-    let hot_wallet = if let Ok(data) = fs::read_to_string("sequencer_keys.json") {
-        serde_json::from_str::<LatticeKeyPair>(&data).unwrap()
-    } else {
-        println!("🔧 Génération du Hot Wallet...");
-        let keys = LatticeKeyPair::generate();
-        fs::write("sequencer_keys.json", serde_json::to_string(&keys).unwrap()).unwrap();
-        keys
-    };
-
-    let pubkey = hot_wallet.public_key.clone();
+    let hot_wallet = match fs::read_to_string("sequencer_keys.json").and_then(|data| serde_json::from_str::<SequencerKeys>(&data).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))) {
+		Ok(keys) => keys,
+		Err(_) => {
+			println!("🔧 Génération du Hot Wallet Séquenceur (WOTS+)...");
+			let mut seed = [0u8; 32];
+			rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+			let keys_wots = wots::Wots::generate_keypair(&seed, 0);
+			let mut sk_hex = String::new();
+			for chunk in keys_wots.0 { sk_hex.push_str(&hex::encode(chunk)); }
+			
+			let keys = SequencerKeys { public_key: hex::encode(&keys_wots.1), secret_key_hex: sk_hex };
+			fs::write("sequencer_keys.json", serde_json::to_string(&keys).unwrap()).unwrap();
+			keys
+		}
+	};
+	let pubkey = hot_wallet.public_key.clone();
     
     // ==========================================================
-    // 💡 AJOUT : L'AFFICHAGE INDISPENSABLE DE LA CLÉ !
+    // AJOUT : L'AFFICHAGE INDISPENSABLE DE LA CLÉ !
     // ==========================================================
     println!("=====================================================");
     println!("🔑 MA CLÉ PUBLIQUE (HOT WALLET) : \n{}", pubkey);
@@ -111,27 +136,36 @@ async fn main() {
         println!("⚓  Envoi de l'ancrage au L1 en cours...");
         println!("=====================================================\n");
 
-        // C. Signature
-        let mut hasher = Sha512::new();
-        hasher.update(state_root.as_bytes());
-        let mut hash_array = [0u8; 64];
-        hash_array.copy_from_slice(&hasher.finalize());
-        let lattice_sig = LatticeKeyPair::sign(&hot_wallet.secret_key, &hash_array);
+        // C. Signature WOTS+
+		let mut hasher = sha2::Sha256::new();
+		hasher.update(state_root.as_bytes());
+		let mut hash_array = [0u8; 32];
+		hash_array.copy_from_slice(&hasher.finalize());
+		
+		let secret_matrix = decode_wots_sk(&hot_wallet.secret_key_hex);
+		let public_key_bytes = hex::decode(&pubkey).unwrap_or_default();
+		let wots_sig = wots::Wots::sign(&secret_matrix, block_idx, &hash_array, &public_key_bytes);
+		let signature_hex = serde_json::to_string(&wots_sig).unwrap();
 
-        // D. Envoi au L1
-        let anchor_tx = Transaction {
-            tx_type: TransactionType::L2Anchor {
-                l2_name: l2_name.clone(),
-                state_root: state_root.clone(),
-                sequencer_signature: serde_json::to_string(&lattice_sig).unwrap(),
+		// D. Envoi au L1
+		let mut anchor_tx = Transaction {
+			tx_type: TransactionType::L2Anchor {
+				l2_name: l2_name.clone(),
+				state_root: state_root.clone(),
+				sequencer_signature: signature_hex,
 				withdrawals: vec![],
-            },
-            inputs: vec![],
-            outputs: vec![],
-            fee: 1000,
-            lattice_signature: None,
-            public_key: pubkey.clone(),
-        };
+			},
+			inputs: vec![],
+			outputs: vec![],
+			fee: 0, // Sera remplacé
+			wots_signature: None, // 👈 Remplace `lattice_signature: None`
+			public_key: pubkey.clone(),
+		};
+
+		// Frais dynamiques
+		let tx_weight_bytes = bincode::serialized_size(&anchor_tx).unwrap_or(0) as usize;
+		let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+		anchor_tx.fee = std::cmp::max(1000, weight_kb * 20);
 
         // On envoie le bloc d'ancrage en BINAIRE PUR (Bincode) !
 		let tx_bytes = bincode::serialize(&anchor_tx).expect("Erreur de sérialisation binaire");

@@ -9,7 +9,9 @@ use sha2::Digest;
 use sled::Db;
 
 const FLAME: u64 = 1_000_000_000;
-const MATURITY_BLOCKS: u64 = 3; // 12 Prod
+const MAX_BLOCK_SIZE_BYTES: usize = 32 * 1024 * 1024; // 32 Mo maximum par bloc !
+const MAX_BLOCK_L2_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2 Mo maximum par microbloc !
+const MATURITY_BLOCKS: u64 = 12; // 12 Prod
 const EXPECTED_BLOCK_TIME: u64 = 120;    // 2 mins (120 s)
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
@@ -244,13 +246,43 @@ impl Blockchain {
 		self.get_jackpot_info(next_draw)
 	}
 
-    pub fn prepare_block_template(&mut self, transactions: Vec<Transaction>, miner_address: &str, l2_keys: Vec<(Vec<[u8; 32]>, Vec<u8>)>) -> (Block, BigUint, Vec<(Vec<[u8; 32]>, Vec<u8>)>) {
+    pub fn prepare_block_template(&mut self, mut transactions: Vec<Transaction>, miner_address: &str, l2_keys: Vec<(Vec<[u8; 32]>, Vec<u8>)>) -> (Block, BigUint, Vec<(Vec<[u8; 32]>, Vec<u8>)>) {
         let current_height = self.current_height + 1; 
         println!("\n⏳ Préparation du Bloc {}...", current_height);
+
+        // ====================================================================
+        // ⚖️ LE MARCHÉ DES FRAIS (FEE MARKET) - ANTI-SPAM ET MAXIMISATION DES GAINS
+        // ====================================================================
+        transactions.sort_by(|a, b| {
+            let get_score = |tx: &Transaction| -> f64 {
+                let is_feeless = matches!(tx.tx_type, 
+                    TransactionType::Coinbase | TransactionType::MicroCoinbase |
+                    TransactionType::MiningShare { .. } | TransactionType::DexSettlement { .. } |
+                    TransactionType::LotteryPayout { .. } | TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. }
+                );
+                
+                if is_feeless {
+                    return std::f64::MAX; // Les transactions du consensus passent en priorité absolue
+                }
+                
+                let weight = bincode::serialized_size(tx).unwrap_or(1) as f64;
+                (tx.fee as f64) / weight // Rentabilité : Flames par Octet
+            };
+
+            let score_a = get_score(a);
+            let score_b = get_score(b);
+            
+            // Tri décroissant : Le score le plus élevé (b) passe avant le plus faible (a)
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // ====================================================================
 
         let mut valid_transactions = Vec::new();
         let mut l1_total_fees = 0;
         let mut temp_spent_images = self.spent_key_images.clone(); 
+        
+        // On garde 1 Mo de marge pour la Coinbase et les en-têtes
+        let mut current_block_size = 1024 * 1024; 
 		
         let mut immature_pubkeys = std::collections::HashSet::new();
         let scan_limit = current_height.saturating_sub(MATURITY_BLOCKS);
@@ -279,6 +311,36 @@ impl Blockchain {
                 if is_pure_l2 && tx.tx_type != TransactionType::MicroCoinbase {
                     continue; 
                 }
+
+                // ====================================================================
+                // 💡 LE TRIBUNAL ÉCONOMIQUE DE PRÉPARATION (Consensus Level)
+                // Empêche le mineur d'inclure des transactions gratuites spammantes
+                // ====================================================================
+                let is_l1_interop = matches!(tx.tx_type, 
+                    TransactionType::L2Anchor { .. } | TransactionType::L2BridgeLock { .. } |
+                    TransactionType::L2Stake { .. } | TransactionType::L2Unstake { .. }
+                );
+                let is_feeless = matches!(tx.tx_type, 
+                    TransactionType::Coinbase | TransactionType::MicroCoinbase |
+                    TransactionType::MiningShare { .. } | TransactionType::DexSettlement { .. } |
+                    TransactionType::LotteryPayout { .. } | TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. }
+                );
+
+                if !is_feeless {
+                    let tx_weight_bytes = bincode::serialized_size(tx).unwrap_or(0) as usize;
+                    let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+                    let min_fee = if is_pure_l2 && !is_l1_interop {
+                        std::cmp::max(100, weight_kb * 2)
+                    } else {
+                        std::cmp::max(1000, weight_kb * 20)
+                    };
+
+                    if tx.fee < min_fee {
+                        println!("⛔ Rejet Mempool (Consensus) : Frais insuffisants ({} Flames < {} Flames requis)", tx.fee, min_fee);
+                        continue; // On ne l'inclut pas dans le bloc !
+                    }
+                }
+                // ====================================================================
 				
                 let mut immature = false;
                 if tx.tx_type != TransactionType::Coinbase {
@@ -406,7 +468,17 @@ impl Blockchain {
 					}
                 }
                 
+				// Ajout la transaction
 				if !double_spend {
+                    // LE BOUCLIER DE TAILLE DU MINEUR
+                    let tx_size = bincode::serialized_size(tx).unwrap_or(0) as usize;
+                    if current_block_size + tx_size > MAX_BLOCK_SIZE_BYTES {
+                        println!("⚠️ [MEMPOOL] Bloc plein ! (Limite de 32 Mo atteinte). Les transactions restantes attendront le prochain bloc.");
+                        break; // On arrête de remplir le bloc !
+                    }
+
+                    current_block_size += tx_size; // On met à jour le poids
+					//println!("⚠️ [POIDS] Le poids du bloc est de {} Ko.", current_block_size/1_024);
                     l1_total_fees += tx.fee; 
                     valid_transactions.push(tx.clone()); 
                     if let Some(sig) = &tx.wots_signature {
@@ -643,13 +715,18 @@ impl Blockchain {
             l2_pubkeys.push(hex::encode(&k.1)); 
         }
 
-        let mut l2_root = l2_pubkeys[0].clone();
-        for i in 1..128 {
-            let mut hasher = sha2::Sha512::new();
-            hasher.update(l2_root.as_bytes());
-            hasher.update(l2_pubkeys[i].as_bytes());
-            l2_root = hex::encode(hasher.finalize());
-        }
+        let l2_root = if l2_pubkeys.is_empty() {
+            "NO_L2_ROOT_FOR_THIS_BLOCK".to_string()
+        } else {
+            let mut current_root = l2_pubkeys[0].clone();
+            for i in 1..l2_pubkeys.len() {
+                let mut hasher = sha2::Sha512::new();
+                hasher.update(current_root.as_bytes());
+                hasher.update(l2_pubkeys[i].as_bytes());
+                current_root = hex::encode(hasher.finalize());
+            }
+            current_root
+        };
 
         let new_header = BlockHeader {
             index: current_height,
@@ -920,7 +997,14 @@ impl Blockchain {
     }
     
 	pub fn validate_and_add_external_block(&mut self, block: Block) -> Result<(), String> {
-		let last_block = self.get_last_block(); 
+        // LE COUPERET DU POIDS : Rejet immédiat si c'est trop lourd !
+        let block_size = bincode::serialized_size(&block).unwrap_or(0) as usize;
+		println!("❌ [POIDS] Le poids du bloc dans validate est de {} Ko.", block_size/ 1_024);
+        if block_size > MAX_BLOCK_SIZE_BYTES {
+            return Err(format!("❌ FRAUDE : Le bloc dépasse la limite de consensus stricte ({} Mo > 32 Mo) !", block_size / 1_024 / 1_024));
+        }
+
+		let last_block = self.get_last_block();
 		
 		let current_time = chrono::Utc::now().timestamp();
 		let max_future_tolerance = 7200; 
@@ -1035,6 +1119,35 @@ impl Blockchain {
 					}
 				}
 			}
+
+            // ====================================================================
+            // TRIBUNAL ÉCONOMIQUE L1/L2 (RÈGLE DE CONSENSUS)
+            // ====================================================================
+            let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
+            let is_l1_interop = matches!(tx.tx_type, 
+                TransactionType::L2Anchor { .. } | TransactionType::L2BridgeLock { .. } |
+                TransactionType::L2Stake { .. } | TransactionType::L2Unstake { .. }
+            );
+            let is_feeless = matches!(tx.tx_type, 
+                TransactionType::Coinbase | TransactionType::MicroCoinbase |
+                TransactionType::MiningShare { .. } | TransactionType::DexSettlement { .. } |
+                TransactionType::LotteryPayout { .. } | TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. }
+            );
+
+            if !is_feeless {
+                let tx_weight_bytes = bincode::serialized_size(tx).unwrap_or(0) as usize;
+                let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+                let min_fee = if is_pure_l2 && !is_l1_interop {
+                    std::cmp::max(100, weight_kb * 2)
+                } else {
+                    std::cmp::max(1000, weight_kb * 20)
+                };
+
+                if tx.fee < min_fee {
+                    return Err(format!("❌ FRAUDE ÉCONOMIQUE : Une transaction ne paie pas le minimum syndical au poids (Frais payés: {}, Requis: {}). Bloc rejeté !", tx.fee, min_fee));
+                }
+            }
+            // ====================================================================
 			
             if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = &tx.tx_type {
                 
@@ -1250,6 +1363,143 @@ impl Blockchain {
 		println!("✅ Bloc {} validé. Masse monétaire intègre.", current_height);
 		Ok(())
 	}
+	
+	// ====================================================================
+    // ⚖️ LE TRIBUNAL CONSENSUS L2 (MicroBlocs)
+    // ====================================================================
+    pub fn validate_and_add_microblock(&mut self, micro_block: crate::block::MicroBlock) -> Result<(), String> {
+        // 1. LE COUPERET DU POIDS L2 : 2 Mo Maximum !
+        let mb_size = bincode::serialized_size(&micro_block).unwrap_or(0) as usize;
+        if mb_size > MAX_BLOCK_L2_SIZE_BYTES {
+            return Err(format!("❌ FRAUDE L2 : Le MicroBloc dépasse la limite stricte de 2 Mo ({} Ko)", mb_size / 1024));
+        }
+
+        // 2. VÉRIFICATION DE L'ARBRE DE MERKLE (128 CLÉS OBLIGATOIRES)
+        if micro_block.merkle_proof.len() != 128 {
+            return Err(format!("❌ FRAUDE L2 : Le Séquenceur a fourni {} clés au lieu des 128 clés WOTS+ requises !", micro_block.merkle_proof.len()));
+        }
+
+        // 3. VÉRIFICATION DE L'ANCRAGE AU PARENT L1
+        let mut parent_l1_block = None;
+        for i in (0..=self.current_height).rev().take(10) {
+            if let Some(b) = self.get_block_by_height(i) {
+                if b.header.hash == micro_block.l1_parent_hash {
+                    parent_l1_block = Some(b);
+                    break;
+                }
+            }
+        }
+        let parent_block = parent_l1_block.ok_or("❌ L2 : Parent L1 introuvable ou trop vieux.")?;
+        
+        let mut calculated_root = micro_block.merkle_proof[0].clone();
+        for i in 1..128 {
+            let mut hasher = sha2::Sha512::new();
+            hasher.update(calculated_root.as_bytes());
+            hasher.update(micro_block.merkle_proof[i].as_bytes());
+            calculated_root = hex::encode(hasher.finalize());
+        }
+        
+        if calculated_root != parent_block.header.l2_root {
+            return Err("❌ FRAUDE L2 : L'arbre de Merkle fourni a été falsifié (Ne correspond pas à la racine L1) !".into());
+        }
+
+        if micro_block.merkle_proof[micro_block.key_index as usize] != micro_block.sequencer_pubkey {
+            return Err("❌ FRAUDE L2 : La clé publique du Séquenceur n'appartient pas à l'arbre validé !".into());
+        }
+
+        // 4. SIGNATURE POST-QUANTIQUE WOTS+ DU MICROBLOC
+		// On recalcule l'empreinte des transactions reçues
+		let mut tx_hasher = sha2::Sha512::new();
+		for tx in &micro_block.transactions {
+			tx_hasher.update(&tx.hash_data());
+		}
+		let txs_hash = hex::encode(tx_hasher.finalize());
+
+		// On intègre l'empreinte dans la donnée à vérifier
+		let mb_data = format!("{}{}{}{}{}", 
+			micro_block.l1_parent_hash, 
+			micro_block.micro_index, 
+			micro_block.key_index, 
+			micro_block.timestamp, 
+			txs_hash // Si un attaquant a modifié 1 octet d'une TX, mb_data change, et la signature WOTS+ devient invalide !
+		);
+
+		let mut hasher = sha2::Sha512::new();
+		hasher.update(mb_data.as_bytes());
+		let mut hash_arr = [0u8; 64];
+		hash_arr.copy_from_slice(&hasher.finalize());
+		let mut hash_arr_32 = [0u8; 32];
+		hash_arr_32.copy_from_slice(&hash_arr[0..32]);
+
+		if !wots::Wots::verify(&micro_block.sequencer_sig, &hash_arr_32) {
+			return Err("❌ FRAUDE L2 : Signature WOTS+ du MicroBloc invalide ou transactions altérées !".into());
+		}
+
+        // 5. STRUCTURE ET FRAIS DYNAMIQUES DES TXs INTERNES (2 Flames / Ko)
+        if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
+            return Err("❌ FRAUDE L2 : La première transaction doit être la MicroCoinbase.".into());
+        }
+
+        let mut expected_fees = 0u64;
+        let mut temp_spent = std::collections::HashSet::new();
+
+        for tx in micro_block.transactions.iter().skip(1) {
+            if !tx.is_valid() {
+                return Err("❌ FRAUDE L2 : Transaction interne invalide (Maths Lattice ou Signature).".into());
+            }
+
+            let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
+            if !is_pure_l2 {
+                return Err("❌ FRAUDE L2 : Un MicroBloc ne peut contenir que des transactions L2_WATT_ pures.".into());
+            }
+
+            // VÉRIFICATION STRICTE DU POIDS (Le bouclier anti-Spam !)
+            let tx_weight_bytes = bincode::serialized_size(tx).unwrap_or(0) as usize;
+            let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+            let min_fee = std::cmp::max(100, weight_kb * 2); // 2 Flames minimum par Ko
+
+            if tx.fee < min_fee {
+                return Err(format!("❌ FRAUDE L2 : Transaction sous-payée incluse par le Séquenceur (Frais: {}, Requis au poids: {}).", tx.fee, min_fee));
+            }
+
+            expected_fees += tx.fee;
+
+            if let Some(sig) = &tx.wots_signature {
+                let ki = hex::encode(&sig.public_key);
+                if self.spent_key_images.contains(&ki) || temp_spent.contains(&ki) {
+                    return Err("❌ FRAUDE L2 : Double dépense UTXO détectée dans le MicroBloc !".into());
+                }
+                temp_spent.insert(ki);
+            }
+        }
+
+        // 6. VÉRIFICATION DE LA MICRO-COINBASE (Pas de planche à billets !)
+        let actual_fees: u64 = micro_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
+        if actual_fees > expected_fees {
+            return Err(format!("❌ FRAUDE L2 : Le Séquenceur a imprimé {} Flames au lieu des {} collectés !", actual_fees, expected_fees));
+        }
+
+        // 7. ANTI-DOUBLON ET SAUVEGARDE SLED
+        let l2_tree = self.db.open_tree("l2_blocks").map_err(|e| e.to_string())?;
+        let key = micro_block.micro_index.to_be_bytes();
+        
+        if l2_tree.contains_key(&key).unwrap_or(false) {
+            return Ok(()); // MicroBloc déjà connu, on l'ignore silencieusement
+        }
+
+        for ki in temp_spent {
+            self.spent_key_images.insert(ki); // On brûle les UTXOs L2
+        }
+
+        let value = bincode::serialize(&micro_block).unwrap();
+        l2_tree.insert(&key, value).map_err(|e| e.to_string())?;
+        self.db.flush().map_err(|e| e.to_string())?;
+
+        println!("⚡ [L2 TRIBUNAL] MicroBloc {}/128 validé ! (Taille: {} Ko, Frais légitimes: {} Flames)", 
+                 micro_block.micro_index, mb_size / 1024, expected_fees);
+
+        Ok(())
+    }
     
     pub fn update_target(&mut self) {
         let current_len = self.current_height + 1; 

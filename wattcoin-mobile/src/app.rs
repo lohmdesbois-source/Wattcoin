@@ -67,7 +67,7 @@ enum AppMessage {
     FileHashed(String, String),
 	L2StatusFetched(String),
 	DomainStatus(String),
-	TxWeightEstimated(usize, f64),
+	TxWeightEstimated(usize, f64, f64),
 }
 
 struct WattcoinApp {
@@ -104,10 +104,11 @@ struct WattcoinApp {
 	
 	recipient_input: String,
     amount_input: String,
+    transfer_tip: String, // 👈 NOUVEAU : Le pourboire mineur !
     transfer_from_l2: bool,
     transfer_to_l2: bool,
 	transfer_asset: String, // "WATT" ou "BTC"
-	tx_weight_estimate: Option<(usize, f64)>,
+	tx_weight_estimate: Option<(usize, f64, f64)>,
 	
 	history_items: Vec<crate::HistoryItem>,
     history_tab: String, // "L1" ou "L2"
@@ -232,6 +233,7 @@ impl WattcoinApp {
 			
 			recipient_input: String::new(),
 			amount_input: String::new(),
+            transfer_tip: String::new(), // 👈 NOUVEAU
 			transfer_from_l2: false,
 			transfer_to_l2: false,
 			transfer_asset: "WATT".to_string(), // Transfert WATT par défaut
@@ -689,8 +691,8 @@ impl eframe::App for WattcoinApp {
 				AppMessage::DomainStatus(status) => { 
 					self.wns_domain_status = status;
 				},
-				AppMessage::TxWeightEstimated(utxo_count, size_mb) => {
-                    self.tx_weight_estimate = Some((utxo_count, size_mb));
+				AppMessage::TxWeightEstimated(utxo_count, size_mb, fee_watt) => { 
+                    self.tx_weight_estimate = Some((utxo_count, size_mb, fee_watt));
                 }
             }
         }
@@ -1349,48 +1351,69 @@ impl eframe::App for WattcoinApp {
 						
 						ui.add_space(10.0);
 
-						ui.vertical(|ui| {
-							ui.label(format!("Montant ({}) :", self.transfer_asset));
-							
-							// ON CAPTURE LA FRAPPE POUR ESTIMER LE POIDS
-							let response = ui.add(egui::TextEdit::singleline(&mut self.amount_input).hint_text("0.0"));
-							
-							if response.changed() && self.transfer_asset == "WATT" {
-								if let (Some(keys), Ok(amt)) = (&self.wallet_keys, self.amount_input.parse::<f64>()) {
-									let tx = self.tx.clone();
-									let keys = keys.clone();
-									let from_l2 = self.transfer_from_l2;
-									tokio::spawn(async move {
-										// ON LUI PASSE LA VRAIE ADRESSE (keys.watt_address)
-										if let Ok((utxos, size)) = crate::estimate_tx_weight(amt, &keys.kyber_secret_hex, &keys.watt_address, from_l2, false).await {
-											let _ = tx.send(AppMessage::TxWeightEstimated(utxos, size)).await;
-										}
-									});
-								} else {
-									self.tx_weight_estimate = None;
-								}
-							}
-							
-							// Conversion USD en direct !
-							if let Ok(amt) = self.amount_input.parse::<f64>() {
-								let price = if self.transfer_asset == "WATT" { self.watt_price_usd } else { self.btc_price_usd };
-								if price > 0.0 {
-									ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", amt * price)).color(egui::Color32::GRAY));
-								}
-							}
-						});
-						
-						// L'AFFICHAGE DU POIDS ESTIMÉ
-						if let Some((utxos, size_mb)) = self.tx_weight_estimate {
-						    ui.add_space(10.0);
-						    let color = if size_mb > 16.0 { egui::Color32::RED } else if size_mb > 8.0 { egui::Color32::from_rgb(255, 165, 0) } else { egui::Color32::GREEN };
-						    egui::Frame::none().fill(item_bg).inner_margin(8.0).rounding(4.0).show(ui, |ui| {
-						        ui.label(egui::RichText::new(format!("⚖ Poids estimé : {:.2} Mo ({} UTXOs utilisés)", size_mb, utxos)).color(color));
-						        if size_mb > 16.0 {
-						            ui.label(egui::RichText::new("⚠ Transaction trop lourde ! Réduisez le montant pour utiliser moins d'UTXOs.").size(10.0).color(egui::Color32::RED));
-						        }
-						    });
-						}
+                        ui.vertical(|ui| {
+                            ui.label(format!("Montant ({}) :", self.transfer_asset));
+                            let response_amt = ui.add(egui::TextEdit::singleline(&mut self.amount_input).hint_text("0.0"));
+                            
+                            if let Ok(amt) = self.amount_input.parse::<f64>() {
+                                let price = if self.transfer_asset == "WATT" { self.watt_price_usd } else { self.btc_price_usd };
+                                if price > 0.0 {
+                                    ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", amt * price)).color(egui::Color32::GRAY));
+                                }
+                            }
+
+                            let mut tip_changed = false;
+                            if self.transfer_asset == "WATT" {
+                                ui.add_space(10.0);
+                                ui.label("Pourboire Mineur (Optionnel, en WATT) :");
+                                let response_tip = ui.add(egui::TextEdit::singleline(&mut self.transfer_tip).hint_text("ex: 0.00001"));
+                                tip_changed = response_tip.changed();
+                                
+                                if let Ok(tip) = self.transfer_tip.replace(",", ".").parse::<f64>() {
+                                    if self.watt_price_usd > 0.0 {
+                                        ui.label(egui::RichText::new(format!("≈ $ {:.4} USD", tip * self.watt_price_usd)).color(egui::Color32::GRAY));
+                                    }
+                                }
+                            }
+
+                            if (response_amt.changed() || tip_changed) && self.transfer_asset == "WATT" {
+                                let safe_amt = self.amount_input.trim().replace(",", ".");
+                                let safe_tip = self.transfer_tip.trim().replace(",", ".");
+                                let amt_val = safe_amt.parse::<f64>().unwrap_or(0.0);
+                                let tip_val = safe_tip.parse::<f64>().unwrap_or(0.0);
+                                
+                                if let Some(keys) = &self.wallet_keys {
+                                    if amt_val > 0.0 {
+                                        let tx = self.tx.clone();
+                                        let keys = keys.clone();
+                                        let from_l2 = self.transfer_from_l2;
+                                        tokio::spawn(async move {
+                                            // 👈 On passe bien le tip_val à la fonction d'estimation
+                                            if let Ok((utxos, size, fee)) = crate::estimate_tx_weight(amt_val, tip_val, &keys.kyber_secret_hex, &keys.watt_address, from_l2, false).await {
+                                                let _ = tx.send(AppMessage::TxWeightEstimated(utxos, size, fee)).await;
+                                            }
+                                        });
+                                    } else {
+                                        self.tx_weight_estimate = None;
+                                    }
+                                }
+                            }
+                        });
+                        
+                        // L'AFFICHAGE DU POIDS ESTIMÉ
+                        if let Some((utxos, size_mb, fee_watt)) = self.tx_weight_estimate { 
+                            ui.add_space(10.0);
+                            let color = if size_mb > 16.0 { egui::Color32::RED } else if size_mb > 8.0 { egui::Color32::from_rgb(255, 165, 0) } else { egui::Color32::GREEN };
+                            egui::Frame::none().fill(item_bg).inner_margin(8.0).rounding(4.0).show(ui, |ui| {
+                                ui.label(egui::RichText::new(format!("⚖ Poids estimé : {:.2} Mo ({} UTXOs utilisés)", size_mb, utxos)).color(color));
+                                // Affichage clair des frais de réseau pour l'utilisateur !
+                                ui.label(egui::RichText::new(format!("💸 Frais de réseau (Taxes + Pourboire) : {:.6} WATT", fee_watt)).color(egui::Color32::from_rgb(0, 240, 255)));
+                                
+                                if size_mb > 16.0 {
+                                    ui.label(egui::RichText::new("⚠ Transaction trop lourde ! Réduisez le montant pour utiliser moins d'UTXOs.").size(10.0).color(egui::Color32::RED));
+                                }
+                            });
+                        }
 
 						ui.add_space(15.0);
 
@@ -1416,6 +1439,7 @@ impl eframe::App for WattcoinApp {
 							} else {
 								// 2. TOUT EST BON, ON RÉCUPÈRE LES VARIABLES PROPRES
 								let amount = self.amount_input.trim().replace(",", ".").parse::<f64>().unwrap();
+                                let tip = self.transfer_tip.trim().replace(",", ".").parse::<f64>().unwrap_or(0.0); // 👈 On capte le pourboire
 								let keys = self.wallet_keys.as_ref().unwrap().clone();
 								let recipient = self.recipient_input.trim().to_string();
 								let tx = self.tx.clone();
@@ -1442,8 +1466,8 @@ impl eframe::App for WattcoinApp {
 											}
 										}
 
-										// On envoie à la vraie adresse finale
-										match crate::send_wattcoin(final_recipient, amount, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, None, None, from_l2, to_l2).await {
+										// On envoie à la vraie adresse finale (avec le tip !)
+										match crate::send_wattcoin(final_recipient, amount, tip, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, None, None, from_l2, to_l2).await {
 											Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 										}
@@ -1724,7 +1748,7 @@ impl eframe::App for WattcoinApp {
 													let htlc_hash = swap.htlc_hash.clone();
 													
 													tokio::spawn(async move {
-														match crate::send_wattcoin(recipient, amount_watt, keys_clone.kyber_secret_hex, keys_clone.watt_address, keys_clone.master_seed_hex, Some(htlc_hash), Some(999_999), false, false).await {
+														match crate::send_wattcoin(recipient, amount_watt, 0.0, keys_clone.kyber_secret_hex, keys_clone.watt_address, keys_clone.master_seed_hex, Some(htlc_hash), Some(999_999), false, false).await {
 															Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 															Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 														}
@@ -2216,7 +2240,7 @@ impl eframe::App for WattcoinApp {
 						ui.add_space(10.0);
 
 						ui.label("Clé publique du destinataire sur le L2 :");
-						let response = ui.add(egui::TextEdit::singleline(&mut self.bridge_receiver_pubkey).hint_text("Clé Lattice ou adresse Kyber"));
+						let response = ui.add(egui::TextEdit::singleline(&mut self.bridge_receiver_pubkey).hint_text("Adresse Kyber"));
 
 						response.context_menu(|ui| {
 							if ui.button("📋 Coller").clicked() {
@@ -2282,7 +2306,7 @@ impl eframe::App for WattcoinApp {
 					egui::Frame::none().fill(panel_bg).inner_margin(20.0).rounding(12.0).show(&mut overlay_ui, |ui| {
 						ui.heading("🏷 Registre des Noms (WNS)");
 						ui.add_space(10.0);
-						ui.label(egui::RichText::new("Achetez un domaine en .watt sur le réseau L2. Utilisez-le pour remplacer votre longue adresse de portefeuille, ou pour déclarer publiquement votre propre serveur de routage (Mixnet).").color(egui::Color32::GRAY));
+						ui.label(egui::RichText::new("Achetez un domaine en .watt ou .chain sur le réseau L2. Utilisez-le pour remplacer votre longue adresse de portefeuille, ou pour déclarer publiquement votre propre serveur de routage (Mixnet).").color(egui::Color32::GRAY));
 						ui.add_space(20.0);
 
 						ui.horizontal(|ui| {
@@ -2389,13 +2413,19 @@ impl eframe::App for WattcoinApp {
 						});
 						ui.add_space(20.0);
 
-						if ui.add_sized([250.0, 40.0], egui::Button::new("🔥 Enregistrer le Domaine")).clicked() {
+						// UX : Le texte du bouton s'adapte selon qu'on fait un Register ou un Update !
+						let btn_text = if self.wns_domain_status.starts_with("👤") {
+							if self.wns_tab == "wallet" { "🔄 Mettre à jour l'Alias" } else { "🔄 Mettre à jour l'IP du Relais" }
+						} else {
+							"🔥 Enregistrer le Domaine"
+						};
+
+						if ui.add_sized([250.0, 40.0], egui::Button::new(btn_text)).clicked() {
 							if let (Some(keys), Ok(fee_watt)) = (&self.wallet_keys, self.wns_bid_amount.parse::<f64>()) {
 								
 								let is_valid_watt = self.wns_domain_input.ends_with(".watt") && self.wns_domain_input.len() > 5;
-                                let is_valid_chain = self.wns_domain_input.ends_with(".chain") && self.wns_domain_input.len() > 6;
+								let is_valid_chain = self.wns_domain_input.ends_with(".chain") && self.wns_domain_input.len() > 6;
 
-								// AJOUT DU MÊME FILTRE ICI
 								if !is_valid_watt && !is_valid_chain {
 									self.sync_message = "❌ Le nom de domaine est invalide (trop court ou extension non gérée).".to_string();
 								} else {
@@ -2404,20 +2434,32 @@ impl eframe::App for WattcoinApp {
 									let keys = keys.clone();
 									let domain = self.wns_domain_input.clone();
 									
-									// Conversion silencieuse : On repasse les WATT en FLAME pour la blockchain (u64)
 									let fee_flames = (fee_watt * 1_000_000_000.0) as u64;
-									
-									let record_data = if self.wns_tab == "wallet" {
-										keys.watt_address.clone()
+
+									let action = if self.wns_domain_status.starts_with("👤") {
+										crate::WnsAction::Update
 									} else {
-										format!("{}|{}", self.wns_ip_input, self.wns_server_pubkey_input)
+										crate::WnsAction::Register
 									};
+									
+									// On clone les champs spécifiques pour les injecter dans le thread
+									let wns_tab = self.wns_tab.clone();
+									let ip_input = self.wns_ip_input.clone();
+									let server_pubkey = self.wns_server_pubkey_input.clone();
 
 									tokio::spawn(async move {
-										// On envoie bien fee_flames au réseau
-										match crate::register_wns_domain(domain, record_data, fee_flames, keys).await {
-											Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
-											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+										if wns_tab == "wallet" {
+											// Aiguillage ALIAS
+											match crate::register_wns_alias(domain, keys.watt_address.clone(), fee_flames, keys, action).await {
+												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
+												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+											}
+										} else {
+											// Aiguillage SERVEUR
+											match crate::register_wns_relay(domain, ip_input, server_pubkey, fee_flames, keys, action).await {
+												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
+												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+											}
 										}
 									});
 								}

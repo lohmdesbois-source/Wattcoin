@@ -39,36 +39,33 @@ impl DarkpoolState {
 
     /// Filtre le mempool : on jette les doubles dépenses, on valide les frais
     pub fn process_mempool(&mut self) -> (u64, usize, u64) {
-        self.block_index += 1; 
-        let txs = std::mem::take(&mut self.mempool);
-        let mut valid_tx_count = 0;
-        let mut total_fees = 0u64;
+		self.block_index += 1; 
+		let txs = std::mem::take(&mut self.mempool);
+		let mut valid_tx_count = 0;
+		let mut total_fees = 0u64;
 
-        for tx in txs {
-            let mut double_spend = false;
-            
-            // On vérifie que la signature en anneau n'a pas déjà été utilisée
-            for input in &tx.inputs {
-                if self.spent_key_images.contains(&input.mpc_ring.key_image) {
-                    double_spend = true;
-                    break;
-                }
-            }
+		for tx in txs {
+			let mut double_spend = false;
+			let mut key_image = String::new();
+			
+			if let Some(sig) = &tx.wots_signature {
+				key_image = hex::encode(&sig.public_key);
+				if self.spent_key_images.contains(&key_image) {
+					double_spend = true;
+				}
+			}
 
-            if !double_spend {
-                // Validation : On "brûle" les Key Images pour toujours
-                for input in &tx.inputs {
-                    self.spent_key_images.insert(input.mpc_ring.key_image.clone());
-                }
-                total_fees += tx.fee;
-                valid_tx_count += 1;
-            } else {
-                println!("⚠️ [DARKPOOL] Tentative de double dépense bloquée !");
-            }
-        }
+			if !double_spend && !key_image.is_empty() {
+				self.spent_key_images.insert(key_image);
+				total_fees += tx.fee;
+				valid_tx_count += 1;
+			} else {
+				println!("⚠️ [DARKPOOL] Tentative de double dépense bloquée ou signature manquante !");
+			}
+		}
 
-        (self.block_index, valid_tx_count, total_fees)
-    }
+		(self.block_index, valid_tx_count, total_fees)
+	}
 
     /// La racine d'état n'est plus le solde des gens, mais le HASH des Key Images brûlés !
     pub fn compute_state_root(&self) -> String {

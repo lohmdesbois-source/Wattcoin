@@ -15,25 +15,31 @@ pub async fn start_api_server(port: u16, state: SharedDarkpoolState) {
         .and(state_filter.clone())
         .map(|tx: Transaction, state: SharedDarkpoolState| {
             
-            // 1. Le Séquenceur utilise le Tribunal Quantique du L1 pour valider l'anonymat !
-            if !tx.is_valid() {
-                return warp::reply::with_status(
-                    warp::reply::json(&serde_json::json!({"error": "Preuve Lattice ou Ring Signature Invalide"})),
-                    warp::http::StatusCode::BAD_REQUEST,
-                );
-            }
+            // 1. Le Séquenceur utilise la validation native du L1 (LWE Homomorphe + WOTS+)
+			if !tx.is_valid() {
+				return warp::reply::with_status(
+					warp::reply::json(&serde_json::json!({"error": "Transaction invalide (Maths LWE ou Signature WOTS+ corrompue)"})),
+					warp::http::StatusCode::BAD_REQUEST,
+				);
+			}
 
             let mut state_guard = state.lock().unwrap();
             
             // 2. Anti-double dépense immédiat dans le Mempool
-            for input in &tx.inputs {
-                if state_guard.spent_key_images.contains(&input.mpc_ring.key_image) {
-                    return warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error": "Double Dépense détectée !"})),
-                        warp::http::StatusCode::CONFLICT,
-                    );
-                }
-            }
+			if let Some(sig) = &tx.wots_signature {
+				let key_image = hex::encode(&sig.public_key);
+				if state_guard.spent_key_images.contains(&key_image) {
+					return warp::reply::with_status(
+						warp::reply::json(&serde_json::json!({"error": "Double Dépense détectée !"})),
+						warp::http::StatusCode::CONFLICT,
+					);
+				}
+			} else {
+				return warp::reply::with_status(
+					warp::reply::json(&serde_json::json!({"error": "Signature manquante"})),
+					warp::http::StatusCode::BAD_REQUEST,
+				);
+			}
 
             // 3. Ajout au Mempool
             state_guard.mempool.push(tx);

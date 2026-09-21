@@ -1,17 +1,62 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
-use sha2::Digest;
 use crate::block::Block;
 use crate::blockchain::Blockchain;
 use crate::transaction::{Transaction, TransactionType};
 use crate::api::{Order, SharedPool};
 use crate::mixnet::OnionPacket;
+// ===================================================================
+// ANNUAIRE WNS CENTRALISÉ (Partagé entre le Nœud L1 et le Wallet)
+// ===================================================================
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex as AsyncMutex;
+
+pub const WNS_RESOLVERS: &[&str] = &[
+    "http://127.0.0.1:8200", // En local on tape direct sur le port 8200 !
+    // "http://80.78.26.243/wns", // Pour la PROD plus tard
+];
+
+pub const NETWORK_SEEDS: &[&str] = &[
+    "seed.watt", // Le nom de domaine fondateur par défaut
+];
+
+pub static WNS_CACHE: Lazy<AsyncMutex<HashMap<String, (String, String)>>> = Lazy::new(|| AsyncMutex::new(HashMap::new()));
+
+#[derive(serde::Deserialize)]
+pub struct WnsDirectory {
+    pub domains: HashMap<String, String>,
+    pub owners: HashMap<String, String>,
+}
+
+pub async fn sync_wns_directory(is_local_dev: bool) {
+    let resolver = if is_local_dev {
+        "http://127.0.0.1:8200"
+    } else {
+        "http://80.78.26.243/wns"
+    };
+
+    let url = format!("{}/directory", resolver);
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    
+    if let Ok(res) = client.get(&url).send().await {
+        if let Ok(directory) = res.json::<WnsDirectory>().await {
+            let mut cache = WNS_CACHE.lock().await;
+            cache.clear();
+            for (domain, record) in directory.domains {
+                if let Some(owner) = directory.owners.get(&domain) {
+                    cache.insert(domain, (record, owner.clone()));
+                }
+            }
+            println!("📖 [WNS] Annuaire téléchargé ({} domaines) depuis {}", cache.len(), resolver);
+        }
+    }
+}
 
 
 
@@ -32,13 +77,30 @@ pub enum P2PMessage {
     MempoolSync { txs: Vec<Transaction> },
 	BroadcastMicroBlock { micro_block: crate::block::MicroBlock },
 	RelayOnion { packet: OnionPacket },
+	// POUR L'ANNUAIRE !
+    SharePeers { peers: Vec<String> },
 }
 
 async fn read_p2p_message<R: AsyncBufReadExt + std::marker::Unpin>(reader: &mut R) -> Option<P2PMessage> {
     let mut line = String::new();
-    match reader.read_line(&mut line).await {
-        Ok(0) => None,
-        Ok(_) => serde_json::from_str::<P2PMessage>(&line.trim()).ok(),
+    
+    // Limite stricte à 3 Mo (3 * 1024 * 1024 octets)
+    const MAX_MESSAGE_SIZE: u64 = 3_145_728; 
+    
+    // On enveloppe le lecteur pour qu'il refuse de lire au-delà de la limite
+    let mut limited_reader = reader.take(MAX_MESSAGE_SIZE);
+    
+    match limited_reader.read_line(&mut line).await {
+        Ok(0) => None, // Déconnexion propre ou fin de flux
+        Ok(n) => {
+            // Si on a atteint la limite stricte sans trouver de saut de ligne final, c'est une attaque
+            if n as u64 == MAX_MESSAGE_SIZE && !line.ends_with('\n') {
+                println!("🚨 [SÉCURITÉ] Flux TCP ignoré : Message P2P trop volumineux (Attaque OOM bloquée).");
+                return None; 
+            }
+            
+            serde_json::from_str::<P2PMessage>(line.trim()).ok()
+        },
         Err(_) => None,
     }
 }
@@ -104,6 +166,15 @@ pub fn start_peer_connection(
             current_height: my_height, 
             sender_port: my_port.clone() 
         }).await;
+		
+		// PEX : On donne notre carnet d'adresses au nouveau venu
+        let my_known_peers: Vec<String> = {
+            let kp = known_peers.lock().unwrap();
+            kp.iter().cloned().collect()
+        };
+        if !my_known_peers.is_empty() {
+            send_message_to_channel(&tx, P2PMessage::SharePeers { peers: my_known_peers }).await;
+        }
 
         // La boucle d'écoute existante...
         while let Some(message) = read_p2p_message(&mut reader).await {
@@ -588,160 +659,59 @@ pub fn start_peer_connection(
                     let actual_peer_id_clone = actual_peer_id.clone();
 
                     tokio::spawn(async move {
-                        let mut parent_l1_block = None;
-                        
-                        // BOUCLIER DE LATENCE ÉTENDU À 60 SECONDES !
-                        // 120 boucles de 500ms = laisse largement le temps au L1 d'être vérifié (30s)
+                        // 1. BOUCLIER DE LATENCE : On attend l'arrivée du parent L1 si besoin (Max 60 sec)
+                        let mut parent_l1_ready = false;
                         for _ in 0..120 {
                             {
                                 let chain = bc_clone.lock().unwrap();
                                 for i in (0..=chain.current_height).rev().take(10) {
                                     if let Some(b) = chain.get_block_by_height(i) {
                                         if b.header.hash == micro_block.l1_parent_hash {
-                                            parent_l1_block = Some(b);
+                                            parent_l1_ready = true;
                                             break;
                                         }
                                     }
                                 }
                             }
-                            if parent_l1_block.is_some() { break; }
+                            if parent_l1_ready { break; }
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         }
 
-                        if let Some(parent_block) = parent_l1_block {
-                            let current_l2_root = parent_block.header.l2_root.clone();
+                        if !parent_l1_ready {
+                            println!("⚠️ [L2] Microbloc orphelin rejeté (Parent L1 '{}' inconnu).", micro_block.l1_parent_hash);
+                            return;
+                        }
 
-                            if micro_block.merkle_proof.len() == 128 {
-                                let mut calculated_root = micro_block.merkle_proof[0].clone();
-                                for i in 1..128 {
-									let mut hasher = sha2::Sha512::new();
-									hasher.update(calculated_root.as_bytes());
-									hasher.update(micro_block.merkle_proof[i].as_bytes());
-									calculated_root = hex::encode(hasher.finalize());
-								}
-                                                
-                                if calculated_root == current_l2_root && micro_block.merkle_proof[micro_block.key_index as usize] == micro_block.sequencer_pubkey {
-                                    
-                                    let mb_data = format!("{}{}{}{}", micro_block.l1_parent_hash, micro_block.micro_index, micro_block.key_index, micro_block.timestamp);
-                                    let mut hasher = sha2::Sha512::new();
-                                    use sha2::Digest;
-                                    hasher.update(mb_data.as_bytes());
-                                    let mut hash_arr = [0u8; 64];
-                                    hash_arr.copy_from_slice(&hasher.finalize());
+                        // 2. LE TRIBUNAL CONSENSUS L2 (Dans un thread dédié pour ne pas bloquer le P2P)
+                        let mb_clone = micro_block.clone();
+                        let validation_result = tokio::task::spawn_blocking(move || {
+                            let mut chain = bc_clone.lock().unwrap();
+                            chain.validate_and_add_microblock(mb_clone)
+                        }).await.unwrap();
 
-									let mut hash_arr_32 = [0u8; 32];
-									hash_arr_32.copy_from_slice(&hash_arr[0..32]);
-
-									if wots::Wots::verify(&micro_block.sequencer_sig, &hash_arr_32) {
-                                                        
-                                        if micro_block.transactions.is_empty() || micro_block.transactions[0].tx_type != TransactionType::MicroCoinbase {
-                                            println!("❌ [L2 REJETÉ] Le séquenceur a oublié la MicroCoinbase !");
-                                            return;
-                                        }
-                                        let expected_fees = (micro_block.transactions.len() - 1) as u64 * 100;
-                                        let actual_fees: u64 = micro_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
-                                                        
-                                        if actual_fees > expected_fees {
-                                            println!("❌ [L2 REJETÉ] Le séquenceur tente d'imprimer de l'argent !");
-                                            return;
-                                        }
-
-                                        // ANTI-DOUBLON GOSSIP (Silencieux)
-                                        // Vérifie si on a déjà traité ce MicroBloc pour éviter de crier à la fraude
-                                        let mut is_duplicate = false;
-                                        {
-                                            let chain_lock = bc_clone.lock().unwrap();
-                                            for tx in micro_block.transactions.iter().skip(1) {
-                                                if let Some(sig) = &tx.wots_signature {
-													let ki = hex::encode(&sig.public_key);
-													if chain_lock.spent_key_images.contains(&ki) {
-														is_duplicate = true;
-														break;
-													}
-												}
-                                                if is_duplicate { break; }
-                                            }
-                                        }
-                                        if is_duplicate {
-                                            return; // On l'a déjà, on l'ignore silencieusement.
-                                        }
-
-                                        // LA CRYPTOGRAPHIE L2 HORS DU MUTEX !
-                                        // On vérifie les signatures Lattice sur un thread CPU dédié sans bloquer le reste !
-                                        let mb_clone_for_math = micro_block.clone();
-                                        let math_valid = tokio::task::spawn_blocking(move || {
-                                            let mut all_valid = true;
-                                            for tx in mb_clone_for_math.transactions.iter().skip(1) {
-                                                if !tx.is_valid() { 
-                                                    all_valid = false; 
-                                                    break; 
-                                                }
-                                            }
-                                            all_valid
-                                        }).await.unwrap();
-
-                                        if !math_valid {
-                                            println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux (Crypto invalide) ignoré.");
-                                            return;
-                                        }
-
-                                        // 1.5 TRIBUNAL DES TRANSACTIONS L2 (Double Dépense Intra-bloc)
-                                        let mut all_valid = true;
-                                        let mut temp_spent = std::collections::HashSet::new();
-
-                                        {
-                                            let chain_lock = bc_clone.lock().unwrap(); 
-                                            
-                                            for tx in micro_block.transactions.iter().skip(1) {
-												if let Some(sig) = &tx.wots_signature {
-													let ki = hex::encode(&sig.public_key);
-													if chain_lock.spent_key_images.contains(&ki) || temp_spent.contains(&ki) {
-														all_valid = false; // 👈 Déclare le bloc invalide
-														break;             // 👈 Sort de la boucle 'for' immédiatement
-													}
-													temp_spent.insert(ki);
-												}
-											}
-                                        }
-
-                                        if !all_valid {
-                                            println!("🚨 [SÉCURITÉ L2] MicroBloc frauduleux (Double Dépense) ignoré.");
-                                            return;
-                                        }
-
-                                        println!("⚡ [L2 VERIFIÉ] MicroBloc {}/128 sauvegardé !", micro_block.micro_index);
-                                        
-                                        // 2. SAUVEGARDE L1/L2 UNIFIÉE
-                                        {
-                                            let mut chain = bc_clone.lock().unwrap();
-                                            for tx in &micro_block.transactions {
-                                                if tx.tx_type != TransactionType::MicroCoinbase {
-                                                    if let Some(sig) = &tx.wots_signature {
-														chain.spent_key_images.insert(hex::encode(&sig.public_key));
-													}
-                                                }
-                                            }
-                                            let _ = chain.push_microblock(&micro_block);
-                                        }
-
-                                        // 3. NETTOYAGE DU MEMPOOL
-                                        {
-                                            let mut mp = mp_clone.lock().unwrap();
-                                            mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
-                                        }
-                                        
-                                        let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };
-                                        let mut json_str = serde_json::to_string(&envelope).unwrap();
-                                        json_str.push('\n');
-                                        let ap = ap_clone.lock().unwrap().clone();
-                                        for (peer_id, sender) in ap.iter() {
-                                            if peer_id != &actual_peer_id_clone { let _ = sender.try_send(json_str.clone()); }
-                                        }
+                        match validation_result {
+                            Ok(()) => {
+                                // NETTOYAGE DU MEMPOOL
+                                {
+                                    let mut mp = mp_clone.lock().unwrap();
+                                    mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
+                                }
+                                
+                                // GOSSIP P2P : On relaie aux autres !
+                                let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };
+                                let mut json_str = serde_json::to_string(&envelope).unwrap();
+                                json_str.push('\n');
+                                let ap = ap_clone.lock().unwrap().clone();
+                                for (peer_id, sender) in ap.iter() {
+                                    if peer_id != &actual_peer_id_clone { 
+                                        let _ = sender.try_send(json_str.clone()); 
                                     }
                                 }
+                            },
+                            Err(e) => {
+                                // Le Tribunal L2 a parlé. Le bloc est une fraude.
+                                println!("{}", e); 
                             }
-                        } else {
-                            println!("⚠️ [L2] Microbloc orphelin reçu (Hash L1 '{}' inconnu ou non validé à temps). Rejeté.", micro_block.l1_parent_hash);
                         }
                     });
                 },
@@ -772,6 +742,26 @@ pub fn start_peer_connection(
                             }
                         },
                         Err(e) => { println!("❌ [MIXNET] Rejet du paquet en oignon : {}", e); }
+                    }
+                },
+				
+				P2PMessage::SharePeers { peers } => {
+                    let mut kp = known_peers.lock().unwrap();
+                    let mut new_found = 0;
+                    for peer in peers {
+                        // On n'ajoute pas soi-même ni des IP mortes
+                        if !kp.contains(&peer) && peer.contains(':') {
+                            kp.insert(peer);
+                            new_found += 1;
+                        }
+                    }
+                    if new_found > 0 {
+                        println!("🕸️ [PEX] Annuaire mis à jour : {} nouveaux pairs découverts !", new_found);
+                        // On sauvegarde sur le disque immédiatement !
+                        let db_dir = format!("{}/.wattcoin", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
+                        let peers_file = format!("{}/known_peers.json", db_dir);
+                        let peers_list: Vec<String> = kp.iter().cloned().collect();
+                        let _ = std::fs::write(&peers_file, serde_json::to_string(&peers_list).unwrap_or_default());
                     }
                 },
                 
@@ -825,4 +815,32 @@ pub async fn broadcast_micro_block(micro_block: crate::block::MicroBlock, active
     for (_peer_id, sender) in peers.iter() {
         let _ = sender.try_send(json_str.clone());
     }
+}
+
+pub fn setup_upnp(port: u16) {
+    std::thread::spawn(move || {
+        println!("🔌 [UPnP] Tentative de communication avec la box internet...");
+        match igd::search_gateway(Default::default()) {
+            Ok(gateway) => {
+                // Astuce pour trouver notre propre IP locale sur le réseau
+                let local_addr = match std::net::UdpSocket::bind("0.0.0.0:0") {
+                    Ok(s) => {
+                        if s.connect("8.8.8.8:53").is_ok() {
+                            s.local_addr().ok().map(|a| a.ip())
+                        } else { None }
+                    },
+                    Err(_) => None,
+                };
+
+                if let Some(std::net::IpAddr::V4(ipv4)) = local_addr {
+                    let local_socket = std::net::SocketAddrV4::new(ipv4, port);
+                    match gateway.add_port(igd::PortMappingProtocol::TCP, port, local_socket, 0, "Wattcoin Node") {
+                        Ok(_) => println!("✅ [UPnP] Port TCP/{} ouvert automatiquement sur la box ! Votre nœud est joignable de l'extérieur.", port),
+                        Err(e) => println!("⚠️ [UPnP] La box a refusé d'ouvrir le port (Erreur: {:?}). Les autres mineurs ne pourront pas initier la connexion vers vous.", e),
+                    }
+                }
+            },
+            Err(e) => println!("⚠️ [UPnP] Routeur introuvable ou UPnP désactivé ({:?}).", e),
+        }
+    });
 }

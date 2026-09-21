@@ -86,7 +86,7 @@ async fn main() {
         start_api_server(l2_api_port, state_clone, api_peers).await; 
     });
 
-    // 💡  VRAI WOTS+
+    // VRAI WOTS+
     let hot_wallet = match fs::read_to_string("sequencer_keys.json").and_then(|data| serde_json::from_str::<SequencerKeys>(&data).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))) {
         Ok(keys) => keys,
         Err(_) => {
@@ -251,19 +251,26 @@ async fn main() {
             });
         }
 
-        let anchor_tx = Transaction {
-            tx_type: TransactionType::L2Anchor {
-                l2_name: l2_name.clone(),
-                state_root: state_root.clone(),
-                sequencer_signature: signature_hex.clone(), // Stocké en Hexadécimal pur ou binaire bincode
-                withdrawals: l1_withdrawals, 
-            },
-            inputs: vec![],
-            outputs: vec![],
-            fee: 1000,
-            wots_signature: None,
-            public_key: pubkey.clone(),
-        };
+        let mut anchor_tx = Transaction {
+			tx_type: TransactionType::L2Anchor {
+				l2_name: l2_name.clone(),
+				state_root: state_root.clone(),
+				sequencer_signature: signature_hex.clone(), 
+				withdrawals: l1_withdrawals, 
+			},
+			inputs: vec![],
+			outputs: vec![],
+			fee: 0, // 👈 Sera mis à jour juste en dessous
+			wots_signature: None,
+			public_key: pubkey.clone(),
+		};
+
+		// CALCUL DYNAMIQUE AU POIDS (Copie de la règle L1)
+		let tx_weight_bytes = bincode::serialized_size(&anchor_tx).unwrap_or(0) as usize;
+		let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+		let dynamic_fee = std::cmp::max(1000, weight_kb * 20); // 20 Flames/Ko pour l'interop L1
+		
+		anchor_tx.fee = dynamic_fee; // On applique le vrai tarif
 
         let tx_bytes = bincode::serialize(&anchor_tx).expect("Erreur sérialisation L2Anchor");
         let _ = client.post(&format!("{}/send_tx", l1_node_url))

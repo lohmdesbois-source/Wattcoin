@@ -53,7 +53,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "soc
 pqc_kyber = "0.7.1"
 arti-client = { version = "0.22.0", default-features = false, features = ["tokio", "rustls", "onion-service-client"] }
 tor-rtcompat = { version = "0.22.0", default-features = false, features = ["tokio", "rustls"] }
-once_cell = "1.19.0"
+once_cell = "1.21.4"
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1"

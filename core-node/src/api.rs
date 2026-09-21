@@ -9,12 +9,9 @@ use std::str::FromStr;
 use sha2::Digest;
 use std::collections::HashSet;
 
-
-
-
 pub type SharedPool = Arc<Mutex<Vec<Order>>>;
 
-// 💡 Devenu 'pub' pour que le mineur (main.rs) et le validateur puissent le mettre à jour
+// Devenu 'pub' pour que le mineur (main.rs) et le validateur puissent le mettre à jour
 pub static LAST_PRICE_SATS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,16 +34,13 @@ pub async fn start_api_server(
     chain: Arc<Mutex<Blockchain>>, 
     dex_pool: SharedPool,
     active_peers: crate::network::ActivePeers,
-    l2_db_file: String,
-	node_kyber_secret: String
+    node_kyber_secret: String
 ) {
     // PURISME CYPHERPUNK : On lit le VRAI prix directement depuis le marbre de la blockchain !
     {
-
 		let chain_lock = chain.lock().unwrap();
         let mut found_price = false;
         
-        // On remonte le temps depuis le bloc le plus récent
         for i in (0..=chain_lock.current_height).rev() {
             if let Some(block) = chain_lock.get_block_by_height(i) {
                 for tx in block.transactions.iter().rev() {
@@ -67,13 +61,95 @@ pub async fn start_api_server(
     let chain_filter = warp::any().map(move || Arc::clone(&chain));
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
-	let l2_file_filter = warp::any().map(move || l2_db_file.clone());
 	
-	// ===================== TRACKING HTLC BTC (pour atomic swap) =====================
 	let btc_htlcs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 	let btc_htlc_set_filter = warp::any().map(move || Arc::clone(&btc_htlcs));
 
-    // LECTURE ON-CHAIN DES SWAPS : On lit l'historique des blocs !
+    // ===================================================================
+    // Route pour que les Wallets connaissent la tarification !
+    // ===================================================================
+    let get_fee_schedule = warp::path("fee_schedule")
+        .and(warp::get())
+        .map(|| {
+            warp::reply::json(&serde_json::json!({
+                "l1_min_fee_flames": 1000,
+                "l1_fee_per_kb_flames": 20,
+                "l2_min_fee_flames": 100,
+                "l2_fee_per_kb_flames": 2, // Le L2 facture au poids maintenant !
+                "description": "Les transactions paient au poids. Le L2 est 10x moins cher que le L1."
+            }))
+        });
+		
+	// ===================================================================
+    // LE THERMOMÈTRE DU RÉSEAU : Estimation des frais en temps réel
+    // ===================================================================
+    let get_fee_estimate = warp::path("fee_estimate")
+        .and(warp::get())
+        .and(mempool_filter.clone())
+        .map(|mempool: Arc<Mutex<Vec<Transaction>>>| {
+            let pool = mempool.lock().unwrap();
+            
+            let mut fee_rates = Vec::new();
+            
+            // 1. On extrait la rentabilité de chaque transaction
+            for tx in pool.iter() {
+                let is_feeless = matches!(tx.tx_type, 
+                    crate::transaction::TransactionType::Coinbase | 
+                    crate::transaction::TransactionType::MicroCoinbase |
+                    crate::transaction::TransactionType::MiningShare { .. } | 
+                    crate::transaction::TransactionType::DexSettlement { .. } |
+                    crate::transaction::TransactionType::LotteryPayout { .. } | 
+                    crate::transaction::TransactionType::HTLCClaim { .. } | 
+                    crate::transaction::TransactionType::HTLCRefund { .. }
+                );
+                
+                if !is_feeless {
+                    let tx_weight_bytes = bincode::serialized_size(tx).unwrap_or(1) as usize;
+                    let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+                    let weight_kb = if weight_kb == 0 { 1 } else { weight_kb };
+                    
+                    let rate = tx.fee / weight_kb;
+                    fee_rates.push((rate, tx_weight_bytes));
+                }
+            }
+            
+            // 2. On trie du plus cher au moins cher (Libre Marché)
+            fee_rates.sort_by(|a, b| b.0.cmp(&a.0));
+            
+            let mut fast_rate = 20;   // Tarif de base L1
+            let mut medium_rate = 20;
+            let mut slow_rate = 20;
+            let mut cumulative_size = 0;
+            
+            // 3. On définit les paliers dans le bloc de 32 Mo
+            for (rate, size) in fee_rates {
+                cumulative_size += size;
+                
+                if cumulative_size <= 10 * 1024 * 1024 {
+                    fast_rate = rate; // Le prix pour être dans les 10 premiers Mo
+                }
+                if cumulative_size <= 25 * 1024 * 1024 {
+                    medium_rate = rate; // Le prix pour être dans les 25 premiers Mo
+                }
+                if cumulative_size <= 32 * 1024 * 1024 {
+                    slow_rate = rate; // Le prix pour passer de justesse
+                }
+            }
+            
+            // Bouclier : on ne peut jamais descendre sous le tarif de base
+            fast_rate = std::cmp::max(fast_rate, 20);
+            medium_rate = std::cmp::max(medium_rate, 20);
+            slow_rate = std::cmp::max(slow_rate, 20);
+            
+            warp::reply::json(&serde_json::json!({
+                "fast_flames_per_kb": fast_rate,
+                "medium_flames_per_kb": medium_rate,
+                "slow_flames_per_kb": slow_rate,
+                "mempool_size_bytes": cumulative_size,
+                "is_congested": cumulative_size > 32 * 1024 * 1024
+            }))
+        });
+
     let get_swaps = warp::path("swaps")
 		.and(warp::get())
 		.and(chain_filter.clone())
@@ -82,7 +158,6 @@ pub async fn start_api_server(
 			let mut active_swaps = Vec::new();
 			let mut claimed_hashes = std::collections::HashSet::new();
 
-			// 1. On détecte tous les HTLC déjà claimés ou remboursés
 			for i in 0..=chain_lock.current_height {
                 if let Some(block) = chain_lock.get_block_by_height(i) {
                     for tx in &block.transactions {
@@ -98,7 +173,6 @@ pub async fn start_api_server(
                 }
 			}
 
-			// 2. On récupère les swaps en cours (DexSettlement + HTLCLock non claimés)
             let start = chain_lock.current_height.saturating_sub(200);
 			for i in (start..=chain_lock.current_height).rev() {
                 if let Some(block) = chain_lock.get_block_by_height(i) {
@@ -117,27 +191,22 @@ pub async fn start_api_server(
 			warp::reply::json(&active_swaps)
 		});
 	
-	let secret_for_onion = node_kyber_secret.clone(); // Clonage pour la route
+	let secret_for_onion = node_kyber_secret.clone(); 
 
-    // ===================================================================
-    // ROUTE MIXNET : La porte d'entrée du réseau en Oignon
-    // ===================================================================
     let relay_onion = warp::path!("relay_onion")
         .and(warp::post())
-        .and(warp::body::content_length_limit(1024 * 1024 * 32)) // 32 Mo max
-        .and(warp::body::bytes()) // 👈 ON LIT LE BINAIRE PUR !
+        .and(warp::body::content_length_limit(1024 * 1024 * 32)) 
+        .and(warp::body::bytes()) 
         .then(move |body_bytes: warp::hyper::body::Bytes| {
             let secret_for_onion = secret_for_onion.clone();
             async move {
                 use warp::Reply;
                 
-                // 1. Décodage binaire
                 let packet: crate::mixnet::OnionPacket = match bincode::deserialize(&body_bytes) {
                     Ok(p) => p,
                     Err(e) => return warp::reply::with_status(warp::reply::json(&format!("❌ Format oignon binaire invalide: {}", e)), warp::http::StatusCode::BAD_REQUEST).into_response(),
                 };
 
-                // 2. Épluchage
                 match packet.peel(&secret_for_onion) {
                     Ok(hop_payload) => {
                         if hop_payload.next_hop_address.starts_with("http") {
@@ -147,9 +216,8 @@ pub async fn start_api_server(
                             let payload = hop_payload.inner_data.clone();
                             
                             let client = reqwest::Client::new();
-                            // 💡 ON ATTEND LE RESULTAT (Fini le mensonge du "OK" instantané)
                             match client.post(&target_url)
-                                .header("Content-Type", "application/octet-stream") // C'est du binaire !
+                                .header("Content-Type", "application/octet-stream") 
                                 .body(payload)
                                 .send()
                                 .await {
@@ -193,7 +261,7 @@ pub async fn start_api_server(
 	let send_tx = warp::post()
 		.and(warp::path("send_tx"))
 		.and(warp::body::content_length_limit(1024 * 1024 * 32))
-        .and(warp::body::bytes()) // ON LIT LE BINAIRE PUR !
+        .and(warp::body::bytes()) 
         .and(mempool_filter.clone())
         .and(chain_filter.clone()) 
         .and(active_peers_filter.clone()) 
@@ -201,7 +269,6 @@ pub async fn start_api_server(
 										 chain_arc: Arc<Mutex<Blockchain>>, 
 										 active_peers: crate::network::ActivePeers| {
             
-            // DÉCODAGE BINAIRE ULTRA RAPIDE !
             let tx: Transaction = match bincode::deserialize(&body_bytes) {
                 Ok(t) => t,
                 Err(e) => {
@@ -210,7 +277,6 @@ pub async fn start_api_server(
                 }
             };
             
-            // PATCH ANTI-HACKING dans api.rs : Bloque TOUTES les transactions systèmes depuis l'API
 			if matches!(tx.tx_type, crate::transaction::TransactionType::Coinbase 
 								  | crate::transaction::TransactionType::MicroCoinbase
 								  | crate::transaction::TransactionType::MiningShare { .. }
@@ -220,11 +286,16 @@ pub async fn start_api_server(
 				return warp::reply::with_status(warp::reply::json(&err_msg), warp::http::StatusCode::BAD_REQUEST);
 			}
 			
-			// ROUTAGE DOMAINE : Est-ce une transaction ciblant le L2 ?
-			let is_l2_tx = tx.outputs.iter().any(|out| out.stealth_address.starts_with("L2_WATT_"));
-
-			// Les frais réduits s'appliquent dès qu'on interagit avec le L2
-			let min_fee = if is_l2_tx { 100 } else { 1000 };
+            // ====================================================================
+			// LE TRIBUNAL ÉCONOMIQUE : Calcul dynamique des frais (Poids / Ko)
+			// ====================================================================
+			let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
+            let is_l1_interop = matches!(tx.tx_type, 
+                crate::transaction::TransactionType::L2Anchor { .. } |
+                crate::transaction::TransactionType::L2BridgeLock { .. } |
+                crate::transaction::TransactionType::L2Stake { .. } |
+                crate::transaction::TransactionType::L2Unstake { .. }
+            );
 
 			let is_feeless = matches!(tx.tx_type, 
 				crate::transaction::TransactionType::Coinbase | 
@@ -232,8 +303,19 @@ pub async fn start_api_server(
 				crate::transaction::TransactionType::HTLCRefund { .. }
 			);
 
+            let tx_weight_bytes = bincode::serialized_size(&tx).unwrap_or(0);
+            let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+
+            // Calcul du prix : L2 Interne = 2 Flames/Ko (min 100). L1 ou Interop = 20 Flames/Ko (min 1000).
+            let min_fee = if is_pure_l2 && !is_l1_interop {
+                std::cmp::max(100, weight_kb * 2) 
+            } else {
+                std::cmp::max(1000, weight_kb * 20)
+            };
+
 			if tx.fee < min_fee && !is_feeless {
-				let err_msg = format!("❌ Frais de réseau insuffisants (Min: {} Flames)", min_fee);
+				let err_msg = format!("❌ Frais de réseau insuffisants (Poids: {} Ko. Min requis: {} Flames)", tx_weight_bytes / 1024, min_fee);
+                println!("{}", err_msg);
 				return warp::reply::with_status(warp::reply::json(&err_msg), warp::http::StatusCode::BAD_REQUEST);
 			}
 
@@ -253,11 +335,10 @@ pub async fn start_api_server(
                 let pool_lock = mempool.lock().unwrap();
 
                 if let Some(sig) = &tx.wots_signature {
-					let ki = hex::encode(&sig.public_key); // 👈 L'empreinte WOTS+ devient le nullifier !
+					let ki = hex::encode(&sig.public_key); 
 					if chain_lock.spent_key_images.contains(&ki) { 
 						return warp::reply::with_status(warp::reply::json(&"❌ Fonds déjà dépensés"), warp::http::StatusCode::BAD_REQUEST); 
 					}
-					// Vérifie si la transaction est déjà en attente dans le mempool
 					if pool_lock.iter().any(|m_tx| {
 						if let Some(m_sig) = &m_tx.wots_signature {
 							hex::encode(&m_sig.public_key) == ki
@@ -295,35 +376,26 @@ pub async fn start_api_server(
             let tx_clone = tx.clone();
             tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
             
-			// AFFICHAGE PROPRE (Sans spammer la console avec les signatures)
             let tx_info = match &tx.tx_type {
                 TransactionType::L2Anchor { l2_name, state_root, .. } => {
                     format!("L2Anchor {{ l2_name: \"{}\", state_root: \"{}...\" }}", l2_name, &state_root[0..15])
                 },
                 _ => format!("{:?}", tx.tx_type),
             };
-            println!("📥 [MEMPOOL] Transaction acceptée et propagée (type: {})", tx_info);
+            println!("📥 [MEMPOOL] Transaction acceptée et propagée (type: {}, Frais: {} Flames)", tx_info, tx.fee);
             warp::reply::with_status(warp::reply::json(&"✅ TX acceptée par le réseau"), warp::http::StatusCode::OK)
         });
     
-    // route all_transactions du wallet
     let get_all_txs = warp::get()
         .and(warp::path("all_transactions"))
         .and(chain_filter.clone())
-        .and(l2_file_filter.clone())
-        .and_then(|chain_arc: Arc<Mutex<Blockchain>>, l2_file: String| async move {
+        .map(|chain_arc: Arc<Mutex<Blockchain>>| {
             let mut enriched_txs = Vec::new();
-            
-            // Un petit dictionnaire pour retrouver la hauteur L1 à partir de son hash
             let mut hash_to_height = std::collections::HashMap::new();
 
-            // =========================================================
-            // SCOPE SYNCHRONE : On lit la RAM et on relâche le verrou
-            // =========================================================
             {
                 let chain_lock = chain_arc.lock().unwrap();
                 
-                // 1. Lecture de la chaîne L1 (en RAM)
                 for i in 0..=chain_lock.current_height {
                     if let Some(block) = chain_lock.get_block_by_height(i) {
                         hash_to_height.insert(block.header.hash.clone(), block.header.index);
@@ -337,41 +409,35 @@ pub async fn start_api_server(
                         }
                     }
                 }
-            } // Le `chain_lock` est détruit exactement ici ! Le Mutex est libre.
 
-            // =========================================================
-            // SCOPE ASYNCHRONE : On lit le disque en toute sécurité
-            // =========================================================
-            // 2. Lecture de la chaîne L2 (sur le Disque Dur)
-            if let Ok(data) = tokio::fs::read_to_string(&l2_file).await {
-                if let Ok(l2_chain) = serde_json::from_str::<Vec<crate::block::MicroBlock>>(&data) {
-                    for mb in l2_chain {
-                        // On retrouve l'index du bloc L1 parent
-                        let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
-                        
-                        for tx in &mb.transactions {
-                            enriched_txs.push(serde_json::json!({
-                                "height": parent_height,
-                                "micro_index": mb.micro_index, // On transmet l'index L2
-                                "timestamp": mb.timestamp,
-                                "transaction": tx,
-                                "is_l2": true
-                            }));
+                if let Ok(l2_tree) = chain_lock.db.open_tree("l2_blocks") {
+                    for item in l2_tree.iter() {
+                        if let Ok((_, value)) = item {
+                            if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
+                                for tx in &mb.transactions {
+                                    enriched_txs.push(serde_json::json!({
+                                        "height": parent_height,
+                                        "micro_index": mb.micro_index,
+                                        "timestamp": mb.timestamp,
+                                        "transaction": tx,
+                                        "is_l2": true
+                                    }));
+                                }
+                            }
                         }
                     }
                 }
-            }
+            } 
 
-            Ok::<_, warp::Rejection>(warp::reply::json(&enriched_txs))
+            warp::reply::json(&enriched_txs)
         });
 		
-	// Synchronisation différentielle (Économise 99% de la bande passante)
     let sync_blocks = warp::get()
         .and(warp::path("sync_blocks"))
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(chain_filter.clone())
-        .and(l2_file_filter.clone())
-        .and_then(|params: std::collections::HashMap<String, String>, chain_arc: Arc<Mutex<Blockchain>>, l2_file: String| async move {
+        .map(|params: std::collections::HashMap<String, String>, chain_arc: Arc<Mutex<Blockchain>>| {
             let last_l1 = params.get("last_l1").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
             let last_l2 = params.get("last_l2").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -384,7 +450,6 @@ pub async fn start_api_server(
                     if let Some(block) = chain_lock.get_block_by_height(i) {
                         hash_to_height.insert(block.header.hash.clone(), block.header.index);
                         
-                        // On n'envoie que les NOUVEAUX blocs L1
                         if block.header.index > last_l1 {
                             for tx in &block.transactions {
                                 new_txs.push(serde_json::json!({
@@ -397,29 +462,30 @@ pub async fn start_api_server(
                         }
                     }
                 }
-            }
 
-            if let Ok(data) = tokio::fs::read_to_string(&l2_file).await {
-                if let Ok(l2_chain) = serde_json::from_str::<Vec<crate::block::MicroBlock>>(&data) {
-                    for mb in l2_chain {
-                        // On n'envoie que les NOUVEAUX microblocs L2
-                        if mb.micro_index > last_l2 {
-                            let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
-                            for tx in &mb.transactions {
-                                new_txs.push(serde_json::json!({
-                                    "height": parent_height,
-                                    "micro_index": mb.micro_index,
-                                    "timestamp": mb.timestamp,
-                                    "transaction": tx,
-                                    "is_l2": true
-                                }));
+                if let Ok(l2_tree) = chain_lock.db.open_tree("l2_blocks") {
+                    for item in l2_tree.iter() {
+                        if let Ok((_, value)) = item {
+                            if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                if mb.micro_index > last_l2 {
+                                    let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
+                                    for tx in &mb.transactions {
+                                        new_txs.push(serde_json::json!({
+                                            "height": parent_height,
+                                            "micro_index": mb.micro_index,
+                                            "timestamp": mb.timestamp,
+                                            "transaction": tx,
+                                            "is_l2": true
+                                        }));
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            Ok::<_, warp::Rejection>(warp::reply::json(&new_txs))
+            warp::reply::json(&new_txs)
         });
         
     let get_pool = warp::get()
@@ -431,17 +497,15 @@ pub async fn start_api_server(
 
     let submit_order = warp::post()
 		.and(warp::path("order"))
-		.and(warp::body::bytes()) // 💡 On accepte le binaire du Mixnet
+		.and(warp::body::bytes()) 
 		.and(dex_pool_filter.clone())
 		.and(active_peers_filter.clone()) 
 		.map(|body_bytes: warp::hyper::body::Bytes, pool: SharedPool, active_peers: crate::network::ActivePeers| {
-            // On décode le JSON depuis les octets
             let order: Order = match serde_json::from_slice(&body_bytes) {
                 Ok(o) => o,
                 Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format JSON invalide"), warp::http::StatusCode::BAD_REQUEST),
             };
 
-			// VALIDATION STRICTE : Un ordre d'achat DOIT avoir un hash HTLC
 			if order.order_type == "buy" && order.htlc_hash.is_none() {
 				return warp::reply::with_status(warp::reply::json(&"❌ Achat impossible : HTLC Hash manquant"), warp::http::StatusCode::BAD_REQUEST);
 			}
@@ -474,10 +538,8 @@ pub async fn start_api_server(
 		.and(warp::get())
 		.and(chain_filter.clone())
 		.and(active_peers_filter.clone())
-		.and(l2_file_filter.clone())
-		.map(|chain_arc: Arc<Mutex<Blockchain>>, active_peers: crate::network::ActivePeers, l2_file: String| {
+		.map(|chain_arc: Arc<Mutex<Blockchain>>, active_peers: crate::network::ActivePeers| {
 			
-			// Version safe (ne panique jamais sur mutex empoisonné)
 			let chain_lock = match chain_arc.lock() {
 				Ok(lock) => lock,
 				Err(_) => {
@@ -490,12 +552,9 @@ pub async fn start_api_server(
 
 			let last_block = chain_lock.get_last_block();
 			
-			// Lecture sécurisée du nombre de Micro-Blocs L2
             let mut l2_blocks_count = 0;
-            if let Ok(data) = std::fs::read_to_string(&l2_file) {
-                if let Ok(l2_chain) = serde_json::from_str::<Vec<crate::block::MicroBlock>>(&data) {
-                    l2_blocks_count = l2_chain.len();
-                }
+            if let Ok(l2_tree) = chain_lock.db.open_tree("l2_blocks") {
+                l2_blocks_count = l2_tree.len();
             }
 
 			let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
@@ -514,7 +573,6 @@ pub async fn start_api_server(
 			let expected_hashes = &max_target / &target_big;
 			let hashrate = &expected_hashes / num_bigint::BigUint::from(120u32);
 
-			// Version safe pour active_peers aussi
 			let peers_count = active_peers.lock()
 				.map(|p| p.len())
 				.unwrap_or(0);
@@ -524,7 +582,7 @@ pub async fn start_api_server(
 				"l2_blocks": l2_blocks_count,
 				"connected_peers": peers_count,
 				"last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed),
-				"version": format!("Wattcoin V{}", env!("CARGO_PKG_VERSION")), // Lecture automatique du Cargo.toml
+				"version": format!("Wattcoin V{}", env!("CARGO_PKG_VERSION")), 
 				"difficulty_decimal": difficulty_decimal,
 				"target_hex": target_hex,
 				"hashrate": hashrate.to_string()
@@ -545,14 +603,10 @@ pub async fn start_api_server(
 		.and(chain_filter.clone())
 		.map(|chain_arc: Arc<Mutex<Blockchain>>| {
 			let chain_lock = chain_arc.lock().unwrap();
-			
-			// La blockchain L1 lit Sled en toute autonomie
 			let pot = chain_lock.get_current_jackpot(); 
-			
 			warp::reply::json(&pot.0)
 		});
 		
-	// ==================== ROUTE DIFFICULTY HISTORY (Avec Échantillonnage) ====================
 	let get_difficulty_history = warp::path("difficulty")
 		.and(warp::path("history"))
 		.and(warp::get())
@@ -567,7 +621,6 @@ pub async fn start_api_server(
 
 			let now = chrono::Utc::now().timestamp();
 
-			// 1. Déterminer combien de blocs sont concernés par la période
 			let mut blocks_in_range = 0;
 			if is_all {
 				blocks_in_range = (chain_lock.current_height + 1) as usize;
@@ -585,7 +638,6 @@ pub async fn start_api_server(
 				}
 			}
 
-			// 2. Calcul du pas (step) pour garantir un maximum d'environ 500 points
 			let target_points = 500;
 			let step = (blocks_in_range / target_points).max(1);
 
@@ -596,7 +648,6 @@ pub async fn start_api_server(
 			let initial_target = max_target.clone() >> 12_u32;
 			let hundred = num_bigint::BigUint::from(100u32);
 
-			// 3. Échantillonnage de la blockchain
 			for i in (0..=chain_lock.current_height).rev() {
                 if let Some(block) = chain_lock.get_block_by_height(i) {
                     if !is_all {
@@ -608,7 +659,6 @@ pub async fn start_api_server(
                         }
                     }
 
-                    // On ne prend qu'un bloc sur "step"
                     if counter % step == 0 {
                         let target_big = num_bigint::BigUint::parse_bytes(block.header.target_hex.as_bytes(), 16)
                             .unwrap_or_else(|| max_target.clone());
@@ -630,17 +680,14 @@ pub async fn start_api_server(
 			history.reverse();
 			warp::reply::json(&history)
 		});
-	// =====================================================================
 	
-	// ==================== HTLC ROUTES (définies ici pour être dans le scope) ====================
     let htlc_lock = warp::post()
         .and(warp::path!("htlc" / "lock"))
-        .and(warp::body::bytes()) // On accepte le binaire !
+        .and(warp::body::bytes()) 
         .and(mempool_filter.clone())
         .and(active_peers_filter.clone())
         .map(|body_bytes: warp::hyper::body::Bytes, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
             
-            // Décodage binaire
             let tx: Transaction = match bincode::deserialize(&body_bytes) {
                 Ok(t) => t,
                 Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
@@ -657,22 +704,19 @@ pub async fn start_api_server(
             warp::reply::with_status(warp::reply::json(&"✅ HTLCLock accepté"), warp::http::StatusCode::OK)
         });
 
-    // ===================== HTLC CLAIM (version ultra-permissive pour swap atomique) =====================
 	let htlc_claim = warp::post()
 		.and(warp::path!("htlc" / "claim"))
-		.and(warp::body::bytes()) // Le Wallet envoie du Bincode pur
+		.and(warp::body::bytes()) 
 		.and(chain_filter.clone())
 		.and(mempool_filter.clone())
 		.and(active_peers_filter.clone())
 		.map(|body_bytes: warp::hyper::body::Bytes, chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
 
-            // Décodage du bincode
             let tx: Transaction = match bincode::deserialize(&body_bytes) {
                 Ok(t) => t,
                 Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
             };
 
-			// === Extraction safe du secret ===
 			let secret = match &tx.tx_type {
 				TransactionType::HTLCClaim { secret } if !secret.is_empty() => secret.clone(),
 				_ => return warp::reply::with_status(
@@ -691,7 +735,6 @@ pub async fn start_api_server(
 
 			let hash_to_find = hex::encode(sha2::Sha256::digest(&secret_bytes));
 
-			// === Verrouillage safe ===
 			let chain = match chain_arc.lock() {
 				Ok(c) => c,
 				Err(_) => return warp::reply::with_status(
@@ -700,7 +743,6 @@ pub async fn start_api_server(
 				),
 			};
 
-			// === 2. VÉRIFICATION TRIBUNAL NODE (tout se passe ici, pas dans le wallet) ===
 			let mut buyer_watt_address: Option<String> = None;
 			let mut watt_amount: u64 = 0;
 			let mut lock_exists = false;
@@ -739,7 +781,6 @@ pub async fn start_api_server(
 				);
 			}
 
-			// === 3. Vérification stricte du output créé par le wallet ===
 			let buyer_addr = buyer_watt_address.as_ref().unwrap();
 
 			if tx.outputs.len() != 1 {
@@ -770,10 +811,8 @@ pub async fn start_api_server(
 				);
 			}
 
-			// === 4. TRIBUNAL NODE : tout est validé ici (secret + lock + swap + montant u64 + destination) ===
 			println!("✅ [NODE TRIBUNAL] HTLCClaim validé pour hash {} ({} WATT → {})", hash_to_find, watt_amount as f64 / 1_000_000_000.0, buyer_addr);
 
-			// === 5. Acceptation (le tx contient déjà le bon output créé par le wallet) ===
 			let mut pool = mempool.lock().unwrap();
 			pool.push(tx.clone());
 			let tx_clone = tx.clone();
@@ -782,16 +821,13 @@ pub async fn start_api_server(
 			warp::reply::with_status(warp::reply::json(&"✅ Claim accepté par le node (output vérifié on-chain)"), warp::http::StatusCode::OK)
 		});
 		
-	// ===================== REVEALED SECRET – VRAI MATCHING STRICT ON-CHAIN =====================
 	let htlc_revealed_secret = warp::path!("htlc" / "secret" / String)
 		.and(warp::get())
 		.and(chain_filter.clone())
-        // 💡 EXIT LE MEMPOOL : On ne lit que la blockchain confirmée !
 		.map(|requested_hash: String, chain_arc: Arc<Mutex<Blockchain>>| {
 
 			let chain = chain_arc.lock().unwrap();
 
-			// 🔒 Chaîne confirmée UNIQUEMENT
 			for i in 0..=chain.current_height {
                 if let Some(block) = chain.get_block_by_height(i) {
                     for tx in &block.transactions {
@@ -816,13 +852,10 @@ pub async fn start_api_server(
 			}))
 		});
 	
-	// ===================== BTC BRIDGE PRODUCTION – VERSION COMPILABLE (FIXÉ) ====================
 	use reqwest::Client;
 	use std::time::Duration;
 
-	// ==================== BTC PROXY FIXÉ (switch LOCAL / PROD) ====================
 	async fn btc_proxy(method: &str, url: &str, body: Option<String>) -> Result<String, String> {
-		// Ton Mixnet protège l'IP de l'utilisateur, le Nœud de Sortie tape le Clearnet direct
 		let client = Client::builder()
 			.timeout(Duration::from_secs(15))
 			.build()
@@ -854,7 +887,6 @@ pub async fn start_api_server(
 			let hash = bitcoin::hashes::sha256::Hash::hash(&secret_bytes);
 			let hash_hex = hex::encode(hash.to_byte_array());
 
-			// === ENREGISTREMENT DU HASH BTC ===
 			{
 				let mut set = btc_htlcs.lock().unwrap();
 				set.insert(hash_hex.clone());
@@ -909,24 +941,21 @@ pub async fn start_api_server(
                 Err(_) => return warp::reply::json(&serde_json::json!({"error": "Format JSON invalide"})),
             };
 
-			// Le wallet passe le hash HTLC dans le champ "htlc_address"
 			let htlc_hash = payload["htlc_address"].as_str().unwrap_or_default().to_string();
 			
-			// ⚡ 2. ON ENREGISTRE LE HASH DANS LA RAM DU NOEUD !
 			if !htlc_hash.is_empty() {
 				let mut set = btc_htlcs.lock().unwrap();
 				set.insert(htlc_hash.clone());
-				println!("🔍 [NODE] BTC virtuellement verrouillés pour le hash : {}", htlc_hash);
+				println!("🔍 [NODE] BTC verrouillés pour le hash : {}", htlc_hash);
 			}
 
 			warp::reply::json(&serde_json::json!({
 				"success": true,
 				"message": "✅ BTC verrouillé dans le HTLC",
-				"htlc_txid": "sim_txid_0x1234...confirmed"
+				"htlc_txid": "Broadcasted via Tor"
 			}))
 		});
 		
-	// ===================== CHECK HTLC BTC (nouvelle route dédiée) =====================
 	let btc_check_htlc_exists = warp::path!("btc" / "htlc" / "exists" / String)
 		.and(warp::get())
 		.and(btc_htlc_set_filter.clone())
@@ -968,8 +997,6 @@ pub async fn start_api_server(
 			}))
 		});
 		
-	// ===================== BTC BROADCAST (Claim HTLC) =====================
-	// 1. NOUVEAU : Récupération des UTXOs BTC du Wallet
 	let btc_utxos_route = warp::path!("btc" / "utxos")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
@@ -988,7 +1015,6 @@ pub async fn start_api_server(
 			}
 		});
 
-	// 2. CORRECTION : Le vrai Broadcast (Pousse le raw_tx sur le réseau)
 	let btc_broadcast = warp::path!("btc" / "broadcast")
 		.and(warp::post())
 		.and(warp::body::bytes()) 
@@ -1001,7 +1027,6 @@ pub async fn start_api_server(
 			let raw_tx = payload["raw_tx"].as_str().unwrap_or_default().to_string();
 			let broadcast_url = "https://mempool.space/testnet/api/tx";
 			
-			// Mempool.space attend le raw_tx direct en POST (texte brut)
 			match btc_proxy("POST", broadcast_url, Some(raw_tx)).await {
 				Ok(txid) => Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
 					"success": true,
@@ -1015,7 +1040,6 @@ pub async fn start_api_server(
 			}
 		});
 		
-	// BTC BALANCE FINALE – respecte LOCAL_DEV_MODE + anonymat PROD
 	let get_btc_balance_route = warp::path!("btc" / "balance")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
@@ -1040,7 +1064,6 @@ pub async fn start_api_server(
 			}
 		});
 		
-	// HISTORIQUE BTC (Proxy)
 	let get_btc_txs_route = warp::path!("btc" / "txs")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
@@ -1060,23 +1083,16 @@ pub async fn start_api_server(
 			}
 		});
 		
-	// ===================================================================
-    // 🌐 ROUTE INTEROPÉRABILITÉ : Statut d'une L2 Souveraine (AVEC VRF)
-    // Permet à n'importe qui de vérifier si une L2 est légitime et 
-    // de récupérer son dernier état ancré (State Root).
-    // ===================================================================
     let get_l2_status = warp::path!("l2" / "status" / String)
         .and(warp::get())
         .and(chain_filter.clone())
         .map(|l2_name: String, chain_arc: Arc<Mutex<Blockchain>>| {
             let chain_guard = chain_arc.lock().unwrap();
             
-            // On utilise un HashSet pour garder une liste unique de tous les candidats
             let mut active_sequencers: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut last_state_root = String::from("AUCUN_ANCRAGE");
             let mut total_anchors = 0u64;
 
-            // 1. On scanne l'historique pour trouver TOUS les stakers
             for i in 0..=chain_guard.current_height {
                 if let Some(block) = chain_guard.get_block_by_height(i) {
                     for tx in &block.transactions {
@@ -1101,26 +1117,22 @@ pub async fn start_api_server(
 
             let mut elected_pubkey = String::new();
 
-            // 2. 🎲 LE MOTEUR VRF (Verifiable Random Function)
             if !active_sequencers.is_empty() {
                 let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
-                candidates.sort(); // 💡 CRITIQUE : Trie alphabétiquement pour un déterminisme total
+                candidates.sort(); 
 
                 let last_block_hash = &chain_guard.get_last_block().header.hash;
                 
-                // On hache (Seed + Nom de la L2)
                 use sha2::Digest;
                 let mut vrf_hasher = sha2::Sha256::new();
                 vrf_hasher.update(last_block_hash.as_bytes());
                 vrf_hasher.update(l2_name.as_bytes());
                 let vrf_hash = vrf_hasher.finalize();
 
-                // On convertit les 8 premiers octets en un chiffre
                 let mut hash_bytes = [0u8; 8];
                 hash_bytes.copy_from_slice(&vrf_hash[0..8]);
                 let random_number = u64::from_be_bytes(hash_bytes);
 
-                // La roulette désigne le gagnant (Modulo mathématique)
                 let winner_index = (random_number as usize) % candidates.len();
                 elected_pubkey = candidates[winner_index].clone();
             }
@@ -1134,16 +1146,13 @@ pub async fn start_api_server(
                 warp::reply::json(&serde_json::json!({
                     "l2_name": l2_name,
                     "is_active": true,
-                    "sequencer_pubkey": elected_pubkey, // 💡 ON RENVOIE LE GAGNANT DU VRF !
+                    "sequencer_pubkey": elected_pubkey, 
                     "last_state_root": last_state_root,
                     "total_anchors_on_l1": total_anchors
                 }))
             }
         });
 		
-	// ===================================================================
-    // 🌐 ROUTE PEG L2 : Affiche la somme des WATT bloqués sur le pont
-    // ===================================================================
     let get_l2_peg = warp::path!("l2" / "peg" / String)
         .and(warp::get())
         .and(chain_filter.clone())
@@ -1151,20 +1160,15 @@ pub async fn start_api_server(
             let chain_guard = chain_arc.lock().unwrap();
             let mut total_peg_flames = 0u64;
 
-            // L'adresse morte officielle générée par le consensus
             let official_bridge_address = format!("BRIDGE_L2_{}", l2_name.to_uppercase());
 
-            // On scanne toute la blockchain L1
             for i in 0..=chain_guard.current_height {
                 if let Some(block) = chain_guard.get_block_by_height(i) {
                     for tx in &block.transactions {
                         if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
-                            // On vérifie que c'est bien la bonne L2
                             if l2_target_name.to_uppercase() == l2_name.to_uppercase() {
                                 for out in &tx.outputs {
-                                    // On ne compte QUE les outputs envoyés à l'adresse morte
                                     if out.stealth_address == official_bridge_address {
-                                        // Le montant a été forcé en texte clair par le consensus L1 !
                                         let amount: u64 = out.aes_vault.parse().unwrap_or(0);
                                         total_peg_flames += amount;
                                     }
@@ -1183,7 +1187,6 @@ pub async fn start_api_server(
             }))
         });
 
-	// ==================== INTÉGRATION FINALE ====================
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec!["content-type"])
@@ -1214,6 +1217,8 @@ pub async fn start_api_server(
 		.or(get_btc_txs_route)
 		.or(get_l2_status)
 		.or(get_l2_peg)
+        .or(get_fee_schedule) // La nouvelle route dynamique pour les frais !
+		.or(get_fee_estimate) // Route pour l'explorer
         .with(cors);
 	
 	println!("🚀 [API] Serveur RPC Démarré sur {}.{}.{}.{}:{}", host_ip[0], host_ip[1], host_ip[2], host_ip[3], port);

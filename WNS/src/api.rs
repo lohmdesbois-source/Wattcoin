@@ -158,9 +158,20 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
                 "owners": state_guard.domain_owners,
             }))
         });
+		
+	// ====================================================================
+	// GET /my_ip : Permet à un nœud de connaître son IP publique
+	// ====================================================================
+	let get_my_ip = warp::path!("my_ip")
+		.and(warp::get())
+		.and(warp::addr::remote())
+		.map(|addr: Option<std::net::SocketAddr>| {
+			let ip = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "inconnue".to_string());
+			warp::reply::json(&serde_json::json!({"ip": ip}))
+		});
     
     let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST"]);
-    let routes = get_status.or(get_balance).or(get_peg).or(send_tx).or(resolve_domain).or(get_directory).with(cors);
+    let routes = get_status.or(get_balance).or(get_peg).or(send_tx).or(resolve_domain).or(get_directory).or(get_my_ip).with(cors);
 
     println!("🌐 [L2 API] Serveur RPC WNS Démarré sur http://127.0.0.1:{}", port);
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;
