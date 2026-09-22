@@ -1,5 +1,5 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,7 +60,8 @@ pub async fn sync_wns_directory(is_local_dev: bool) {
 
 
 
-pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
+// Le channel gère du binaire pur (Vec<u8>)
+pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 pub static HIGHEST_KNOWN_BLOCK: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -81,34 +82,38 @@ pub enum P2PMessage {
     SharePeers { peers: Vec<String> },
 }
 
-async fn read_p2p_message<R: AsyncBufReadExt + std::marker::Unpin>(reader: &mut R) -> Option<P2PMessage> {
-    let mut line = String::new();
+// Lecture avec préfixe de taille (TCP Framing)
+async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R) -> Option<P2PMessage> {
+    let mut len_buf = [0u8; 4];
     
-    // Limite stricte à 3 Mo (3 * 1024 * 1024 octets)
-    const MAX_MESSAGE_SIZE: u64 = 3_145_728; 
+    // 1. On lit exactement 4 octets pour connaître la taille
+    if reader.read_exact(&mut len_buf).await.is_err() { return None; }
+    let length = u32::from_be_bytes(len_buf) as usize;
     
-    // On enveloppe le lecteur pour qu'il refuse de lire au-delà de la limite
-    let mut limited_reader = reader.take(MAX_MESSAGE_SIZE);
+    // 2. Limite stricte à 33 Mo (32 Mo de bloc + 1 Mo de marge Bincode) = 34_603_008 octets
+    const MAX_MESSAGE_SIZE: usize = 34_603_008; 
     
-    match limited_reader.read_line(&mut line).await {
-        Ok(0) => None, // Déconnexion propre ou fin de flux
-        Ok(n) => {
-            // Si on a atteint la limite stricte sans trouver de saut de ligne final, c'est une attaque
-            if n as u64 == MAX_MESSAGE_SIZE && !line.ends_with('\n') {
-                println!("🚨 [SÉCURITÉ] Flux TCP ignoré : Message P2P trop volumineux (Attaque OOM bloquée).");
-                return None; 
-            }
-            
-            serde_json::from_str::<P2PMessage>(line.trim()).ok()
-        },
-        Err(_) => None,
+    if length > MAX_MESSAGE_SIZE {
+        println!("🚨 [SÉCURITÉ] Flux TCP ignoré : Message binaire trop volumineux ({} octets).", length);
+        return None; 
     }
+    
+    // 3. On lit exactement le reste du message
+    let mut payload = vec![0u8; length];
+    if reader.read_exact(&mut payload).await.is_err() { return None; }
+    
+    bincode::deserialize(&payload).ok()
 }
 
-async fn send_message_to_channel(sender: &mpsc::Sender<String>, message: P2PMessage) {
-    let mut json_str = serde_json::to_string(&message).unwrap();
-    json_str.push('\n'); 
-    let _ = sender.send(json_str).await;
+// Écriture Binaire avec préfixe
+async fn send_message_to_channel(sender: &mpsc::Sender<Vec<u8>>, message: P2PMessage) {
+    if let Ok(payload) = bincode::serialize(&message) {
+        let length = (payload.len() as u32).to_be_bytes();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&length);
+        framed.extend_from_slice(&payload);
+        let _ = sender.send(framed).await;
+    }
 }
 
 pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers) {
@@ -138,18 +143,17 @@ pub fn start_peer_connection(
     blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool,
     known_peers: crate::SharedPeers, active_peers: ActivePeers
 ) {
-    let (read_half, mut write_half) = socket.into_split();
-    let mut reader = BufReader::new(read_half);
-    let (tx, mut rx) = mpsc::channel::<String>(10_000);
+    let (mut read_half, mut write_half) = socket.into_split();
+    // Le channel transite du Vec<u8> !
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(10_000);
 
     let random_id: u32 = rand::random();
     let temp_peer_id = format!("{}:incoming_{}", peer_ip, random_id);
     active_peers.lock().unwrap().insert(temp_peer_id.clone(), tx.clone());
 
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
-            let _ = write_half.flush().await;
+        while let Some(msg_bytes) = rx.recv().await {
+            if write_half.write_all(&msg_bytes).await.is_err() { break; }
         }
     });
 
@@ -177,7 +181,8 @@ pub fn start_peer_connection(
         }
 
         // La boucle d'écoute existante...
-        while let Some(message) = read_p2p_message(&mut reader).await {
+        // On lit directement sur read_half
+        while let Some(message) = read_p2p_message(&mut read_half).await {
             match message {
                 P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
                     actual_peer_id = format!("{}:{}_{}", peer_ip, sender_port, random_id);
@@ -244,110 +249,120 @@ pub fn start_peer_connection(
                             for i in (0..=chain.current_height).rev() {
                                 if chain.get_block_by_height(i).unwrap().header.hash == locator {
                                     found_idx = i as usize;
-                                    found = true;
-                                    break;
+                                    found = true; break;
                                 }
                             }
                             if found { break; }
                         }
                         
                         // On envoie uniquement les blocs APRÈS l'ancêtre commun
+                        // SYNC PING-PONG : 1 bloc binaire à la fois
                         if (found_idx as u64) < chain.current_height {
-                            let mut blocks = Vec::new();
-                            for i in (found_idx as u64 + 1)..=chain.current_height {
-                                blocks.push(chain.get_block_by_height(i).unwrap());
-                            }
-                            Some(blocks)
+                            Some(vec![chain.get_block_by_height(found_idx as u64 + 1).unwrap()])
                         } else {
                             None
                         }
                     }; 
 
                     if let Some(blocks) = blocks_to_send {
-                        println!("📤 [SYNC] Le nœud distant est en retard. Envoi dynamique de {} blocs manquants...", blocks.len());
                         send_message_to_channel(&tx, P2PMessage::SyncResponse { blocks }).await;
                     }
                 },
                 
                 P2PMessage::SyncResponse { blocks } => {
-					if blocks.is_empty() {
-						println!("⚠️ [SYNC] Lot de blocs vide reçu, ignoré.");
-						continue;
-					}
-					
-					let incoming_last = blocks.last().unwrap();
-					let mut chain = blockchain.lock().unwrap(); 
-					let current_height = chain.current_height + 1;
+                    if blocks.is_empty() {
+                        println!("⚠️ [SYNC] Lot de blocs vide reçu, ignoré.");
+                        continue;
+                    }
+                    
+                    let incoming_last = blocks.last().unwrap();
+                    let mut needs_sync_request = false;
+                    let mut locators = Vec::new();
 
-					// ====================================================================
-					// BOUCLIER ANTI-SPAM & ANTI-FAUX POSITIF MESS
-					// Si on a déjà dépassé cet index ET que le hash correspond à ce qu'on a,
-					// c'est un lot en double. On le détruit silencieusement.
-					// ====================================================================
-					if incoming_last.header.index < current_height {
-						let our_hash = &chain.get_block_by_height(incoming_last.header.index).unwrap().header.hash;
-						if our_hash == &incoming_last.header.hash {
-							continue;
-						}
-					}
+                    { // DÉBUT DE LA ZONE SOUS VERROU BLOCKCHAIN
+                        let mut chain = blockchain.lock().unwrap(); 
+                        let current_height = chain.current_height + 1;
 
-					println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, incoming_last.header.index);
-					
-					if chain.resolve_partial_fork(blocks.clone()) { 
-						println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
-						
-						let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
+                        if incoming_last.header.index < current_height {
+                            let our_hash = &chain.get_block_by_height(incoming_last.header.index).unwrap().header.hash;
+                            if our_hash == &incoming_last.header.hash {
+                                continue;
+                            }
+                        }
 
-						let mut mp = mempool.lock().unwrap();
-						mp.retain(|tx| { 
-							let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
-							let is_valid_share = match &tx.tx_type {
-								TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-								_ => true
-							};
-							not_in_block && is_valid_share
-						});
+                        println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, incoming_last.header.index);
+                        
+                        if chain.resolve_partial_fork(blocks.clone()) { 
+                            println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
+                            
+                            let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
 
-						// On relaie la bonne nouvelle au reste du réseau !
-						if let Some(last_block) = blocks.last() {
-							
-							// --- NOUVEL AFFICHAGE VISUEL POUR LE RELAIS ---
-							let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-							let tx_count = last_block.transactions.len();
-							let tx_detail = if tx_count == 1 { 
-								"1 Coinbase".to_string() 
-							} else { 
-								format!("1 Coinbase + {} Publique/Swap", tx_count - 1) 
-							};
+                            { // SOUS-VERROU MEMPOOL (isolé dans ses propres accolades)
+                                let mut mp = mempool.lock().unwrap();
+                                mp.retain(|tx| { 
+                                    let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
+                                    let is_valid_share = match &tx.tx_type {
+                                        TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+                                        _ => true
+                                    };
+                                    not_in_block && is_valid_share
+                                });
+                            } // FIN VERROU MEMPOOL
 
-							println!("\n====================================================================");
-							println!("🔄 [SYNC] BLOC {} RATTRAPÉ ET REDIFFUSÉ !", last_block.header.index);
-							println!("🕒 Synchronisé le : {}", now);
-							println!("🔗 Hash           : {}", last_block.header.hash);
-							println!("📝 Contenu        : {} transactions incluses ({})", tx_count, tx_detail);
-							println!("====================================================================");
-							// ----------------------------------------------
+                            // On relaie la bonne nouvelle au reste du réseau !
+                            if let Some(last_block) = blocks.last() {
+                                
+                                // --- NOUVEL AFFICHAGE VISUEL POUR LE RELAIS ---
+                                let now = chrono::Local::now().format("%d-%m-%Y %H:%M:%S");
+                                let tx_count = last_block.transactions.len();
+                                let tx_detail = if tx_count == 1 { 
+                                    "1 Coinbase".to_string() 
+                                } else { 
+                                    format!("1 Coinbase + {} Publique/Swap/Loto", tx_count - 1) 
+                                };
 
-							let env = P2PMessage::NewBlock { 
-								block: last_block.clone(), 
-								sender_port: my_port.clone() 
-							};
-							let mut json_str = serde_json::to_string(&env).unwrap();
-							json_str.push('\n');
-							
-							let ap = active_peers.lock().unwrap().clone();
-							for (peer_id, sender) in ap.iter() {
-								// On ne renvoie pas au pair qui vient de nous synchroniser
-								if peer_id != &actual_peer_id {
-									let _ = sender.try_send(json_str.clone());
-								}
-							}
-						}
+                                println!("\n====================================================================");
+                                println!("🔄 [SYNC] BLOC {} RATTRAPÉ ET REDIFFUSÉ !", last_block.header.index);
+                                println!("🕒 Synchronisé le : {}", now);
+                                println!("🔗 Hash           : {}", last_block.header.hash);
+                                println!("📝 Contenu        : {} transactions incluses ({})", tx_count, tx_detail);
+                                println!("====================================================================");
+                                // ----------------------------------------------
 
-					} else {
-						println!("❌ [SYNC] Échec de la fusion !");
-					}
-				},
+                                let env = P2PMessage::NewBlock { 
+                                    block: last_block.clone(), 
+                                    sender_port: my_port.clone() 
+                                };
+                                if let Ok(payload) = bincode::serialize(&env) {
+                                    let length = (payload.len() as u32).to_be_bytes();
+                                    let mut framed = Vec::with_capacity(4 + payload.len());
+                                    framed.extend_from_slice(&length);
+                                    framed.extend_from_slice(&payload);
+
+                                    let ap = active_peers.lock().unwrap().clone();
+                                    for (peer_id, sender) in ap.iter() {
+                                        if peer_id != &actual_peer_id {
+                                            let _ = sender.try_send(framed.clone()); 
+                                        }
+                                    }
+                                }
+                            }
+
+                            if blocks.len() == 1 {
+                                needs_sync_request = true;
+                                locators = vec![incoming_last.header.hash.clone()];
+                            }
+
+                        } else {
+                            println!("❌ [SYNC] Échec de la fusion !");
+                        }
+                    } // FIN DE LA ZONE SOUS VERROU BLOCKCHAIN (chain est 100% purgée)
+
+                    // L'APPEL ASYNCHRONE EST TOTALEMENT ISOLÉ ICI
+                    if needs_sync_request {
+                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes: locators, sender_port: my_port.clone() }).await;
+                    }
+                },
 
                 P2PMessage::NewBlock { block, sender_port } => {
 					// DÉCLENCHEMENT DU KILL SWITCH
@@ -482,15 +497,20 @@ pub fn start_peer_connection(
 								}
                                 
                                 let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port_clone };
-                                let mut json_str = serde_json::to_string(&env).unwrap();
-                                json_str.push('\n');
-                                
-                                let ap = active_peers_clone.lock().unwrap().clone();
-                                for (peer_id, sender) in ap.iter() {
-                                    if peer_id != &actual_peer_id_clone {
-                                        let _ = sender.try_send(json_str.clone());
-                                    }
-                                }
+								if let Ok(payload) = bincode::serialize(&env) {
+									let length = (payload.len() as u32).to_be_bytes();
+									let mut framed = Vec::with_capacity(4 + payload.len());
+									framed.extend_from_slice(&length);
+									framed.extend_from_slice(&payload);
+
+									let ap = active_peers_clone.lock().unwrap().clone();
+									for (peer_id, sender) in ap.iter() {
+										// CORRECTION : Utilisation des bonnes variables du scope
+										if peer_id != &actual_peer_id_clone {
+											let _ = sender.try_send(framed.clone());
+										}
+									}
+								}
                             }
                         }
                     });
@@ -548,7 +568,7 @@ pub fn start_peer_connection(
 						let tx_clone = in_tx.clone();
 						let mp_clone_bg = Arc::clone(&mempool);
 						let ap_clone_bg = Arc::clone(&active_peers);
-						let actual_peer_id_clone = actual_peer_id.clone(); 
+						let actual_peer_id_clone = actual_peer_id.clone();
 
 						tokio::task::spawn_blocking(move || {
 							// KILL SWITCH 2 : Juste avant de lancer le hachage lourd, on revérifie si le bloc a changé !
@@ -570,19 +590,22 @@ pub fn start_peer_connection(
 											let mut pool = mp_clone_bg.lock().unwrap();
 											let tx_hash = in_tx.hash_data();
 											if !pool.iter().any(|t| t.hash_data() == tx_hash) {
-												// Séparation claire : icône de part de minage
 												println!("⛏️ [P2POOL] Nouvelle part de minage relayée !");
 												let tx_to_propagate = in_tx.clone();
 												pool.push(in_tx);
 
 												let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
-												let mut json_str = serde_json::to_string(&envelope).unwrap();
-												json_str.push('\n');
-												
-												let ap = ap_clone_bg.lock().unwrap().clone();
-												for (peer_id, sender) in ap.iter() {
-													if peer_id != &actual_peer_id_clone {
-														let _ = sender.try_send(json_str.clone());
+												if let Ok(payload) = bincode::serialize(&envelope) {
+													let length = (payload.len() as u32).to_be_bytes();
+													let mut framed = Vec::with_capacity(4 + payload.len());
+													framed.extend_from_slice(&length);
+													framed.extend_from_slice(&payload);
+													
+													let ap = ap_clone_bg.lock().unwrap().clone();
+													for (peer_id, sender) in ap.iter() {
+														if peer_id != &actual_peer_id_clone {
+															let _ = sender.try_send(framed.clone());
+														}
 													}
 												}
 											}
@@ -597,20 +620,25 @@ pub fn start_peer_connection(
 
 					// 3. TRAITEMENT CLASSIQUE POUR LES AUTRES TRANSACTIONS (HTLC, Envoi Classique...)
 					if in_tx.is_valid() {
-						let mut pool = mempool.lock().unwrap(); // Ou mp_clone dans la boucle Tor
+						let mut pool = mempool.lock().unwrap(); 
 						if !pool.iter().any(|t| t.hash_data() == in_tx.hash_data()) {
 							println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !"); 
 							let tx_to_propagate = in_tx.clone();          
 							pool.push(in_tx);
 
 							let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
-							let mut json_str = serde_json::to_string(&envelope).unwrap();
-							json_str.push('\n');
-							
-							let ap = active_peers.lock().unwrap().clone(); // Ou ap_clone dans la boucle Tor
-							for (peer_id, sender) in ap.iter() {
-								if peer_id != &actual_peer_id {
-									let _ = sender.try_send(json_str.clone());
+							if let Ok(payload) = bincode::serialize(&envelope) {
+								let length = (payload.len() as u32).to_be_bytes();
+								let mut framed = Vec::with_capacity(4 + payload.len());
+								framed.extend_from_slice(&length);
+								framed.extend_from_slice(&payload);
+
+								let ap = active_peers.lock().unwrap().clone();
+								for (peer_id, sender) in ap.iter() {
+									// CORRECTION : On envoie 'framed'
+									if peer_id != &actual_peer_id {
+										let _ = sender.try_send(framed.clone());
+									}
 								}
 							}
 						}
@@ -690,24 +718,27 @@ pub fn start_peer_connection(
                         }).await.unwrap();
 
                         match validation_result {
-                            Ok(()) => {
-                                // NETTOYAGE DU MEMPOOL
-                                {
-                                    let mut mp = mp_clone.lock().unwrap();
-                                    mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
-                                }
-                                
-                                // GOSSIP P2P : On relaie aux autres !
-                                let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };
-                                let mut json_str = serde_json::to_string(&envelope).unwrap();
-                                json_str.push('\n');
-                                let ap = ap_clone.lock().unwrap().clone();
-                                for (peer_id, sender) in ap.iter() {
-                                    if peer_id != &actual_peer_id_clone { 
-                                        let _ = sender.try_send(json_str.clone()); 
-                                    }
-                                }
-                            },
+							Ok(()) => {
+								{
+									let mut mp = mp_clone.lock().unwrap();
+									mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
+								}
+								
+								let envelope = P2PMessage::BroadcastMicroBlock { micro_block: micro_block.clone() };
+								if let Ok(payload) = bincode::serialize(&envelope) {
+									let length = (payload.len() as u32).to_be_bytes();
+									let mut framed = Vec::with_capacity(4 + payload.len());
+									framed.extend_from_slice(&length);
+									framed.extend_from_slice(&payload);
+
+									let ap = ap_clone.lock().unwrap().clone();
+									for (peer_id, sender) in ap.iter() {
+										if peer_id != &actual_peer_id_clone { 
+											let _ = sender.try_send(framed.clone()); 
+										}
+									}
+								}
+							},
                             Err(e) => {
                                 // Le Tribunal L2 a parlé. Le bloc est une fraude.
                                 println!("{}", e); 
@@ -775,45 +806,61 @@ pub fn start_peer_connection(
 
 pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: ActivePeers) {
     let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
-    let mut json_str = serde_json::to_string(&envelope).unwrap();
-    json_str.push('\n');
+    if let Ok(payload) = bincode::serialize(&envelope) {
+        let length = (payload.len() as u32).to_be_bytes();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&length);
+        framed.extend_from_slice(&payload);
 
-    let peers = active_peers.lock().unwrap().clone();
-    for (_peer_id, sender) in peers.iter() {
-        let _ = sender.try_send(json_str.clone());
+        let peers = active_peers.lock().unwrap().clone();
+        for (_peer_id, sender) in peers.iter() {
+            let _ = sender.try_send(framed.clone());
+        }
     }
 }
 
 pub async fn broadcast_transaction(tx: Transaction, active_peers: ActivePeers) {
     let envelope = P2PMessage::BroadcastTransaction { tx };
-    let mut json_str = serde_json::to_string(&envelope).unwrap();
-    json_str.push('\n');
+    if let Ok(payload) = bincode::serialize(&envelope) {
+        let length = (payload.len() as u32).to_be_bytes();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&length);
+        framed.extend_from_slice(&payload);
 
-    let peers = active_peers.lock().unwrap().clone();
-    for (_peer_id, sender) in peers.iter() {
-        let _ = sender.try_send(json_str.clone());
+        let peers = active_peers.lock().unwrap().clone();
+        for (_peer_id, sender) in peers.iter() {
+            let _ = sender.try_send(framed.clone());
+        }
     }
 }
 
 pub async fn broadcast_order(order: Order, active_peers: ActivePeers) {
     let envelope = P2PMessage::BroadcastOrder { order };
-    let mut json_str = serde_json::to_string(&envelope).unwrap();
-    json_str.push('\n');
+    if let Ok(payload) = bincode::serialize(&envelope) {
+        let length = (payload.len() as u32).to_be_bytes();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&length);
+        framed.extend_from_slice(&payload);
 
-    let peers = active_peers.lock().unwrap().clone();
-    for (_peer_id, sender) in peers.iter() {
-        let _ = sender.try_send(json_str.clone());
+        let peers = active_peers.lock().unwrap().clone();
+        for (_peer_id, sender) in peers.iter() {
+            let _ = sender.try_send(framed.clone());
+        }
     }
 }
 
 pub async fn broadcast_micro_block(micro_block: crate::block::MicroBlock, active_peers: ActivePeers) {
     let envelope = P2PMessage::BroadcastMicroBlock { micro_block };
-    let mut json_str = serde_json::to_string(&envelope).unwrap();
-    json_str.push('\n');
+    if let Ok(payload) = bincode::serialize(&envelope) {
+        let length = (payload.len() as u32).to_be_bytes();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&length);
+        framed.extend_from_slice(&payload);
 
-    let peers = active_peers.lock().unwrap().clone();
-    for (_peer_id, sender) in peers.iter() {
-        let _ = sender.try_send(json_str.clone());
+        let peers = active_peers.lock().unwrap().clone();
+        for (_peer_id, sender) in peers.iter() {
+            let _ = sender.try_send(framed.clone());
+        }
     }
 }
 

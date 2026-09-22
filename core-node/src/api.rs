@@ -242,9 +242,15 @@ pub async fn start_api_server(
                                     if let Ok(mut stream) = tokio::net::TcpStream::connect(&target_ip).await {
                                         use tokio::io::AsyncWriteExt;
                                         let envelope = crate::network::P2PMessage::RelayOnion { packet: next_packet };
-                                        let mut json_str = serde_json::to_string(&envelope).unwrap();
-                                        json_str.push('\n');
-                                        let _ = stream.write_all(json_str.as_bytes()).await;
+                                        
+                                        // FRAMING BINAIRE
+                                        if let Ok(payload) = bincode::serialize(&envelope) {
+                                            let length = (payload.len() as u32).to_be_bytes();
+                                            let mut framed = Vec::with_capacity(4 + payload.len());
+                                            framed.extend_from_slice(&length);
+                                            framed.extend_from_slice(&payload);
+                                            let _ = stream.write_all(&framed).await;
+                                        }
                                     }
                                 });
                             }
