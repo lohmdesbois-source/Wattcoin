@@ -36,7 +36,7 @@ pub static SYNC_STATUS: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(Stri
 
 
 
-const MATURITY_BLOCKS: u64 = 3; 
+const MATURITY_BLOCKS: u64 = 12; 
 const FLAME: u64 = 1_000_000_000;
 
 // ===================================================================

@@ -999,7 +999,7 @@ impl Blockchain {
 	pub fn validate_and_add_external_block(&mut self, block: Block) -> Result<(), String> {
         // LE COUPERET DU POIDS : Rejet immédiat si c'est trop lourd !
         let block_size = bincode::serialized_size(&block).unwrap_or(0) as usize;
-		println!("❌ [POIDS] Le poids du bloc dans validate est de {} Ko.", block_size/ 1_024);
+		println!("🏋️ [POIDS] Le poids du bloc dans validate est de {} Ko.", block_size/ 1_024);
         if block_size > MAX_BLOCK_SIZE_BYTES {
             return Err(format!("❌ FRAUDE : Le bloc dépasse la limite de consensus stricte ({} Mo > 32 Mo) !", block_size / 1_024 / 1_024));
         }
