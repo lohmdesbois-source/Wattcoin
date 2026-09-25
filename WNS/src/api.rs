@@ -3,10 +3,8 @@
 use warp::Filter;
 use crate::state::SharedL2State;
 use crate::transaction::L2Transaction;
-// On importe les outils réseau
 use wots::{Wots, WotsSignature};
 use crate::network::{ActiveWnsPeers, WnsP2PMessage, broadcast_message};
-
 
 pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: ActiveWnsPeers) {
     let state_filter = warp::any().map(move || state.clone());
@@ -57,14 +55,23 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
         .and(peers_filter.clone())
         .map(|tx: L2Transaction, state: SharedL2State, active_peers: ActiveWnsPeers| {
             
-            if tx.fee < 1500 {
+            // Évaluation dynamique du poids de la transaction L2
+            let tx_weight_bytes = bincode::serialized_size(&tx).unwrap_or(500) as usize;
+            let weight_kb = (tx_weight_bytes as f64 / 1024.0).ceil() as u64;
+            
+            // Le WNS facture au minimum 2000 FLAMEs (pour garantir son bénéfice) 
+            // ou un tarif dynamique au poids
+            let dynamic_min_fee = std::cmp::max(2000, weight_kb * 100); 
+
+            if tx.fee < dynamic_min_fee {
                 return warp::reply::with_status(
-                    warp::reply::json(&serde_json::json!({"error": "Frais insuffisants. Minimum requis : 1500 Flames."})),
+                    warp::reply::json(&serde_json::json!({
+                        "error": format!("Frais L2 insuffisants. Minimum requis : {} Flames.", dynamic_min_fee)
+                    })),
                     warp::http::StatusCode::BAD_REQUEST,
                 );
             }
             
-            // AJOUT DU SUPPORT POUR .chain ICI
             let is_valid_watt = tx.domain_name.ends_with(".watt") && tx.domain_name.len() > 5;
             let is_valid_chain = tx.domain_name.ends_with(".chain") && tx.domain_name.len() > 6;
 
@@ -75,7 +82,6 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
                 );
             }
 
-            // VRAIE VÉRIFICATION WOTS+
             let hash = tx.hash_data();
             
             let is_valid = if let Ok(sig) = serde_json::from_str::<WotsSignature>(&tx.signature) {
@@ -93,7 +99,6 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
 
             let mut state_guard = state.lock().unwrap();
             
-            // 💡 VÉRIFICATION DU NONCE
             if let Some(acc) = state_guard.accounts.get(&tx.account_address) {
                 if tx.nonce != acc.nonce + 1 {
                     return warp::reply::with_status(
@@ -158,20 +163,9 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
                 "owners": state_guard.domain_owners,
             }))
         });
-		
-	// ====================================================================
-	// GET /my_ip : Permet à un nœud de connaître son IP publique
-	// ====================================================================
-	let get_my_ip = warp::path!("my_ip")
-		.and(warp::get())
-		.and(warp::addr::remote())
-		.map(|addr: Option<std::net::SocketAddr>| {
-			let ip = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "inconnue".to_string());
-			warp::reply::json(&serde_json::json!({"ip": ip}))
-		});
     
     let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST"]);
-    let routes = get_status.or(get_balance).or(get_peg).or(send_tx).or(resolve_domain).or(get_directory).or(get_my_ip).with(cors);
+    let routes = get_status.or(get_balance).or(get_peg).or(send_tx).or(resolve_domain).or(get_directory).with(cors);
 
     println!("🌐 [L2 API] Serveur RPC WNS Démarré sur http://127.0.0.1:{}", port);
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;

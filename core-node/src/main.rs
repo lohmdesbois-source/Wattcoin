@@ -73,16 +73,18 @@ async fn main() {
     if let Err(e) = std::fs::create_dir_all(&db_dir) {
         println!("⚠️ Impossible de créer le dossier .wattcoin : {}", e);
     }
-	
-	// ==============================================================
+    
+    // ==============================================================
     // SÉCURITÉ MIXNET : Gestion KISS de l'identité Kyber du Nœud
     // ==============================================================
     let kyber_sec_path = format!("{}/node_kyber.secret", db_dir);
     let kyber_pub_path = format!("{}/node_kyber.pub", db_dir);
     
-    let node_kyber_secret = if std::path::Path::new(&kyber_sec_path).exists() {
-        // Lecture silencieuse de la clé existante (auto-restart parfait)
-        std::fs::read_to_string(&kyber_sec_path).unwrap().trim().to_string()
+    let (node_kyber_secret, node_kyber_pub) = if std::path::Path::new(&kyber_sec_path).exists() {
+        // Lecture silencieuse de la clé existante
+        let sec = std::fs::read_to_string(&kyber_sec_path).unwrap().trim().to_string();
+        let pubk = std::fs::read_to_string(&kyber_pub_path).unwrap().trim().to_string();
+        (sec, pubk)
     } else {
         println!("🔑 Première exécution : Génération de l'identité quantique du Nœud Relais...");
         let mut rng = rand::thread_rng();
@@ -92,7 +94,7 @@ async fn main() {
         
         // Sauvegarde sur le disque
         std::fs::write(&kyber_sec_path, &sec_hex).unwrap();
-        std::fs::write(&kyber_pub_path, &pub_hex.clone()).unwrap();
+        std::fs::write(&kyber_pub_path, &pub_hex).unwrap();
         
         // OS SHIELD : Application du CHMOD 600 (Lecture/Écriture pour le propriétaire uniquement)
         #[cfg(target_family = "unix")]
@@ -111,7 +113,7 @@ async fn main() {
         println!("{}", pub_hex);
         println!("============================================================\n");
         
-        sec_hex
+        (sec_hex, pub_hex)
     };
 
     // 1. ON LANCE L'UPnP SI ON EST EN MODE LIVE ET PAS SUR UN VPS
@@ -139,14 +141,14 @@ async fn main() {
     }
 
     let role_prefix = if is_relay_mode { "relay" } else { "miner" };
-	let l1_db_file = format!("{}/{}_l1_chain_{}", db_dir, role_prefix, port);
+    let l1_db_file = format!("{}/{}_l1_chain_{}", db_dir, role_prefix, port);
 
     // On utilise maintenant l1_db_file pour charger la chaîne (L1 + L2 unifié)
     let shared_chain = Arc::new(Mutex::new(Blockchain::new(&l1_db_file).unwrap()));
     let mempool: SharedMempool = Arc::new(Mutex::new(Vec::new()));
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
-	
-	// ====================================================================
+    
+    // ====================================================================
     // ⚛️ AFFICHAGE DU GENESIS ET GESTION DU LANCEMENT (MAINNET)
     // ====================================================================
     let (genesis_timestamp, genesis_hash) = {
@@ -172,19 +174,15 @@ async fn main() {
     let now_ts = chrono::Utc::now().timestamp();
     if now_ts < genesis_timestamp {
         let wait_seconds = genesis_timestamp - now_ts;
-		println!("⏳ [TESTNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
+        println!("⏳ [TESTNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
         println!("⏳ Le nœud est en mode veille. Lancement automatique dans {} secondes...", wait_seconds);
         println!("⏳ Laissez ce terminal ouvert. Les moteurs s'allumeront à l'heure H.\n");
         
-        // Le nœud s'endort ici et se réveillera exactement à l'heure du Genesis !
         tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds as u64)).await;
         
-		println!("🚀 [TESTNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
+        println!("🚀 [TESTNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
     }
-    // ====================================================================
 
-    // L'initialisation se fera juste avant le minage
-    
     let active_peers: wattcoin_core::network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
 
     let p2p_chain = Arc::clone(&shared_chain);
@@ -201,19 +199,22 @@ async fn main() {
             &bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active
         ).await;
     });
-	
+    
     let api_chain = Arc::clone(&shared_chain);
     let api_mempool = Arc::clone(&mempool);
     let api_dex_pool = Arc::clone(&dex_pool);
     let api_active_peers = Arc::clone(&active_peers);
-	let api_kyber_secret = node_kyber_secret.clone(); // Clonage pour la route
-	
+    
+    // 💡 ICI ON UTILISE DIRECTEMENT LES VARIABLES DU SCOPE PRINCIPAL
+    let api_kyber_secret = node_kyber_secret.clone(); 
+    let api_kyber_pub = node_kyber_pub.clone(); 
+    
     tokio::spawn(async move { 
         wattcoin_core::api::start_api_server(
-            api_port, api_bind_ip, api_mempool, api_chain, api_dex_pool, api_active_peers, api_kyber_secret
+            api_port, api_bind_ip, api_mempool, api_chain, api_dex_pool, api_active_peers, api_kyber_secret, api_kyber_pub
         ).await; 
     });
-	
+    
     if let Some(target) = &peer_target {
         println!("🤝 Ouverture du tunnel P2P vers {}...", target);
         let target_clone = target.clone();
@@ -230,27 +231,24 @@ async fn main() {
             } else { 
                 format!("127.0.0.1:{}", target_clone) 
             };
-			
-			// On ajoute un compteur d'échecs
-			let mut consecutive_failures = 0;
+            
+            let mut consecutive_failures = 0;
             
             // LE CHIEN DE GARDE (Watchdog Auto-Reconnect)
             loop {
-                // On vérifie si l'IP cible est toujours dans la liste des pairs actifs
                 let is_connected = {
                     let ap = p2p_active_hs.lock().unwrap();
                     let target_ip = address.split(':').next().unwrap_or("");
                     ap.keys().any(|k| k.starts_with(target_ip))
                 };
 
-                // Si la connexion est tombée (ou n'a jamais réussi), on relance !
                 if !is_connected {
                     println!("🔓 Tentative de connexion P2P vers {}...", address);
                     
                     match tokio::net::TcpStream::connect(&address).await {
                         Ok(socket) => {
                             println!("✅ Connexion P2P réussie vers {} !", address);
-							consecutive_failures = 0; // On réinitialise si succès
+                            consecutive_failures = 0; 
                             wattcoin_core::network::start_peer_connection(
                                 socket, 
                                 address.split(':').next().unwrap_or("127.0.0.1").to_string(), 
@@ -264,41 +262,138 @@ async fn main() {
                         }
                         Err(e) => { 
                             println!("❌ Échec de connexion au réseau : {}", e); 
-							consecutive_failures += 1;
+                            consecutive_failures += 1;
                 
-							// SI ON EST TOTALEMENT ISOLÉ (3 échecs = ~30 secondes)
-							if consecutive_failures >= 3 {
-								println!("⚠️ [RELAIS] Isolement détecté. Rafraîchissement de l'annuaire WNS...");
-								// 1. On force la mise à jour de l'annuaire RAM depuis le WNS (via network.rs)
-								wattcoin_core::network::WNS_CACHE.lock().await.clear();
-								let is_local = !is_live_mode; // Si on n'est pas en --live, on est en local
-								wattcoin_core::network::sync_wns_directory(is_local).await;
-								
-								// On essaie de se connecter à un autre nœud connu de notre carnet local !
-								let alternative_peer = {
-									let kp = p2p_peers_hs.lock().unwrap();
-									kp.iter().next().cloned() // On prend le premier dispo
-								};
-								
-								if let Some(new_target) = alternative_peer {
-									println!("🔄 [RELAIS] Bascule vers un nœud de secours : {}", new_target);
-									address = new_target; // On change la cible de notre boucle de reconnexion
-									consecutive_failures = 0; // On laisse sa chance au nouveau nœud
-								}
-							}
+                            if consecutive_failures >= 3 {
+                                println!("⚠️ [RELAIS] Isolement détecté. Recherche d'un nouveau Phare dans la DHT locale...");
+                                
+                                let mut new_target = None;
+                                
+                                {
+                                    let chain = p2p_chain_handshake.lock().unwrap();
+                                    if let Ok(dht_tree) = chain.db.open_tree("dht_nodes") {
+                                        for result in dht_tree.iter() {
+                                            if let Ok((_, value)) = result {
+                                                if let Ok(record) = bincode::deserialize::<wattcoin_core::network::DhtRecord>(&value) {
+                                                    if record.is_lighthouse && !record.ip_port.is_empty() && record.ip_port != address {
+                                                        new_target = Some(record.ip_port);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if let Some(target) = new_target {
+                                    println!("🔄 [RELAIS] Bascule vers un Phare de secours : {}", target);
+                                    address = target;
+                                    consecutive_failures = 0;
+                                } else {
+                                    let seed = wattcoin_core::SEED_NODES[0].to_string();
+                                    if address != seed {
+                                        println!("🔄 [RELAIS] DHT vide. Bascule vers le Seed Node racine : {}", seed);
+                                        address = seed;
+                                        consecutive_failures = 0;
+                                    }
+                                }
+                            }
                             println!("⚠️ Nouvelle tentative automatique dans 10 secondes...");
                         }
                     }
                 } else {
-					// Si on est connecté, tout va bien, le compteur reste à 0
-					consecutive_failures = 0;
-				}
-
-                // On dort 10 secondes avant de revérifier (zéro impact CPU)
+                    consecutive_failures = 0;
+                }
                 tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         });
     }
+    
+    // ====================================================================
+    // ANNONCE DHT : SIGNALEMENT DU NŒUD AU RÉSEAU (MINI-POW)
+    // ====================================================================
+    // On utilise la clé publique générée plus haut au lieu de la lire sur le disque !
+    let dht_kyber_pub = node_kyber_pub.clone();
+    let dht_chain = Arc::clone(&shared_chain);
+    let dht_active_peers = Arc::clone(&active_peers);
+    let dht_is_lighthouse = is_vps_mode; 
+    let my_port_dht = port.clone();
+    let is_live_dht = is_live_mode;
+
+    tokio::spawn(async move {
+        // 1. Découverte de l'IP Publique si on est un Phare (VPS)
+        let mut dht_ip_port = String::new();
+        if dht_is_lighthouse && is_live_dht {
+            println!("🔍 [DHT] Découverte de l'IP publique pour le Phare...");
+            let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+            if let Ok(res) = client.get("https://api.ipify.org").send().await {
+                if let Ok(ip) = res.text().await {
+                    dht_ip_port = format!("{}:{}", ip.trim(), my_port_dht);
+                    println!("🌍 [DHT] IP Publique trouvée : {}", dht_ip_port);
+                }
+            }
+        } else if dht_is_lighthouse {
+            dht_ip_port = format!("127.0.0.1:{}", my_port_dht); // Mode local
+        }
+        // Si dht_is_lighthouse est faux (Mme odette toulemonde), dht_ip_port reste vide !
+
+        // 2. Calcul du PoW isolé dans un thread bloquant (Zéro impact sur le nœud)
+        tokio::task::spawn_blocking(move || {
+            println!("⏳ [DHT] Génération de la preuve de travail anti-spam (Mini-PoW)...");
+            let timestamp = chrono::Utc::now().timestamp();
+            let mut nonce = 0u64;
+            let mut pow_hash = String::new();
+
+            let flags = randomx_rs::RandomXFlag::get_recommended_flags();
+            
+            // On récupère la graine de l'époque en cours
+            let seed = {
+                let chain = dht_chain.lock().unwrap();
+                chain.get_epoch_seed(chain.current_height)
+            };
+            
+            if let Ok(cache) = randomx_rs::RandomXCache::new(flags, seed.as_bytes()) {
+                if let Ok(vm) = randomx_rs::RandomXVM::new(flags, Some(cache), None) {
+                    loop {
+                        let header_data = format!("{}{}{}{}", dht_kyber_pub, dht_ip_port, timestamp, nonce);
+                        if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
+                            // LA DIFFICULTÉ : Les 12 premiers bits à zéro (1 chance sur 4096)
+                            if hash_bytes[0] == 0 && hash_bytes[1] < 16 {
+                                pow_hash = hex::encode(&hash_bytes);
+                                break;
+                            }
+                        }
+                        nonce += 1;
+                    }
+                }
+            }
+
+            if !pow_hash.is_empty() {
+                println!("✅ [DHT] Mini-PoW trouvé ! (Nonce: {})", nonce);
+                let announcement = wattcoin_core::network::P2PMessage::NodeAnnouncement {
+                    kyber_pubkey: dht_kyber_pub,
+                    ip_port: dht_ip_port,
+                    is_lighthouse: dht_is_lighthouse,
+                    timestamp,
+                    pow_hash,
+                    nonce,
+                };
+
+                // On diffuse l'annonce à tous nos voisins
+                if let Ok(payload) = bincode::serialize(&announcement) {
+                    let length = (payload.len() as u32).to_be_bytes();
+                    let mut framed = Vec::with_capacity(4 + payload.len());
+                    framed.extend_from_slice(&length);
+                    framed.extend_from_slice(&payload);
+
+                    let peers = dht_active_peers.lock().unwrap().clone();
+                    for (_, sender) in peers.iter() {
+                        let _ = sender.try_send(framed.clone());
+                    }
+                }
+            }
+        });
+    });
 
     if is_relay_mode {
         loop {

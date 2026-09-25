@@ -34,7 +34,8 @@ pub async fn start_api_server(
     chain: Arc<Mutex<Blockchain>>, 
     dex_pool: SharedPool,
     active_peers: crate::network::ActivePeers,
-    node_kyber_secret: String
+    node_kyber_secret: String,
+    node_kyber_pub: String
 ) {
     // PURISME CYPHERPUNK : On lit le VRAI prix directement depuis le marbre de la blockchain !
     {
@@ -1192,6 +1193,16 @@ pub async fn start_api_server(
                 "peg_watt": total_peg_flames as f64 / 1_000_000_000.0
             }))
         });
+		
+	// Expose la clé Kyber pour le chiffrement des Wallets
+    let pubkey_clone = node_kyber_pub.clone();
+    let get_pubkey = warp::path("pubkey")
+        .and(warp::get())
+        .map(move || {
+            warp::reply::json(&serde_json::json!({
+                "pubkey": pubkey_clone
+            }))
+        });
 
     let cors = warp::cors()
         .allow_any_origin()
@@ -1225,6 +1236,7 @@ pub async fn start_api_server(
 		.or(get_l2_peg)
         .or(get_fee_schedule) // La nouvelle route dynamique pour les frais !
 		.or(get_fee_estimate) // Route pour l'explorer
+		.or(get_pubkey)
         .with(cors);
 	
 	println!("🚀 [API] Serveur RPC Démarré sur {}.{}.{}.{}:{}", host_ip[0], host_ip[1], host_ip[2], host_ip[3], port);

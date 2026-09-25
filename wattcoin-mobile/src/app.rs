@@ -147,10 +147,8 @@ struct WattcoinApp {
     bridge_receiver_pubkey: String,
     bridge_amount: String,
 	
-	wns_tab: String, // "wallet" ou "server"
+	wns_tab: String, // "wallet"
     wns_domain_input: String,
-    wns_ip_input: String,
-    wns_server_pubkey_input: String,
     wns_bid_amount: String,
 	wns_domain_status: String,
     
@@ -276,9 +274,7 @@ impl WattcoinApp {
 			
 			wns_tab: "wallet".to_string(),
 			wns_domain_input: String::new(),
-			wns_ip_input: String::new(),
-			wns_server_pubkey_input: String::new(),
-			wns_bid_amount: "0.0000015".to_string(), // 1500 FLAME
+			wns_bid_amount: "0.000002".to_string(), // 2000 FLAME minimum pour la rentabilité du L2
 			wns_domain_status: String::new(),
             
             sync_message: String::new(),
@@ -2306,26 +2302,18 @@ impl eframe::App for WattcoinApp {
 					egui::Frame::none().fill(panel_bg).inner_margin(20.0).rounding(12.0).show(&mut overlay_ui, |ui| {
 						ui.heading("🏷 Registre des Noms (WNS)");
 						ui.add_space(10.0);
-						ui.label(egui::RichText::new("Achetez un domaine en .watt ou .chain sur le réseau L2. Utilisez-le pour remplacer votre longue adresse de portefeuille, ou pour déclarer publiquement votre propre serveur de routage (Mixnet).").color(egui::Color32::GRAY));
+						ui.label(egui::RichText::new("Achetez un nom de domaine en .watt ou .chain sur le réseau L2. Vous pouvez utiliser cet alias public pour recevoir des fonds et des messages chiffrés à la place de votre longue adresse Kyber.").color(egui::Color32::GRAY));
 						ui.add_space(20.0);
 
-						ui.horizontal(|ui| {
-							ui.selectable_value(&mut self.wns_tab, "wallet".to_string(), "👛 Alias de Portefeuille");
-							ui.selectable_value(&mut self.wns_tab, "server".to_string(), "🖥 Serveur Relais (Mixnet)");
-						});
-						ui.separator();
-						ui.add_space(15.0);
+						// On force le statut "wallet" (Alias de portefeuille) sans afficher d'onglets
+						self.wns_tab = "wallet".to_string();
 
 						ui.label("Nom de domaine souhaité (doit finir par .watt ou .chain) :");
-						// On capture l'action de l'utilisateur sur le champ
 						let response = ui.add(egui::TextEdit::singleline(&mut self.wns_domain_input).hint_text("ex: watty.chain"));
 
-						// Dès que le texte change, on lance une vérification
 						if response.changed() {
 							let domain = self.wns_domain_input.clone();
 							let tx = self.tx.clone();
-							
-							// On récupère notre propre adresse pour voir si le domaine est à nous
 							let my_address = self.wallet_keys.as_ref().map(|k| k.watt_address.clone()).unwrap_or_default();
 							
 							let is_valid_watt = domain.ends_with(".watt") && domain.len() > 5;
@@ -2339,13 +2327,10 @@ impl eframe::App for WattcoinApp {
 								self.wns_domain_status = "🔍 Vérification...".to_string();
 								
 								tokio::spawn(async move {
-									// Un petit délai de 400ms pour laisser l'utilisateur finir de taper (Debounce)
 									tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 									
-									// On fouille dans l'annuaire
 									match crate::resolve_wns_domain_opsec(&domain).await {
 										Ok(record) => {
-											// Le domaine est pris. Est-ce qu'il pointe vers nous ?
 											if record.contains(&my_address) {
 												let _ = tx.send(AppMessage::DomainStatus("👤 Ce domaine vous appartient !".to_string())).await;
 											} else {
@@ -2353,7 +2338,6 @@ impl eframe::App for WattcoinApp {
 											}
 										}
 										Err(_) => {
-											// Erreur du WNS = Le domaine n'existe pas dans le registre !
 											let _ = tx.send(AppMessage::DomainStatus("✅ Domaine disponible !".to_string())).await;
 										}
 									}
@@ -2361,13 +2345,12 @@ impl eframe::App for WattcoinApp {
 							}
 						}
 
-						// L'affichage dynamique du résultat sous le champ de texte
 						if !self.wns_domain_status.is_empty() {
 							ui.add_space(2.0);
 							let color = if self.wns_domain_status.starts_with("✅") || self.wns_domain_status.starts_with("👤") {
 								egui::Color32::GREEN
 							} else if self.wns_domain_status.starts_with("⚠️") || self.wns_domain_status.starts_with("🔍") {
-								egui::Color32::from_rgb(255, 165, 0) // Orange
+								egui::Color32::from_rgb(255, 165, 0)
 							} else {
 								egui::Color32::RED
 							};
@@ -2375,37 +2358,13 @@ impl eframe::App for WattcoinApp {
 						}
 						ui.add_space(10.0);
 
-						if self.wns_tab == "server" {
-							ui.label("IP et Port de votre Nœud (Clearnet ou Tor) :");
-							ui.add(egui::TextEdit::singleline(&mut self.wns_ip_input).hint_text("ex: 82.12.34.56:8000"));
-							ui.add_space(10.0);
-							
-							ui.label("Clé Publique Kyber de votre Nœud (node_kyber.pub) :");
-							let response = ui.add(egui::TextEdit::singleline(&mut self.wns_server_pubkey_input).hint_text("ex: 82c681..."));
-
-							response.context_menu(|ui| {
-								if ui.button("📋 Coller").clicked() {
-									if let Some(pasted_text) = get_clipboard_text() {
-										self.wns_server_pubkey_input = pasted_text;
-									}
-									ui.close_menu();
-								}
-								if ui.button("📋 Copier").clicked() {
-									set_clipboard_text(ui.ctx(), &self.wns_server_pubkey_input);
-									ui.close_menu();
-								}
-							});
-							ui.add_space(10.0);
-						}
-
 						ui.horizontal(|ui| {
 							ui.vertical(|ui| {
 								ui.label("Enchère / Frais d'enregistrement (WATT sur L2) :");
-								ui.add(egui::TextEdit::singleline(&mut self.wns_bid_amount).hint_text("Min: 0.0000015"));
+								ui.add(egui::TextEdit::singleline(&mut self.wns_bid_amount).hint_text("Min: 0.000002"));
 								
 								if let Ok(amt) = self.wns_bid_amount.parse::<f64>() {
 									if self.watt_price_usd > 0.0 {
-										// On utilise 6 décimales pour l'USD car le montant est très petit
 										ui.label(egui::RichText::new(format!("≈ $ {:.8} USD", amt * self.watt_price_usd)).color(egui::Color32::GRAY));
 									}
 								}
@@ -2413,59 +2372,40 @@ impl eframe::App for WattcoinApp {
 						});
 						ui.add_space(20.0);
 
-						// UX : Le texte du bouton s'adapte selon qu'on fait un Register ou un Update !
-						let btn_text = if self.wns_domain_status.starts_with("👤") {
-							if self.wns_tab == "wallet" { "🔄 Mettre à jour l'Alias" } else { "🔄 Mettre à jour l'IP du Relais" }
-						} else {
-							"🔥 Enregistrer le Domaine"
-						};
+						// LOGIQUE SIMPLIFIÉE : On achète, ou on contemple.
+						let is_mine = self.wns_domain_status.starts_with("👤");
+						let is_available = self.wns_domain_status.starts_with("✅");
 
-						if ui.add_sized([250.0, 40.0], egui::Button::new(btn_text)).clicked() {
-							if let (Some(keys), Ok(fee_watt)) = (&self.wallet_keys, self.wns_bid_amount.parse::<f64>()) {
-								
-								let is_valid_watt = self.wns_domain_input.ends_with(".watt") && self.wns_domain_input.len() > 5;
-								let is_valid_chain = self.wns_domain_input.ends_with(".chain") && self.wns_domain_input.len() > 6;
-
-								if !is_valid_watt && !is_valid_chain {
-									self.sync_message = "❌ Le nom de domaine est invalide (trop court ou extension non gérée).".to_string();
-								} else {
-									self.sync_message = "Création de la transaction WNS en cours...".to_string();
-									let tx = self.tx.clone();
-									let keys = keys.clone();
-									let domain = self.wns_domain_input.clone();
+						if is_available {
+							if ui.add_sized([250.0, 40.0], egui::Button::new("🔥 Enregistrer le Domaine")).clicked() {
+								if let (Some(keys), Ok(fee_watt)) = (&self.wallet_keys, self.wns_bid_amount.parse::<f64>()) {
 									
-									let fee_flames = (fee_watt * 1_000_000_000.0) as u64;
+									let is_valid_watt = self.wns_domain_input.ends_with(".watt") && self.wns_domain_input.len() > 5;
+									let is_valid_chain = self.wns_domain_input.ends_with(".chain") && self.wns_domain_input.len() > 6;
 
-									let action = if self.wns_domain_status.starts_with("👤") {
-										crate::WnsAction::Update
+									if !is_valid_watt && !is_valid_chain {
+										self.sync_message = "❌ Le nom de domaine est invalide (trop court ou extension non gérée).".to_string();
 									} else {
-										crate::WnsAction::Register
-									};
-									
-									// On clone les champs spécifiques pour les injecter dans le thread
-									let wns_tab = self.wns_tab.clone();
-									let ip_input = self.wns_ip_input.clone();
-									let server_pubkey = self.wns_server_pubkey_input.clone();
-
-									tokio::spawn(async move {
-										if wns_tab == "wallet" {
-											// Aiguillage ALIAS
-											match crate::register_wns_alias(domain, keys.watt_address.clone(), fee_flames, keys, action).await {
+										self.sync_message = "Création de la transaction WNS en cours...".to_string();
+										let tx = self.tx.clone();
+										let keys = keys.clone();
+										let domain = self.wns_domain_input.clone();
+										let fee_flames = (fee_watt * 1_000_000_000.0) as u64;
+										
+										tokio::spawn(async move {
+											// Plus besoin de passer l'action en paramètre !
+											match crate::register_wns_alias(domain, keys.watt_address.clone(), fee_flames, keys).await {
 												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 											}
-										} else {
-											// Aiguillage SERVEUR
-											match crate::register_wns_relay(domain, ip_input, server_pubkey, fee_flames, keys, action).await {
-												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
-												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
-											}
-										}
-									});
+										});
+									}
+								} else {
+									self.sync_message = "❌ Montant invalide ou portefeuille verrouillé.".to_string();
 								}
-							} else {
-								self.sync_message = "❌ Montant invalide ou portefeuille verrouillé.".to_string();
 							}
+						} else if is_mine {
+							ui.label(egui::RichText::new("🎉 Ce domaine est à vous ! La fonctionnalité de revente arrivera dans une prochaine mise à jour.").color(egui::Color32::GRAY));
 						}
 
 						if !self.sync_message.is_empty() {

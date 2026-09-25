@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
+use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
 use crate::block::Block;
@@ -11,58 +12,11 @@ use crate::blockchain::Blockchain;
 use crate::transaction::{Transaction, TransactionType};
 use crate::api::{Order, SharedPool};
 use crate::mixnet::OnionPacket;
-// ===================================================================
-// ANNUAIRE WNS CENTRALISÉ (Partagé entre le Nœud L1 et le Wallet)
-// ===================================================================
-use once_cell::sync::Lazy;
-use tokio::sync::Mutex as AsyncMutex;
-
-pub const WNS_RESOLVERS: &[&str] = &[
-    "http://127.0.0.1:8200", // En local on tape direct sur le port 8200 !
-    // "http://80.78.26.243/wns", // Pour la PROD plus tard
-];
-
-pub const NETWORK_SEEDS: &[&str] = &[
-    "seed.watt", // Le nom de domaine fondateur par défaut
-];
-
-pub static WNS_CACHE: Lazy<AsyncMutex<HashMap<String, (String, String)>>> = Lazy::new(|| AsyncMutex::new(HashMap::new()));
-
-#[derive(serde::Deserialize)]
-pub struct WnsDirectory {
-    pub domains: HashMap<String, String>,
-    pub owners: HashMap<String, String>,
-}
-
-pub async fn sync_wns_directory(is_local_dev: bool) {
-    let resolver = if is_local_dev {
-        "http://127.0.0.1:8200"
-    } else {
-        "http://80.78.26.243/wns"
-    };
-
-    let url = format!("{}/directory", resolver);
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    
-    if let Ok(res) = client.get(&url).send().await {
-        if let Ok(directory) = res.json::<WnsDirectory>().await {
-            let mut cache = WNS_CACHE.lock().await;
-            cache.clear();
-            for (domain, record) in directory.domains {
-                if let Some(owner) = directory.owners.get(&domain) {
-                    cache.insert(domain, (record, owner.clone()));
-                }
-            }
-            println!("📖 [WNS] Annuaire téléchargé ({} domaines) depuis {}", cache.len(), resolver);
-        }
-    }
-}
-
-
 
 // Le channel gère du binaire pur (Vec<u8>)
 pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 pub static HIGHEST_KNOWN_BLOCK: AtomicU64 = AtomicU64::new(0);
+
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum P2PMessage {
@@ -78,9 +32,29 @@ pub enum P2PMessage {
     MempoolSync { txs: Vec<Transaction> },
 	BroadcastMicroBlock { micro_block: crate::block::MicroBlock },
 	RelayOnion { packet: OnionPacket },
-	// POUR L'ANNUAIRE !
-    SharePeers { peers: Vec<String> },
+    NodeAnnouncement { 
+        kyber_pubkey: String, 
+        ip_port: String, 
+        is_lighthouse: bool,
+        timestamp: i64,
+        pow_hash: String,     // Le hash RandomX
+        nonce: u64,           // Le sel pour trouver le PoW
+    },
 }
+
+// Le profil enregistré dans la base de données Sled
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DhtRecord {
+    pub kyber_pubkey: String,
+    pub ip_port: String,      // L'adresse IP et le port (vide si le nœud est caché)
+    pub is_lighthouse: bool,  // Vrai si le nœud a passé le test TCP
+    pub last_seen: i64,       // Timestamp de la dernière validation
+}
+
+
+
+
+
 
 // Lecture avec préfixe de taille (TCP Framing)
 async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R) -> Option<P2PMessage> {
@@ -170,15 +144,6 @@ pub fn start_peer_connection(
             current_height: my_height, 
             sender_port: my_port.clone() 
         }).await;
-		
-		// PEX : On donne notre carnet d'adresses au nouveau venu
-        let my_known_peers: Vec<String> = {
-            let kp = known_peers.lock().unwrap();
-            kp.iter().cloned().collect()
-        };
-        if !my_known_peers.is_empty() {
-            send_message_to_channel(&tx, P2PMessage::SharePeers { peers: my_known_peers }).await;
-        }
 
         // La boucle d'écoute existante...
         // On lit directement sur read_half
@@ -776,25 +741,86 @@ pub fn start_peer_connection(
                     }
                 },
 				
-				P2PMessage::SharePeers { peers } => {
-                    let mut kp = known_peers.lock().unwrap();
-                    let mut new_found = 0;
-                    for peer in peers {
-                        // On n'ajoute pas soi-même ni des IP mortes
-                        if !kp.contains(&peer) && peer.contains(':') {
-                            kp.insert(peer);
-                            new_found += 1;
-                        }
-                    }
-                    if new_found > 0 {
-                        println!("🕸️ [PEX] Annuaire mis à jour : {} nouveaux pairs découverts !", new_found);
-                        // On sauvegarde sur le disque immédiatement !
-                        let db_dir = format!("{}/.wattcoin", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
-                        let peers_file = format!("{}/known_peers.json", db_dir);
-                        let peers_list: Vec<String> = kp.iter().cloned().collect();
-                        let _ = std::fs::write(&peers_file, serde_json::to_string(&peers_list).unwrap_or_default());
-                    }
-                },
+				P2PMessage::NodeAnnouncement { kyber_pubkey, ip_port, is_lighthouse, timestamp, pow_hash, nonce } => {
+					// A. Filtre temporel (Anti-Rejeu) : On refuse les annonces qui ont plus de 2 heures
+					// On ne les "périme" pas de la base une fois entrées, c'est juste pour l'admission.
+					let now = chrono::Utc::now().timestamp();
+					if timestamp < now - 7200 || timestamp > now + 3600 {
+						println!("🚨 [DHT] Annonce ignorée (Timestamp invalide/rejeu).");
+						continue;
+					}
+
+					// B. Validation du PoW RandomX (Mode Light, 0 RAM)
+					let header_data = format!("{}{}{}{}", kyber_pubkey, ip_port, timestamp, nonce);
+					let flags = randomx_rs::RandomXFlag::get_recommended_flags();
+					
+					let is_pow_valid = {
+						let chain = blockchain.lock().unwrap();
+						let seed = chain.get_epoch_seed(chain.current_height);
+						
+						if let Ok(cache) = randomx_rs::RandomXCache::new(flags, seed.as_bytes()) {
+							if let Ok(vm) = randomx_rs::RandomXVM::new(flags, Some(cache), None) {
+								if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
+									let calculated_hash = hex::encode(&hash_bytes);
+									// On vérifie que le hash correspond ET qu'il respecte la difficulté (les 12 premiers bits à zéro) !
+									calculated_hash == pow_hash && hash_bytes[0] == 0 && hash_bytes[1] < 16
+								} else { false }
+							} else { false }
+						} else { false }
+					};
+
+					if !is_pow_valid {
+						println!("🚨 [DHT] Annonce ignorée (PoW Invalide). Spam détecté !");
+						continue;
+					}
+
+					// C. Validation TCP Asynchrone & Écriture dans Sled
+					// On clone les variables nécessaires pour le thread d'arrière-plan
+					let kp_clone = kyber_pubkey.clone();
+					let ip_clone = ip_port.clone();
+					let chain_arc = Arc::clone(&blockchain); // On utilise la db de la blockchain
+					
+					tokio::spawn(async move {
+						let mut is_valid = true;
+
+						// Si le nœud se déclare "Phare", on le teste IMMÉDIATEMENT
+						if is_lighthouse {
+							// Timeout ultra court (2 secondes) pour ne pas engorger le réseau
+							match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(&ip_clone)).await {
+								Ok(Ok(_stream)) => {
+									println!("📡 [DHT] Ping réussi ! Nœud Phare validé : {}", ip_clone);
+									// (La connexion se coupe toute seule à la fin du bloc)
+								}
+								_ => {
+									println!("🚨 [DHT] Échec Ping TCP sur {}. Le nœud ment sur son statut de Phare.", ip_clone);
+									is_valid = false;
+								}
+							}
+						} else {
+							println!("📡 [DHT] Annonce de Nœud Caché valide reçue : {}", kp_clone);
+						}
+
+						// Si tout est bon, on l'écrit de manière persistante
+						if is_valid {
+							let record = DhtRecord {
+								kyber_pubkey: kp_clone.clone(),
+								ip_port: ip_clone,
+								is_lighthouse,
+								last_seen: chrono::Utc::now().timestamp(),
+							};
+
+							// On récupère l'instance Sled depuis l'Arc de la Blockchain
+							let db = { chain_arc.lock().unwrap().db.clone() }; 
+							if let Ok(dht_tree) = db.open_tree("dht_nodes") {
+								if let Ok(bincode_data) = bincode::serialize(&record) {
+									let _ = dht_tree.insert(kp_clone.as_bytes(), bincode_data);
+									let _ = dht_tree.flush(); // Force l'écriture sur le disque
+									println!("💾 [DHT] Identité {} sauvegardée sur le disque.", kp_clone);
+								}
+							}
+						}
+					});
+				},
                 
             }
         }

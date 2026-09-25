@@ -20,7 +20,7 @@ pub use wattcoin_core::lattice::{self, LWECommitment, LATTICE_DIM};
 pub use wattcoin_core::transaction::{Transaction, TransactionType, TransactionInput, TransactionOutput, SwapContract};
 pub use wattcoin_core::mixnet::{OnionPacket, HopPayload};
 // On importe la logique officielle du Nœud L1 !
-pub use wattcoin_core::network::{WNS_RESOLVERS, NETWORK_SEEDS, WNS_CACHE, sync_wns_directory};
+pub use wattcoin_core::network::DhtRecord;
 
 // 2. IMPORT DES OUTILS L2 WNS (Directement depuis le Séquenceur WNS !)
 pub use wattcoin_name_service::transaction::{L2Transaction, WnsAction};
@@ -296,78 +296,60 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 
 async fn node_call(method: &str, endpoint: &str, body: Option<Vec<u8>>) -> Result<String, String> {
     
-    // 1. On synchronise l'annuaire WNS s'il est vide
-    {
-        let cache = WNS_CACHE.lock().await;
-        if cache.is_empty() {
-            drop(cache); // On relâche le verrou pour ne pas bloquer
-            sync_wns_directory(LOCAL_DEV_MODE).await;
-        }
-    }
+    // 💡 Le Wallet tente d'abord de communiquer avec le Nœud
+    let target_ip = if LOCAL_DEV_MODE {
+        "127.0.0.1:8100".to_string()
+    } else {
+        // Le Phare public de secours si l'utilisateur n'a pas son propre nœud local
+        "80.78.26.243:8100".to_string() 
+    };
 
-    crate::set_status("⏳ Routage en oignon via WNS...");
+    let original_public_url = format!("http://{}{}", target_ip, endpoint);
 
-    // 2. On cherche notre Nœud Racine ("seed.watt") dans l'annuaire RAM
-    let cache = WNS_CACHE.lock().await;
-    
-    for &seed_domain in NETWORK_SEEDS {
-        if let Some((node_url, node_pubkey)) = cache.get(seed_domain) {
-            
-            // L'ASTUCE POUR LE LOCAL_DEV_MODE
-            // Même si le WNS nous donne l'IP de prod, si on est en local, on force le routage vers localhost !
-			let target_ip = if LOCAL_DEV_MODE {
-				"127.0.0.1:8100".to_string()
-			} else {
-				// On récupère l'IP du WNS (ex: 80.78.26.243), et on utilise ton NGINX sur /api !
-				let node_p2p = node_url.clone();
-				let ip_part = if let Some(idx) = node_p2p.rfind(':') { &node_p2p[..idx] } else { &node_p2p };
-				format!("{}/api", ip_part) // Le Wallet tapera sur http://80.78.26.243/api
-			};
+    // GESTION DU TYPE (JSON vs BINAIRE) ET DU CHIFFREMENT MIXNET
+    let (final_url, final_body, final_ct) = if method == "POST" && body.is_some() {
+        
+        crate::set_status("🔍 Demande de la clé publique au nœud relais...");
 
-			let original_public_url = format!("http://{}{}", target_ip, endpoint);
+        // 1. On demande la clé publique du nœud dynamiquement !
+        let pubkey_url = format!("http://{}/pubkey", target_ip);
+        let pubkey_res = HTTP_CLIENT.get(&pubkey_url).send().await
+            .map_err(|e| format!("Impossible de joindre le nœud pour obtenir sa clé Kyber : {}", e))?;
+        
+        let pubkey_json: serde_json::Value = pubkey_res.json().await.map_err(|_| "Erreur JSON Pubkey".to_string())?;
+        let node_pubkey_hex = pubkey_json["pubkey"].as_str().ok_or("Clé publique introuvable sur le nœud")?;
 
-			// GESTION DU TYPE (JSON vs BINAIRE) SELON LA ROUTE
-			let (final_url, final_body, final_ct) = if method == "POST" && body.is_some() {
-				
-				// L'URL cible à l'intérieur de l'oignon DOIT rester 127.0.0.1:8100 (C'est ce que le Nœud comprend en le déballant)
-				let internal_target_url = format!("http://127.0.0.1:8100{}", endpoint);
-				
-				// On passe du binaire à l'oignon
-				let packet = wrap_in_onion(&internal_target_url, &body.clone().unwrap(), node_pubkey)?;
-				let onion_bytes = bincode::serialize(&packet).map_err(|_| "Erreur bincode Onion".to_string())?;
-				
-				// On l'envoie à l'extérieur via NGINX
-				(format!("http://{}/relay_onion", target_ip), Some(onion_bytes), "application/octet-stream")
-			} else {
-                let ct = if endpoint == "/send_tx" { "application/octet-stream" } else { "application/json" };
-				(original_public_url, body.clone(), ct)
-			};
+        crate::set_status("🧅 Chiffrement Mixnet et envoi au relais...");
 
-            // Envoi HTTP
-            let req = match method {
-                "POST" => HTTP_CLIENT.post(&final_url).header("Content-Type", final_ct).body(final_body.unwrap_or_default()),
-                "DELETE" => HTTP_CLIENT.delete(&final_url), 
-                _ => HTTP_CLIENT.get(&final_url),           
-            };
+        // 2. On fabrique l'oignon avec la clé fraîchement récupérée
+        let internal_target_url = format!("http://127.0.0.1:8100{}", endpoint);
+        let packet = wrap_in_onion(&internal_target_url, &body.clone().unwrap(), node_pubkey_hex)?;
+        let onion_bytes = bincode::serialize(&packet).map_err(|_| "Erreur bincode Onion".to_string())?;
+        
+        // 3. On frappe la route onion_relay du nœud avec l'oignon binaire
+        (format!("http://{}/relay_onion", target_ip), Some(onion_bytes), "application/octet-stream")
+    } else {
+        let ct = if endpoint == "/send_tx" { "application/octet-stream" } else { "application/json" };
+        (original_public_url, body.clone(), ct)
+    };
 
-            // BORROW CHECKER RUST ICI :
-            match req.send().await {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        return Ok(resp.text().await.unwrap_or_default());
-                    } else {
-                        let status = resp.status(); 
-                        let error_msg = resp.text().await.unwrap_or_default(); 
-                        println!("⚠️ [RESEAU] Le nœud {} a rejeté la requête (HTTP {}) : {}", seed_domain, status, error_msg);
-                        return Err(format!("❌ Rejeté par le Nœud : {}", error_msg)); 
-                    }
-                },
-                Err(e) => { println!("⚠️ [RESEAU] Erreur de connexion brute avec {} : {}", seed_domain, e); }
+    let req = match method {
+        "POST" => HTTP_CLIENT.post(&final_url).header("Content-Type", final_ct).body(final_body.unwrap_or_default()),
+        "DELETE" => HTTP_CLIENT.delete(&final_url), 
+        _ => HTTP_CLIENT.get(&final_url),           
+    };
+
+    match req.send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                Ok(resp.text().await.unwrap_or_default())
+            } else {
+                let error_msg = resp.text().await.unwrap_or_default(); 
+                Err(format!("❌ Rejeté par le Nœud : {}", error_msg)) 
             }
-        }
+        },
+        Err(e) => Err(format!("⚠️ Erreur de connexion : {}", e)),
     }
-
-    Err("❌ Impossible de router la transaction : Vérifiez que le Séquenceur WNS tourne et contient seed.watt.".to_string())
 }
 
 pub fn wrap_in_onion(
@@ -3214,36 +3196,16 @@ pub async fn register_wns_alias(
     domain: String, 
     target_wallet: String, 
     fee: u64, 
-    keys: WalletKeys,
-    action: WnsAction
+    keys: WalletKeys
 ) -> Result<String, String> {
     
-    // L'adresse de réception Kyber n'a pas de préfixe pq_watt_ ou L2_WATT_
     // On vérifie juste qu'il ne s'agit pas de l'adresse courte de minage
     if target_wallet.starts_with("Wq") {
         return Err("❌ L'adresse cible doit être votre longue adresse de réception Kyber, pas l'adresse courte de minage.".to_string());
     }
     
-    submit_wns_transaction(domain, target_wallet, fee, keys, action).await
-}
-
-// Dépôt d'un Serveur Relais
-pub async fn register_wns_relay(
-    domain: String, 
-    ip_port: String, 
-    node_pubkey: String, 
-    fee: u64, 
-    keys: WalletKeys,
-    action: WnsAction
-) -> Result<String, String> {
-    if !ip_port.contains(':') {
-        return Err("❌ Format IP invalide (ex: 82.12.34.56:8000).".to_string());
-    }
-    if node_pubkey.is_empty() {
-        return Err("❌ La clé publique du nœud est requise.".to_string());
-    }
-    let record_data = format!("{}|{}", ip_port, node_pubkey);
-    submit_wns_transaction(domain, record_data, fee, keys, action).await
+    // On force l'action "Register" en dur !
+    submit_wns_transaction(domain, target_wallet, fee, keys, WnsAction::Register).await
 }
 
 // La vraie mécanique interne (l'ancienne register_wns_domain)
@@ -3336,25 +3298,26 @@ async fn submit_wns_transaction(
 }
 
 pub async fn resolve_wns_domain_opsec(domain: &str) -> Result<String, String> {
-    // 1. On cherche d'abord dans la RAM silencieusement
-    {
-        let cache = WNS_CACHE.lock().await;
-        if let Some((record_data, _owner)) = cache.get(domain) {
-            return Ok(record_data.clone());
-        }
-    }
-
-    // 2. Si le nom n'y est pas (ou si le cache est vide), on télécharge TOUT l'annuaire
-    // OpSec : Le serveur ne sait pas quel nom on cherche !
-    crate::set_status("🔄 Téléchargement sécurisé de l'annuaire WNS...");
-    sync_wns_directory(LOCAL_DEV_MODE).await;
-
-    // 3. On revérifie dans la RAM mise à jour
-    let cache = WNS_CACHE.lock().await;
-    if let Some((record_data, _owner)) = cache.get(domain) {
-        Ok(record_data.clone())
-    } else {
-        Err(format!("Le domaine '{}' n'existe pas.", domain))
+    crate::set_status("🔍 Interrogation sécurisée du WNS...");
+    
+    // On tape sur l'API HTTP du WNS local (ou relais de production)
+    let resolver = if LOCAL_DEV_MODE { "http://127.0.0.1:8200" } else { "http://80.78.26.243/api_wns" };
+    let url = format!("{}/resolve/{}", resolver, domain);
+    
+    match HTTP_CLIENT.get(&url).send().await {
+        Ok(res) => {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if json["success"].as_bool().unwrap_or(false) {
+                    let record = json["record_data"].as_str().unwrap_or_default().to_string();
+                    Ok(record)
+                } else {
+                    Err(format!("Le domaine '{}' n'existe pas.", domain))
+                }
+            } else {
+                Err("Erreur JSON lors de la résolution WNS.".to_string())
+            }
+        },
+        Err(e) => Err(format!("Serveur WNS injoignable : {}", e)),
     }
 }
 
