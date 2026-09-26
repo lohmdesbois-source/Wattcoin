@@ -332,7 +332,7 @@ pub fn start_peer_connection(
                 P2PMessage::NewBlock { block, sender_port } => {
 					// DÉCLENCHEMENT DU KILL SWITCH
 					crate::network::HIGHEST_KNOWN_BLOCK.fetch_max(block.header.index, Ordering::Relaxed);
-                    // 1. Clones pour envoyer dans le thread d'arrière-plan
+                    // Clones pour envoyer dans le thread d'arrière-plan
                     let bc_clone = Arc::clone(&blockchain);
                     let block_clone = block.clone();
                     let my_port_clone = my_port.clone();
@@ -342,11 +342,49 @@ pub fn start_peer_connection(
                     let active_peers_clone = Arc::clone(&active_peers);
                     let actual_peer_id_clone = actual_peer_id.clone();
 
-                    // 2. On libère IMMÉDIATEMENT le port TCP (le réseau respire)
+                    // On libère IMMÉDIATEMENT le port TCP (le réseau respire)
                     tokio::spawn(async move {
-                        
-                        // VÉRIFICATION MATHÉMATIQUE HORS DU MUTEX !
-                        // On vérifie tout le bloc sans bloquer le reste du nœud.
+                        // BOUCLIER ANTI-DOS : VÉRIFICATION PoW *AVANT* LE RESTE ET *HORS MUTEX*
+                        let (seed, target) = {
+                            let chain = bc_clone.lock().unwrap();
+                            (chain.get_epoch_seed(block_clone.header.index), chain.target.clone())
+                        };
+
+                        let is_pow_valid = tokio::task::spawn_blocking({
+                            let b_clone = block_clone.clone();
+                            let s = seed.clone();
+                            move || {
+                                let flags = randomx_rs::RandomXFlag::get_recommended_flags();
+                                if let Ok(cache) = randomx_rs::RandomXCache::new(flags, s.as_bytes()) {
+                                    if let Ok(vm) = randomx_rs::RandomXVM::new(flags, Some(cache), None) {
+                                        let miner_address = b_clone.transactions.get(0)
+                                            .and_then(|tx| tx.outputs.get(0))
+                                            .map(|out| out.stealth_address.replace("COINBASE_", ""))
+                                            .unwrap_or_default();
+
+                                        let header_data = format!("{}{}{}{}{}{}{}", 
+                                            miner_address, b_clone.header.index, b_clone.header.timestamp, 
+                                            b_clone.header.previous_hash, b_clone.header.nonce,
+                                            b_clone.header.l2_root, b_clone.header.tx_root 
+                                        );
+
+                                        if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
+                                            let hash_hex = hex::encode(&hash_bytes);
+                                            let hash_bigint = num_bigint::BigUint::parse_bytes(hash_hex.as_bytes(), 16).unwrap_or_default();
+                                            return hash_hex == b_clone.header.hash && hash_bigint <= target;
+                                        }
+                                    }
+                                }
+                                false
+                            }
+                        }).await.unwrap();
+
+                        if !is_pow_valid {
+                            println!("❌ [SÉCURITÉ] Bloc rejeté : Preuve de Travail (PoW) invalide ! Spam détecté.");
+                            return; 
+                        }
+
+                        // BOUCLIER ZKP : VÉRIFICATION DES TX SEULEMENT SI LE POW EST BON !
                         let mut all_math_valid = true;
                         for tx in &block_clone.transactions {
                             if tx.tx_type != TransactionType::Coinbase && tx.tx_type != TransactionType::MicroCoinbase {
@@ -359,10 +397,10 @@ pub fn start_peer_connection(
                         
                         if !all_math_valid {
                             println!("❌ [SÉCURITÉ] Bloc frauduleux ! Cryptographie invalide (Rejeté).");
-                            return; // On jette le bloc sans jamais avoir bloqué le nœud !
+                            return; 
                         }
 
-                        // SEULEMENT MAINTENANT, on bloque la chaîne pour les vérifications de solde (ultra-rapide)
+                        // INSERTION SÉCURISÉE (Le bloc est 100% sûr, on peut verrouiller)
                         let bc_clone_blocking = Arc::clone(&bc_clone); 
                         let validation_result = tokio::task::spawn_blocking(move || {
 							let mut chain = bc_clone_blocking.lock().unwrap();
@@ -372,7 +410,7 @@ pub fn start_peer_connection(
 							if block_clone.header.index < current_height {
 								let our_hash = &chain.get_block_by_height(block_clone.header.index).unwrap().header.hash;
 								if our_hash == &block_clone.header.hash {
-									return Ok(false); // 👈 FAUX : Bloc déjà connu, on arrête les frais.
+									return Ok(false); // FAUX : Bloc déjà connu, on arrête les frais.
 								}
 							}
 
@@ -501,7 +539,7 @@ pub fn start_peer_connection(
 					}
 
 					// 2. LE BOUCLIER QUALITATIF (P2Pool Mining Share)
-					if let TransactionType::MiningShare { nonce, hash, timestamp, .. } = in_tx.tx_type.clone() {
+					if let TransactionType::MiningShare { miner_address, nonce, hash, timestamp, .. } = in_tx.tx_type.clone() {
 						
 						let (target, current_height, previous_hash, seed) = {
 							let chain = blockchain.lock().unwrap();
@@ -541,11 +579,11 @@ pub fn start_peer_connection(
 								return; // On avorte la tâche pour libérer le CPU
 							}
 
-							let parts: Vec<&str> = tx_clone.public_key.split('_').collect();
+							let parts: Vec<&str> = tx_clone.public_key.split('|').collect();
 							let l2_root = parts.get(0).cloned().unwrap_or("");
 							let tx_root = parts.get(1).cloned().unwrap_or("");
 							
-							let header_data = format!("{}{}{}{}{}{}", current_height, timestamp, previous_hash, nonce, l2_root, tx_root);
+							let header_data = format!("{}{}{}{}{}{}{}", miner_address, current_height, timestamp, previous_hash, nonce, l2_root, tx_root);
 							
 							let flags = randomx_rs::RandomXFlag::get_recommended_flags();
 							if let Ok(cache) = randomx_rs::RandomXCache::new(flags, seed.as_bytes()) {
@@ -616,8 +654,9 @@ pub fn start_peer_connection(
                 },
 
                 P2PMessage::MempoolSync { txs } => {
-                    let mut local_mp = mempool.lock().unwrap();
+                    // Ordre strict (Chain -> Mempool) pour éviter le deadlock !
                     let chain = blockchain.lock().unwrap(); 
+                    let mut local_mp = mempool.lock().unwrap(); 
                     let mut added = 0;
                     for t in txs {
                         let mut spent = false;

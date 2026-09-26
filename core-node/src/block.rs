@@ -84,7 +84,9 @@ impl Block {
                     stealth_address: "GENESIS".to_string(),
                     kyber_capsule: "GENESIS_KEY".to_string(),
                     aes_vault: "Wattcoin Nertwork: L'énergie libre, anonyme et post-quantique. 07/Septembre/2026 - Wattcoin casse les règles.".to_string(),
-                    lattice_commitment: crate::lattice::LWECommitment::commit(0, &[0u64; crate::lattice::LATTICE_DIM]),
+                    // On bypass la création de bruit aléatoire pour garantir un hash fixe
+					lattice_commitment: crate::lattice::LWECommitment { t_vector: vec![0u64; crate::lattice::LATTICE_COLS] },
+					range_proof: String::new(),
                 }
             ],
             fee: 0,

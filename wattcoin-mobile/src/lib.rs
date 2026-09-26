@@ -16,7 +16,7 @@ use pqc_kyber::{keypair, encapsulate, decapsulate};
 
 
 // 1. IMPORT DES OUTILS L1 (Depuis le Node Core)
-pub use wattcoin_core::lattice::{self, LWECommitment, LATTICE_DIM};
+pub use wattcoin_core::lattice::{self, LWECommitment, LATTICE_COLS};
 pub use wattcoin_core::transaction::{Transaction, TransactionType, TransactionInput, TransactionOutput, SwapContract};
 pub use wattcoin_core::mixnet::{OnionPacket, HopPayload};
 // On importe la logique officielle du Nœud L1 !
@@ -42,8 +42,8 @@ const FLAME: u64 = 1_000_000_000;
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
 // ===================================================================
-const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
-//const LOCAL_DEV_MODE: bool = true; 
+//const LOCAL_DEV_MODE: bool = false; // ← pour PROD : décommente celle-ci + commente la ligne du dessus
+const LOCAL_DEV_MODE: bool = true; 
 // ===================================================================
 
 #[derive(Debug)]
@@ -990,20 +990,20 @@ pub fn generate_balanced_blinding_factors(
     assert!(num_outputs > 0, "Une transaction doit avoir au moins un output");
 
     // 1. On calcule la somme des masques de tous les UTXOs que l'on dépense
-    let mut sum_in = vec![0u64; LATTICE_DIM];
+    let mut sum_in = vec![0u64; LATTICE_COLS];
     for bf in input_bfs {
-        for i in 0..LATTICE_DIM {
+        for i in 0..LATTICE_COLS {
             sum_in[i] = sum_in[i].wrapping_add(bf[i]);
         }
     }
 
-    let mut out_bfs = vec![vec![0u64; LATTICE_DIM]; num_outputs];
-    let mut sum_out_temp = vec![0u64; LATTICE_DIM];
+    let mut out_bfs = vec![vec![0u64; LATTICE_COLS]; num_outputs];
+    let mut sum_out_temp = vec![0u64; LATTICE_COLS];
     let mut rng = rand::thread_rng();
 
     // 2. Pour tous les outputs SAUF LE DERNIER, on génère de l'aléatoire pur
     for out_idx in 0..(num_outputs - 1) {
-        for i in 0..LATTICE_DIM {
+        for i in 0..LATTICE_COLS {
             let r: u64 = rng.r#gen(); // De l'aléatoire sur 64 bits
             out_bfs[out_idx][i] = r;
             sum_out_temp[i] = sum_out_temp[i].wrapping_add(r);
@@ -1012,7 +1012,7 @@ pub fn generate_balanced_blinding_factors(
 
     // 3. LA MAGIE : Le tout dernier output encaisse la différence stricte
     // Ainsi, sum(out_bfs) sera EXACTEMENT ÉGAL à sum_in
-    for i in 0..LATTICE_DIM {
+    for i in 0..LATTICE_COLS {
         out_bfs[num_outputs - 1][i] = sum_in[i].wrapping_sub(sum_out_temp[i]);
     }
 
@@ -1110,7 +1110,7 @@ pub async fn send_wattcoin(
 
             let mut is_mine = false;
             let mut val = 0u64;
-            let mut my_bf = vec![0u64; LATTICE_DIM];
+            let mut my_bf = vec![0u64; LATTICE_COLS];
 
             if out.stealth_address == format!("COINBASE_{}", my_short_address) 
                 || out.stealth_address == format!("JACKPOT_{}", my_short_address) 
@@ -1191,6 +1191,7 @@ pub async fn send_wattcoin(
             kyber_capsule: hex::encode(&kyber_capsule),
             aes_vault: hex::encode(final_vault),
             lattice_commitment: commitment,
+			range_proof: String::new(),
         });
         bf_index += 1;
 
@@ -1213,7 +1214,8 @@ pub async fn send_wattcoin(
                 stealth_address: format!("{}{}", change_prefix, hex::encode(&otp_c[0..8])),
                 kyber_capsule: hex::encode(&kyber_capsule_change),
                 aes_vault: hex::encode(final_vault_c),
-                lattice_commitment: commitment_c
+                lattice_commitment: commitment_c,
+				range_proof: String::new(),
             });
         }
 
@@ -1225,7 +1227,7 @@ pub async fn send_wattcoin(
         let wots_keys = loop {
             let keys = wots::Wots::generate_keypair(&seed_bytes, current_index);
             let pk_hex = hex::encode(&keys.1);
-            // 👈 FILTRAGE AUSSI SUR LA CLÉ WOTS+ !
+            // FILTRAGE AUSSI SUR LA CLÉ WOTS+ !
             if !spent_keys_snapshot.contains(&pk_hex) && !pending_snapshot.contains(&pk_hex) {
                 break keys;
             }
@@ -1234,9 +1236,13 @@ pub async fn send_wattcoin(
         let pubkey_hex = hex::encode(&wots_keys.1);
 
         let mut final_inputs = Vec::new();
-        for utxo in &selected_utxos_clone {
-            final_inputs.push(TransactionInput { commitment: utxo.2.clone(), source_height: utxo.3 });
-        }
+		for utxo in &selected_utxos_clone {
+			final_inputs.push(TransactionInput { 
+				utxo_id: utxo.1.clone(), // utxo.1 est la kyber_capsule
+				commitment: utxo.2.clone(), 
+				source_height: utxo.3 
+			});
+		}
 
         let mut tx_pq = Transaction { 
             tx_type, 
@@ -1352,7 +1358,7 @@ pub async fn send_data_internal(
 
             let mut is_mine = false;
             let mut val = 0u64;
-            let mut my_bf = vec![0u64; LATTICE_DIM];
+            let mut my_bf = vec![0u64; LATTICE_COLS];
 
             if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) 
                 || out.stealth_address == format!("COINBASE_{}", my_short_address) 
@@ -1425,6 +1431,7 @@ pub async fn send_data_internal(
         kyber_capsule: hex::encode(&kyber_capsule),
         aes_vault: hex::encode(final_vault),
         lattice_commitment: LWECommitment::commit(0, data_bf), 
+		range_proof: String::new(),
     });
     bf_index += 1;
 
@@ -1447,7 +1454,8 @@ pub async fn send_data_internal(
             stealth_address: format!("{}{}", stealth_prefix, hex::encode(&otp2[0..8])),
             kyber_capsule: hex::encode(&kyber_capsule_change),
             aes_vault: hex::encode(final_vault2),
-            lattice_commitment: LWECommitment::commit(change_amount, change_bf)
+            lattice_commitment: LWECommitment::commit(change_amount, change_bf),
+			range_proof: String::new(),
         });
     }
 
@@ -1468,7 +1476,11 @@ pub async fn send_data_internal(
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        final_inputs.push(TransactionInput { commitment: utxo.2.clone(), source_height: utxo.3 });
+        final_inputs.push(TransactionInput { 
+            utxo_id: utxo.1.clone(), 
+            commitment: utxo.2.clone(), 
+            source_height: utxo.3 
+        });
     }
 
     let mut tx_pq = Transaction { 
@@ -1554,7 +1566,7 @@ pub async fn buy_lottery_ticket(
 
             let mut is_mine = false;
             let mut val = 0u64;
-            let mut my_bf = vec![0u64; LATTICE_DIM];
+            let mut my_bf = vec![0u64; LATTICE_COLS];
 
             if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) 
                 || out.stealth_address == format!("COINBASE_{}", my_short_address) 
@@ -1618,6 +1630,7 @@ pub async fn buy_lottery_ticket(
         kyber_capsule: hex::encode(ticket_capsule),
         aes_vault: ticket_price_flames.to_string(),
         lattice_commitment: LWECommitment::commit(ticket_price_flames, ticket_bf),
+		range_proof: String::new(),
     });
     bf_index += 1;
 
@@ -1638,7 +1651,8 @@ pub async fn buy_lottery_ticket(
             stealth_address: format!("pq_watt_{}", hex::encode(&otp_2[0..8])), 
             kyber_capsule: hex::encode(&kyber_capsule_2),
             aes_vault: hex::encode(final_vault_2), 
-            lattice_commitment: LWECommitment::commit(change_amount, change_bf)
+            lattice_commitment: LWECommitment::commit(change_amount, change_bf),
+			range_proof: String::new(),
         });
     }
 
@@ -1665,7 +1679,11 @@ pub async fn buy_lottery_ticket(
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        final_inputs.push(TransactionInput { commitment: utxo.2.clone(), source_height: utxo.3 });
+        final_inputs.push(TransactionInput { 
+            utxo_id: utxo.1.clone(), 
+            commitment: utxo.2.clone(), 
+            source_height: utxo.3 
+        });
     }
 
     let mut tx_pq = Transaction { 
@@ -1782,7 +1800,8 @@ pub async fn claim_wattcoin_swap(secret: String, _hash: String, amount_flames: u
         stealth_address: watt_address.clone(),   // L'adresse publique brute
         kyber_capsule: "HTLC_CLAIM".to_string(), // Un marqueur propre
         aes_vault: amount_flames.to_string(),    // Le montant en texte clair !
-        lattice_commitment: LWECommitment::commit(amount_flames, &[0u64; LATTICE_DIM]),
+        lattice_commitment: LWECommitment::commit(amount_flames, &[0u64; LATTICE_COLS]),
+		range_proof: String::new(),
     };
 
     let secret_bytes = hex::decode(&secret).unwrap_or_default();
@@ -2382,7 +2401,7 @@ pub async fn stake_l2(
 
             let mut is_mine = false;
             let mut val = 0u64;
-            let mut my_bf = vec![0u64; LATTICE_DIM];
+            let mut my_bf = vec![0u64; LATTICE_COLS];
 
             if out.stealth_address == format!("COINBASE_{}", sender_kyber_public_hex) 
                 || out.stealth_address == format!("COINBASE_{}", my_short_address) 
@@ -2429,22 +2448,23 @@ pub async fn stake_l2(
 
     let change_amount = collected_flames - required_total;
     
-    let mut sum_in_bf = vec![0u64; crate::lattice::LATTICE_DIM];
+    let mut sum_in_bf = vec![0u64; crate::lattice::LATTICE_COLS];
     for bf in &input_blinding_factors {
-        for i in 0..crate::lattice::LATTICE_DIM {
+        for i in 0..crate::lattice::LATTICE_COLS {
             sum_in_bf[i] = sum_in_bf[i].wrapping_add(bf[i]);
         }
     }
 
     let mut outputs = Vec::new();
 
-    let stake_bf = vec![0u64; crate::lattice::LATTICE_DIM]; 
+    let stake_bf = vec![0u64; crate::lattice::LATTICE_COLS]; 
     
     outputs.push(TransactionOutput {
         stealth_address: format!("L2_STAKE_{}", sender_kyber_public_hex),
         kyber_capsule: "L2_STAKE_LOCK".to_string(),
         aes_vault: amount_flames.to_string(), 
         lattice_commitment: LWECommitment::commit(amount_flames, &stake_bf), 
+		range_proof: String::new(),
     });
 
     if change_amount > 0 {
@@ -2466,7 +2486,8 @@ pub async fn stake_l2(
             stealth_address: format!("pq_watt_{}", hex::encode(&otp2[0..8])),
             kyber_capsule: hex::encode(&kyber_capsule_change),
             aes_vault: hex::encode(final_vault2),
-            lattice_commitment: LWECommitment::commit(change_amount, change_bf)
+            lattice_commitment: LWECommitment::commit(change_amount, change_bf),
+			range_proof: String::new(),
         });
     }
 
@@ -2487,7 +2508,11 @@ pub async fn stake_l2(
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        final_inputs.push(TransactionInput { commitment: utxo.2.clone(), source_height: utxo.3 });
+        final_inputs.push(TransactionInput { 
+            utxo_id: utxo.1.clone(), 
+            commitment: utxo.2.clone(), 
+            source_height: utxo.3 
+        });
     }
 
     let mut tx_pq = Transaction { 
@@ -2540,7 +2565,7 @@ pub async fn unstake_l2(
     
     let mut selected_utxo = None;
     let mut stake_amount = 0u64;
-    let mut old_bf = vec![0u64; crate::lattice::LATTICE_DIM];
+    let mut old_bf = vec![0u64; crate::lattice::LATTICE_COLS];
 
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
@@ -2561,8 +2586,9 @@ pub async fn unstake_l2(
             if out.stealth_address == format!("L2_STAKE_{}", sender_kyber_public_hex) {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     stake_amount = amt;
-                    old_bf = vec![0u64; crate::lattice::LATTICE_DIM]; 
-                    selected_utxo = Some((out.lattice_commitment.clone(), height));
+                    old_bf = vec![0u64; crate::lattice::LATTICE_COLS]; 
+                    // On stocke la capsule (utxo_id)
+                    selected_utxo = Some((out.kyber_capsule.clone(), out.lattice_commitment.clone(), height));
                     break;
                 }
             }
@@ -2575,7 +2601,8 @@ pub async fn unstake_l2(
 						if let Ok(parsed_bf) = serde_json::from_str::<Vec<u64>>(parts[2]) {
 							old_bf = parsed_bf;
 						}
-						selected_utxo = Some((out.lattice_commitment.clone(), height));
+                        // On stocke la capsule (utxo_id)
+						selected_utxo = Some((out.kyber_capsule.clone(), out.lattice_commitment.clone(), height));
 						break;
 					}
 				}
@@ -2588,7 +2615,8 @@ pub async fn unstake_l2(
 	if current_max_l2 > cache.last_scanned_micro_index { cache.last_scanned_micro_index = current_max_l2; cache_updated = true; }
 	if cache_updated { save_cache(&cache); }
 
-    let (commitment, source_height) = selected_utxo.ok_or(format!("❌ Aucune caution trouvée pour la L2 '{}'.", l2_name))?;
+    // On extrait l'utxo_id en plus du reste
+    let (utxo_id, commitment, source_height) = selected_utxo.ok_or(format!("❌ Aucune caution trouvée pour la L2 '{}'.", l2_name))?;
     
     if stake_amount <= fee { return Err("❌ Caution trop faible pour payer les frais de retrait.".to_string()); }
 
@@ -2615,6 +2643,7 @@ pub async fn unstake_l2(
         kyber_capsule: hex::encode(&new_capsule),
         aes_vault: hex::encode(final_vault),
         lattice_commitment: LWECommitment::commit(return_amount, out_bf),
+		range_proof: String::new(),
     };
 
     let mut seed_bytes = [0u8; 32];
@@ -2634,7 +2663,8 @@ pub async fn unstake_l2(
 
     let mut tx_pq = Transaction {
         tx_type: TransactionType::L2Unstake { l2_name: l2_name.clone() },
-        inputs: vec![TransactionInput { commitment, source_height }],
+        // On insère l'utxo_id !
+        inputs: vec![TransactionInput { utxo_id, commitment, source_height }],
         outputs: vec![output],
         fee,
         wots_signature: None,
@@ -2922,7 +2952,7 @@ pub async fn bridge_to_l2(
 
             let mut is_mine = false;
             let mut val = 0u64;
-            let mut my_bf = vec![0u64; LATTICE_DIM];
+            let mut my_bf = vec![0u64; LATTICE_COLS];
 
             if out.stealth_address.starts_with("pq_watt_") {
                 if let Some(payload_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
@@ -2967,21 +2997,22 @@ pub async fn bridge_to_l2(
 
     let change_amount = collected_flames - required_total;
     
-    let mut sum_in_bf = vec![0u64; crate::lattice::LATTICE_DIM];
+    let mut sum_in_bf = vec![0u64; crate::lattice::LATTICE_COLS];
     for bf in &input_blinding_factors {
-        for i in 0..crate::lattice::LATTICE_DIM {
+        for i in 0..crate::lattice::LATTICE_COLS {
             sum_in_bf[i] = sum_in_bf[i].wrapping_add(bf[i]);
         }
     }
     
     let mut outputs = Vec::new();
-    let bridge_bf = vec![0u64; crate::lattice::LATTICE_DIM];
+    let bridge_bf = vec![0u64; crate::lattice::LATTICE_COLS];
     
     outputs.push(TransactionOutput {
         stealth_address: format!("BRIDGE_L2_{}", l2_target_name.to_uppercase()),
         kyber_capsule: "L2_BRIDGE_LOCK".to_string(),
         aes_vault: amount_flames.to_string(),
         lattice_commitment: LWECommitment::commit(amount_flames, &bridge_bf), 
+		range_proof: String::new(),
     });
 
     if change_amount > 0 {
@@ -3004,7 +3035,8 @@ pub async fn bridge_to_l2(
             stealth_address: format!("pq_watt_{}", hex::encode(&otp2[0..8])),
             kyber_capsule: hex::encode(&kyber_capsule_change),
             aes_vault: hex::encode(final_vault2),
-            lattice_commitment: LWECommitment::commit(change_amount, change_bf)
+            lattice_commitment: LWECommitment::commit(change_amount, change_bf),
+			range_proof: String::new(),
         });
     }
 
@@ -3030,7 +3062,11 @@ pub async fn bridge_to_l2(
 
     let mut final_inputs = Vec::new();
     for utxo in &selected_utxos {
-        final_inputs.push(TransactionInput { commitment: utxo.2.clone(), source_height: utxo.3 });
+        final_inputs.push(TransactionInput { 
+            utxo_id: utxo.1.clone(), 
+            commitment: utxo.2.clone(), 
+            source_height: utxo.3 
+        });
     }
 
     let mut tx_pq = Transaction { 

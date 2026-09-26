@@ -92,12 +92,12 @@ pub enum TransactionType {
     },
 }
 
-// L'Input Anonyme Allégé (On vire la Ring Signature individuelle !)
+// L'Input Anonyme
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
+    pub utxo_id: String, // Identifiant strict (kyber_capsule d'origine)
     pub commitment: LWECommitment,  
     pub source_height: u64,
-    // 💡 Optionnel mais recommandé : Ajouter la référence exacte de l'UTXO précédent (ex: tx_hash)
 }
 
 // L'Output Masqué (Capsule Kyber + Montant Masqué)
@@ -107,6 +107,9 @@ pub struct TransactionOutput {
     pub kyber_capsule: String,        
     pub aes_vault: String,            
     pub lattice_commitment: LWECommitment, 
+	// Emplacement cryptographique pour le ZK Range Proof
+    // Empêche les montants négatifs (underflow) et les montants colossaux
+    pub range_proof: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,66 +123,93 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn hash_data(&self) -> [u8; 64] {
-        let mut hasher = Sha512::new();
-        let tx_data = format!("{:?}{:?}{}", self.tx_type, self.outputs, self.fee);
-        hasher.update(tx_data.as_bytes());
-        let result = hasher.finalize();
-        let mut hash_arr = [0u8; 64];
-        hash_arr.copy_from_slice(&result);
-        hash_arr
-    }
+	pub fn hash_data(&self) -> [u8; 64] {
+		let mut hasher = Sha512::new();
+        
+		// SPLIT CONSENSUS : Sérialisation binaire canonique pure
+		let mut temp_tx = self.clone();
+		temp_tx.wots_signature = None; // On exclut la signature de son propre hash
+		
+		if let Ok(bytes) = bincode::serialize(&temp_tx) {
+			hasher.update(&bytes);
+		}
+        
+		let result = hasher.finalize();
+		let mut hash_arr = [0u8; 64];
+		hash_arr.copy_from_slice(&result);
+		hash_arr
+	}
 
     pub fn is_valid(&self) -> bool {
-        if matches!(self.tx_type,
-            TransactionType::Coinbase 
-			| TransactionType::MicroCoinbase
-            | TransactionType::DexSettlement { .. } 
-            | TransactionType::LotteryPayout { .. }
-			| TransactionType::MiningShare { .. }  
-            | TransactionType::HTLCRefund { .. } 
-            | TransactionType::L2Anchor { .. } 
-            ) {
-            return true;
+        let is_consensus_mint = matches!(self.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::LotteryPayout { .. });
+        let is_feeless_empty = matches!(self.tx_type, TransactionType::DexSettlement { .. } | TransactionType::MiningShare { .. });
+
+        // 1. Bloquer les transactions sans input (SAUF consensus/mint)
+        if !is_consensus_mint && !is_feeless_empty && self.inputs.is_empty() {
+            println!("⛔ Rejet : Transaction standard sans input.");
+            return false;
         }
 
+        // 2. Empêcher la création d'outputs fantômes sur les signaux P2P (Dex/Minage)
+        if is_feeless_empty && (!self.outputs.is_empty() || !self.inputs.is_empty()) {
+            println!("⛔ Rejet : Les DexSettlement et MiningShare ne peuvent avoir ni input ni output.");
+            return false;
+        }
+
+        // 3. Bloquer l'underflow sur les frais
+        // Limite fixée à 10 milliards de WATT (10^19 Flames), ce qui rentre parfaitement dans un u64
+        let max_supply_flames = 10_000_000_000_u64 * 1_000_000_000_u64;
+        if self.fee > max_supply_flames {
+            println!("⛔ Rejet : Frais aberrants.");
+            return false;
+        }
+
+        // 4. Validation stricte des signatures WOTS+
+        if let Some(sig) = &self.wots_signature {
+            let hash = self.hash_data();
+            let mut hash_32 = [0u8; 32];
+            hash_32.copy_from_slice(&hash[0..32]);
+            
+            if !wots::Wots::verify(sig, &hash_32) {
+                println!("⛔ Rejet : Signature WOTS+ invalide.");
+                return false;
+            }
+        } else if !is_consensus_mint && !is_feeless_empty {
+            println!("⛔ Rejet : Transaction non signée.");
+            return false;
+        }
+
+        // 5. Validation de la Preuve de Secret (HTLC)
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
             if secret.is_empty() { return false; }
             let secret_bytes = hex::decode(secret).unwrap_or_default();
             let real_hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
-            return real_hash == self.public_key; 
+            if real_hash != self.public_key { return false; }
         }
-		
-        if self.inputs.len() > 256 || self.outputs.len() > 256 {
-            return false;
-        }
+
+        if self.inputs.len() > 256 || self.outputs.len() > 256 { return false; }
 
         let mut total_vault_size = 0;
         for out in &self.outputs { total_vault_size += out.aes_vault.len(); }
         if total_vault_size > 8_388_608 { return false; }
 
-        let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
-        let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
-        // Validation Homomorphe LWE des montants
-        if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { 
-            return false; 
-        }
-
-        let tx_hash_64 = self.hash_data();
-        // Conversion du hash 64 octets (SHA512) en 32 octets pour la vérification WOTS+ (qui tourne en SHA256)
-        let mut tx_hash_32 = [0u8; 32];
-        tx_hash_32.copy_from_slice(&tx_hash_64[0..32]);
-
-        // 2. Vérification de la signature WOTS+ (L'Expéditeur)
+        // 6. Validation Homomorphe (Appliquée SEULEMENT si la transaction dépense des UTXOs)
         if !self.inputs.is_empty() {
-            if let Some(wots_sig) = &self.wots_signature {
-                // Le Nœud utilise la fonction native de ta librairie WOTS !
-                if !wots::Wots::verify(wots_sig, &tx_hash_32) { return false; }
-            } else {
-                return false; // Pas de signature, rejet !
+            let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
+            let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
+            if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { 
+                return false; 
             }
         }
-		
-		true
+
+        // 7. RANGE PROOF UNIVERSEL : Personne n'y échappe, pas même la Loterie ou la Coinbase !
+        for out in &self.outputs {
+            if !LWECommitment::verify_range_proof(&out.lattice_commitment, &out.range_proof) {
+                println!("⛔ Rejet : Range Proof invalide (Montant illégal ou underflow).");
+                return false;
+            }
+        }
+        
+        true
     }
 }

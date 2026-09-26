@@ -430,6 +430,7 @@ async fn main() {
 
                             if is_my_gas && amt_collected > 0 {
                                 selected_inputs.push(wattcoin_core::transaction::TransactionInput {
+                                    utxo_id: out.kyber_capsule.clone(), 
                                     commitment: out.lattice_commitment.clone(),
                                     source_height: height,
                                 });

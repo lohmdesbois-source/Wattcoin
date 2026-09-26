@@ -5370,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_core"
-version = "3.0.1"
+version = "4.0.1"
 dependencies = [
  "aes-gcm",
  "arti-client",
@@ -5788,6 +5788,7 @@ name = "wots"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "hkdf",
  "rand",
  "serde",
  "sha2",

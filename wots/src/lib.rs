@@ -1,6 +1,4 @@
 use sha2::{Sha256, Digest};
-use rand::{RngCore, SeedableRng};
-use rand::rngs::StdRng;
 use serde::{Serialize, Deserialize};
 
 pub const WOTS_CHAINS: usize = 32 + 2; // 32 octets pour le hash + 2 pour le checksum
@@ -16,22 +14,26 @@ pub struct WotsSignature {
 pub struct Wots;
 
 impl Wots {
-    /// Génère une paire de clés WOTS+ déterministe avec clé publique compressée (32 octets)
+    // Génération déterministe via HKDF (Strict & Immuable)
     pub fn generate_keypair(master_seed: &[u8], index: u64) -> (Vec<[u8; 32]>, Vec<u8>) {
-        let mut hasher = Sha256::new();
-        hasher.update(master_seed);
-        hasher.update(index.to_be_bytes());
-        let sub_seed = hasher.finalize();
+        use hkdf::Hkdf;
+        use sha2::Sha256;
 
-        let mut rng = StdRng::from_seed(sub_seed.into());
+        // Dérivation d'une sous-graine unique pour cet index
+        let hk = Hkdf::<Sha256>::new(None, master_seed);
+        let mut sub_seed = [0u8; 32];
+        hk.expand(&index.to_be_bytes(), &mut sub_seed).expect("HKDF expand failed");
+
+        // Génération de la matrice de clés secrètes (WOTS_CHAINS * 32 octets)
         let mut secret_key = Vec::with_capacity(WOTS_CHAINS);
+        let prf_hk = Hkdf::<Sha256>::new(None, &sub_seed);
         
-        // On prépare le hasher qui va compresser tous les bouts de la clé publique
         let mut pk_hasher = Sha256::new();
 
-        for _ in 0..WOTS_CHAINS {
+        for i in 0..WOTS_CHAINS {
             let mut sk_chunk = [0u8; 32];
-            rng.fill_bytes(&mut sk_chunk);
+            // On utilise l'index de la chaîne comme contexte pour générer le chunk
+            prf_hk.expand(&(i as u32).to_be_bytes(), &mut sk_chunk).expect("HKDF expand failed");
             secret_key.push(sk_chunk);
 
             let mut pk_chunk = sk_chunk;
@@ -40,11 +42,9 @@ impl Wots {
                 h.update(&pk_chunk);
                 pk_chunk = h.finalize().into();
             }
-            // Au lieu de stocker le chunk, on l'ajoute directement dans le hachoir final
             pk_hasher.update(&pk_chunk);
         }
 
-        // La clé publique finale est l'empreinte unique de 32 octets
         let compressed_pk: [u8; 32] = pk_hasher.finalize().into();
 
         (secret_key, compressed_pk.to_vec()) 

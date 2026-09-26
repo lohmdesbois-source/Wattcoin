@@ -656,7 +656,9 @@ async fn main() {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
 
-                    let header_data = format!("{}{}{}{}{}{}", 
+                    // Le PoW est désormais indissociable de l'adresse du mineur
+                    let header_data = format!("{}{}{}{}{}{}{}", 
+                        miner_address_clone,
 						candidate_block.header.index, 
 						candidate_block.header.timestamp, 
 						candidate_block.header.previous_hash, 
@@ -686,8 +688,8 @@ async fn main() {
                                     timestamp: candidate_block.header.timestamp 
                                 },
                                 inputs: vec![], outputs: vec![], fee: 0,
-                                // On sépare par des :
-								public_key: format!("{}_{}_{}", candidate_block.header.l2_root, candidate_block.header.tx_root, candidate_block.header.nonce), 
+                                // On sépare par des |
+								public_key: format!("{}|{}|{}", candidate_block.header.l2_root, candidate_block.header.tx_root, candidate_block.header.nonce), 
 								wots_signature: None,
                             };
                             let mut pool = miner_mempool.lock().unwrap();
@@ -832,7 +834,8 @@ async fn main() {
                                         stealth_address: format!("L2_WATT_{}", hex::encode(&keypair.1)),
                                         kyber_capsule: format!("MICRO_COINBASE_{}", global_l2_index), // 💡 Propre
                                         aes_vault: sequencer_reward.to_string(),
-                                        lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(sequencer_reward, &[0u64; wattcoin_core::lattice::LATTICE_DIM]),
+                                        lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(sequencer_reward, &[0u64; wattcoin_core::lattice::LATTICE_COLS]),
+										range_proof: String::new(),
                                     }
                                 ];
 
@@ -842,7 +845,8 @@ async fn main() {
                                         stealth_address: "LOTTERY_RESERVE".to_string(),
                                         kyber_capsule: format!("L2_TAX_CAPSULE_{}", global_l2_index), // 💡 Propre
                                         aes_vault: lottery_tax.to_string(),
-                                        lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(lottery_tax, &[0u64; wattcoin_core::lattice::LATTICE_DIM]),
+                                        lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(lottery_tax, &[0u64; wattcoin_core::lattice::LATTICE_COLS]),
+										range_proof: String::new(),
                                     });
                                 }
 

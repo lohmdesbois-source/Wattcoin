@@ -5462,7 +5462,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_core"
-version = "3.0.1"
+version = "3.0.3"
 dependencies = [
  "aes-gcm",
  "arti-client",
@@ -5491,7 +5491,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_name_service"
-version = "0.2.3"
+version = "0.2.7"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",

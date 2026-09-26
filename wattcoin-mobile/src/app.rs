@@ -344,11 +344,11 @@ impl WattcoinApp {
                     current_block_height = info["blocks"].as_u64().unwrap_or(0); 
                 }
                 
-                // FIX DU PRIX : S'il est à 0, on envoie -1 pour dire au Wallet de garder l'ancien !
+                // PRIX DEX : Empêche la ruine visuelle en cas de perte de connexion
                 let watt_price_usd = if price_sats > 0 {
                     (price_sats as f64 / 100_000_000.0) * btc_usd
                 } else {
-                    -1.0 
+                    -1.0 // Un flag clair d'erreur
                 };
 				
 				// Récupération des métriques réseau
@@ -647,7 +647,7 @@ impl eframe::App for WattcoinApp {
                     self.balance_btc = balance_btc; 
 					self.balance_wns = balance_wns;
                     
-                    // On ne met à jour que si c'est valide
+                    // PRIX DEX : On ignore le prix s'il est négatif !
                     if price_usd >= 0.0 {
                         self.watt_price_usd = price_usd;
                     }

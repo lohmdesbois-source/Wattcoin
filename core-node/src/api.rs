@@ -211,9 +211,19 @@ pub async fn start_api_server(
                 match packet.peel(&secret_for_onion) {
                     Ok(hop_payload) => {
                         if hop_payload.next_hop_address.starts_with("http") {
-                            println!("🎯 [MIXNET] Nœud de Sortie (Exit Node) ! Routage final...");
-                            
                             let target_url = hop_payload.next_hop_address.clone();
+							// SSRF : On interdit formellement au nœud de requêter le réseau local !
+                            if target_url.contains("127.0.0.1") 
+                                || target_url.contains("localhost") 
+                                || target_url.contains("169.254.") // AWS/GCP Metadata
+                                || target_url.contains("10.")      // LAN
+                                || target_url.contains("192.168.") // LAN
+                            {
+                                println!("🚨 [SÉCURITÉ] Tentative de SSRF bloquée vers : {}", target_url);
+                                return warp::reply::with_status(warp::reply::json(&"❌ [SÉCURITÉ] SSRF Interdit"), warp::http::StatusCode::FORBIDDEN).into_response();
+                            }
+
+                            println!("🎯 [MIXNET] Nœud de Sortie (Exit Node) ! Routage final...");
                             let payload = hop_payload.inner_data.clone();
                             
                             let client = reqwest::Client::new();
@@ -341,19 +351,14 @@ pub async fn start_api_server(
                 let chain_lock = chain_arc.lock().unwrap();
                 let pool_lock = mempool.lock().unwrap();
 
-                if let Some(sig) = &tx.wots_signature {
-					let ki = hex::encode(&sig.public_key); 
-					if chain_lock.spent_key_images.contains(&ki) { 
-						return warp::reply::with_status(warp::reply::json(&"❌ Fonds déjà dépensés"), warp::http::StatusCode::BAD_REQUEST); 
-					}
-					if pool_lock.iter().any(|m_tx| {
-						if let Some(m_sig) = &m_tx.wots_signature {
-							hex::encode(&m_sig.public_key) == ki
-						} else { false }
-					}) { 
-						return warp::reply::with_status(warp::reply::json(&"❌ TX déjà en attente"), warp::http::StatusCode::BAD_REQUEST); 
-					}
-				}
+                for input in &tx.inputs {
+                    if chain_lock.spent_key_images.contains(&input.utxo_id) { 
+                        return warp::reply::with_status(warp::reply::json(&"❌ UTXO déjà dépensé on-chain"), warp::http::StatusCode::BAD_REQUEST); 
+                    }
+                    if pool_lock.iter().any(|m_tx| m_tx.inputs.iter().any(|i| i.utxo_id == input.utxo_id)) { 
+                        return warp::reply::with_status(warp::reply::json(&"❌ UTXO déjà en cours de dépense dans la mempool"), warp::http::StatusCode::BAD_REQUEST); 
+                    }
+                }
             }
             
             if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
@@ -1131,17 +1136,22 @@ pub async fn start_api_server(
                 let last_block_hash = &chain_guard.get_last_block().header.hash;
                 
                 use sha2::Digest;
-                let mut vrf_hasher = sha2::Sha256::new();
-                vrf_hasher.update(last_block_hash.as_bytes());
-                vrf_hasher.update(l2_name.as_bytes());
-                let vrf_hash = vrf_hasher.finalize();
-
-                let mut hash_bytes = [0u8; 8];
-                hash_bytes.copy_from_slice(&vrf_hash[0..8]);
-                let random_number = u64::from_be_bytes(hash_bytes);
-
-                let winner_index = (random_number as usize) % candidates.len();
-                elected_pubkey = candidates[winner_index].clone();
+                let mut lowest_score = [0xFFu8; 32];
+                
+                for candidate in &candidates {
+                    let mut vrf_hasher = sha2::Sha256::new();
+                    vrf_hasher.update(last_block_hash.as_bytes());
+                    vrf_hasher.update(l2_name.as_bytes());
+                    vrf_hasher.update(candidate.as_bytes()); 
+                    
+                    let mut vrf_hash = [0u8; 32];
+                    vrf_hash.copy_from_slice(&vrf_hasher.finalize());
+                    
+                    if vrf_hash < lowest_score {
+                        lowest_score = vrf_hash;
+                        elected_pubkey = candidate.clone();
+                    }
+                }
             }
 
             if elected_pubkey.is_empty() {
