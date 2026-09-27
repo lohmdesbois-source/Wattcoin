@@ -1223,6 +1223,100 @@ pub async fn start_api_server(
                 "pubkey": pubkey_clone
             }))
         });
+		
+	// ===================================================================
+    // EXPLORATEUR : PAGINATION ET RECHERCHE DANS LA DB SLED
+    // ===================================================================
+    let explorer_api = warp::path("explorer")
+        .and(warp::get())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(chain_filter.clone())
+        .map(|params: std::collections::HashMap<String, String>, chain_arc: Arc<Mutex<Blockchain>>| {
+            let chain = chain_arc.lock().unwrap();
+            let page = params.get("page").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).max(1);
+            let limit = 10;
+            let layer = params.get("layer").cloned().unwrap_or_else(|| "l1".to_string());
+            let search = params.get("q").cloned().unwrap_or_default().to_lowercase();
+
+            let mut results = Vec::new();
+            let mut total_pages = 1;
+
+            if layer == "l1" {
+                if !search.is_empty() {
+                    // RECHERCHE DANS LE L1
+                    for i in (0..=chain.current_height).rev() {
+                        if let Some(block) = chain.get_block_by_height(i) {
+                            let mut match_found = block.header.index.to_string() == search || block.header.hash.to_lowercase() == search;
+                            if !match_found {
+                                for tx in &block.transactions {
+                                    if tx.public_key.to_lowercase().contains(&search) { match_found = true; break; }
+                                    for out in &tx.outputs {
+                                        if out.stealth_address.to_lowercase().contains(&search) || out.kyber_capsule.to_lowercase().contains(&search) { match_found = true; break; }
+                                    }
+                                }
+                            }
+                            if match_found {
+                                results.push(serde_json::json!({ "height": block.header.index, "timestamp": block.header.timestamp, "transactions": block.transactions, "is_l2": false }));
+                                if results.len() >= limit as usize { break; } // Limite la recherche à 10 résultats max
+                            }
+                        }
+                    }
+                } else {
+                    // PAGINATION CLASSIQUE L1
+                    total_pages = (chain.current_height + limit) / limit;
+                    let start_idx = chain.current_height.saturating_sub((page - 1) * limit);
+                    
+                    for i in 0..limit {
+                        if start_idx < i { break; }
+                        if let Some(block) = chain.get_block_by_height(start_idx - i) {
+                            results.push(serde_json::json!({ "height": block.header.index, "timestamp": block.header.timestamp, "transactions": block.transactions, "is_l2": false }));
+                        }
+                    }
+                }
+            } else {
+                // PAGINATION ET RECHERCHE L2 (Sled Tree)
+                if let Ok(l2_tree) = chain.db.open_tree("l2_blocks") {
+                    let total_items = l2_tree.len() as u64;
+                    total_pages = (total_items + limit - 1) / limit;
+                    let skip = (page - 1) * limit;
+                    let mut count = 0;
+
+                    for item in l2_tree.iter().rev() {
+                        if let Ok((_, value)) = item {
+                            if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                if !search.is_empty() {
+                                    let mut match_found = mb.micro_index.to_string() == search || mb.l1_parent_hash.to_lowercase() == search;
+                                    if !match_found {
+                                        for tx in &mb.transactions {
+                                            if tx.public_key.to_lowercase().contains(&search) { match_found = true; break; }
+                                            for out in &tx.outputs {
+                                                if out.stealth_address.to_lowercase().contains(&search) || out.kyber_capsule.to_lowercase().contains(&search) { match_found = true; break; }
+                                            }
+                                        }
+                                    }
+                                    if match_found {
+                                        results.push(serde_json::json!({ "micro_index": mb.micro_index, "timestamp": mb.timestamp, "transactions": mb.transactions, "is_l2": true }));
+                                        if results.len() >= limit as usize { break; }
+                                    }
+                                } else {
+                                    if count >= skip && count < skip + limit {
+                                        results.push(serde_json::json!({ "micro_index": mb.micro_index, "timestamp": mb.timestamp, "transactions": mb.transactions, "is_l2": true }));
+                                    }
+                                    count += 1;
+                                    if count >= skip + limit { break; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            warp::reply::json(&serde_json::json!({
+                "blocks": results,
+                "total_pages": total_pages.max(1),
+                "current_page": page
+            }))
+        });
 
     // SÉCURITÉ CORS : Interdit aux pages web de forger des requêtes en arrière-plan
     // Le Wallet desktop n'utilise pas de navigateur, il n'est donc pas bloqué.
@@ -1262,6 +1356,7 @@ pub async fn start_api_server(
         .or(get_fee_schedule) // La nouvelle route dynamique pour les frais !
 		.or(get_fee_estimate) // Route pour l'explorer
 		.or(get_pubkey)
+		.or(explorer_api)
         .with(cors);
 	
 	println!("🚀 [API] Serveur RPC Démarré sur {}.{}.{}.{}:{}", host_ip[0], host_ip[1], host_ip[2], host_ip[3], port);

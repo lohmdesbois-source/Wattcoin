@@ -11,7 +11,7 @@ use sled::Db;
 const FLAME: u64 = 1_000_000_000;
 const MAX_BLOCK_SIZE_BYTES: usize = 32 * 1024 * 1024; // 32 Mo maximum par bloc !
 const MAX_BLOCK_L2_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2 Mo maximum par microbloc !
-const MATURITY_BLOCKS: u64 = 12; // 12 Prod
+const MATURITY_BLOCKS: u64 = 1; // 12 Prod
 const EXPECTED_BLOCK_TIME: u64 = 120;    // 2 mins (120 s)
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
