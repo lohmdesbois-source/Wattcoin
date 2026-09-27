@@ -895,7 +895,14 @@ impl Blockchain {
                 vm = RandomXVM::new(flags, Some(cache.clone()), None).unwrap();
             }
 
-            let header_data = format!("{}{}{}{}{}{}", 
+            // On extrait l'adresse du mineur depuis la transaction Coinbase
+            let miner_address = block.transactions.get(0)
+                .and_then(|tx| tx.outputs.get(0))
+                .map(|out| out.stealth_address.replace("COINBASE_", ""))
+                .unwrap_or_default();
+			
+            let header_data = format!("{}{}{}{}{}{}{}", 
+                miner_address,
 				block.header.index, 
 				block.header.timestamp, 
 				block.header.previous_hash, 
