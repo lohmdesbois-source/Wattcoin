@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
+use once_cell::sync::Lazy;
 use crate::block::Block;
 use crate::blockchain::Blockchain;
 use crate::transaction::{Transaction, TransactionType};
@@ -16,6 +17,10 @@ use crate::mixnet::OnionPacket;
 // Le channel gère du binaire pur (Vec<u8>)
 pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 pub static HIGHEST_KNOWN_BLOCK: AtomicU64 = AtomicU64::new(0);
+// BOUCLIER ANTI-DOS & BAN LIST
+pub static BANNED_PEERS: Lazy<Mutex<HashMap<String, i64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+const MAX_PEERS: usize = 50;
+const BAN_DURATION_SECS: i64 = 3600; // Banni pour 1 heure
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -57,7 +62,7 @@ pub struct DhtRecord {
 
 
 // Lecture avec préfixe de taille (TCP Framing)
-async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R) -> Option<P2PMessage> {
+async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R, peer_ip: &str) -> Option<P2PMessage> {
     let mut len_buf = [0u8; 4];
     
     // 1. On lit exactement 4 octets pour connaître la taille
@@ -69,7 +74,8 @@ async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R) 
     
     if length > MAX_MESSAGE_SIZE {
         println!("🚨 [SÉCURITÉ] Flux TCP ignoré : Message binaire trop volumineux ({} octets).", length);
-        return None; 
+        ban_peer(peer_ip, "Spam Mémoire (Payload géant)");
+        return None; // 👈 Coupe la connexion instantanément
     }
     
     // 3. On lit exactement le reste du message
@@ -101,7 +107,28 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
         let (socket, peer_addr) = listener.accept().await.unwrap();
         let peer_ip = peer_addr.ip().to_string();
         
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        // --- BOUCLIER ANTI-DOS : LIMITES ET BAN LIST ---
+        let current_time = chrono::Utc::now().timestamp();
+        
+        let is_banned = {
+            let mut bans = BANNED_PEERS.lock().unwrap();
+            bans.retain(|_, &mut unban_time| current_time < unban_time); // Purge des vieux bans
+            bans.contains_key(&peer_ip)
+        };
+
+        if is_banned {
+            println!("🚫 Rejet de la connexion : IP {} est actuellement bannie.", peer_ip);
+            continue; // On ferme la socket sans répondre
+        }
+
+        let current_peers = active_peers.lock().unwrap().len();
+        if current_peers >= MAX_PEERS {
+            println!("⚠️ Nœud saturé ({} peers max). Rejet de {}.", MAX_PEERS, peer_ip);
+            continue;
+        }
+        // -----------------------------------------------
+
+        let now = chrono::Local::now().format("%d-%m-%Y %H:%M:%S");
         println!("🤝 [{}] Nouvelle connexion P2P entrante depuis {} !", now, peer_ip);
         
         start_peer_connection(
@@ -147,7 +174,7 @@ pub fn start_peer_connection(
 
         // La boucle d'écoute existante...
         // On lit directement sur read_half
-        while let Some(message) = read_p2p_message(&mut read_half).await {
+        while let Some(message) = read_p2p_message(&mut read_half, &peer_ip).await {
             match message {
                 P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
                     actual_peer_id = format!("{}:{}_{}", peer_ip, sender_port, random_id);
@@ -341,6 +368,7 @@ pub fn start_peer_connection(
                     let dex_pool_clone = Arc::clone(&dex_pool);
                     let active_peers_clone = Arc::clone(&active_peers);
                     let actual_peer_id_clone = actual_peer_id.clone();
+					let peer_ip_task = peer_ip.clone();
 
                     // On libère IMMÉDIATEMENT le port TCP (le réseau respire)
                     tokio::spawn(async move {
@@ -381,6 +409,7 @@ pub fn start_peer_connection(
 
                         if !is_pow_valid {
                             println!("❌ [SÉCURITÉ] Bloc rejeté : Preuve de Travail (PoW) invalide ! Spam détecté.");
+                            crate::network::ban_peer(&peer_ip_task, "Faux PoW (Spam CPU)");
                             return; 
                         }
 
@@ -397,6 +426,7 @@ pub fn start_peer_connection(
                         
                         if !all_math_valid {
                             println!("❌ [SÉCURITÉ] Bloc frauduleux ! Cryptographie invalide (Rejeté).");
+                            crate::network::ban_peer(&peer_ip_task, "Cryptographie falsifiée");
                             return; 
                         }
 
@@ -955,4 +985,10 @@ pub fn setup_upnp(port: u16) {
             Err(e) => println!("⚠️ [UPnP] Routeur introuvable ou UPnP désactivé ({:?}).", e),
         }
     });
+}
+
+pub fn ban_peer(ip: &str, reason: &str) {
+    println!("🛑 [SÉCURITÉ] IP bannie ({}): {}", ip, reason);
+    let unban_time = chrono::Utc::now().timestamp() + BAN_DURATION_SECS;
+    BANNED_PEERS.lock().unwrap().insert(ip.to_string(), unban_time);
 }

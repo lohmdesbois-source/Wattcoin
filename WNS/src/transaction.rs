@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Sha512, Digest}; // 💡 Ajout de Sha256
+use sha2::{Sha512, Digest};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum WnsAction {
@@ -12,7 +12,7 @@ pub struct L2Transaction {
     pub account_address: String, 
     pub sender_pubkey: String,   
     pub next_pubkey: String,     
-    pub nonce: u64,              // 💡 LE COMPTEUR ANTI-REJEU !
+    pub nonce: u64,              // LE COMPTEUR ANTI-REJEU !
     
     pub action: WnsAction,       
     pub domain_name: String,     
@@ -24,7 +24,7 @@ pub struct L2Transaction {
 }
 
 impl L2Transaction {
-    pub fn hash_data(&self) -> [u8; 32] { // 💡 WOTS+ exige exactement 32 octets
+    pub fn hash_data(&self) -> [u8; 64] { // WOTS+ exige exactement 64 octets
         let mut hasher = Sha512::new();
         hasher.update(self.account_address.as_bytes());
         hasher.update(self.sender_pubkey.as_bytes());
@@ -42,12 +42,8 @@ impl L2Transaction {
         hasher.update(&self.amount.to_be_bytes()); 
         hasher.update(&self.fee.to_be_bytes());
         
-        // On réduit le SHA-512 en SHA-256 pour WOTS+
-        let mut final_hasher = Sha256::new();
-        final_hasher.update(hasher.finalize());
-        
-        let mut result = [0u8; 32];
-        result.copy_from_slice(&final_hasher.finalize());
+        let mut result = [0u8; 64];
+        result.copy_from_slice(&hasher.finalize());
         result
     }
 }

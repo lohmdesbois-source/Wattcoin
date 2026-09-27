@@ -438,19 +438,11 @@ impl Blockchain {
 						continue;
 					}
 
-					let mut is_valid_math = true;
-					for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
-						let expected = if i == 0 { stake_amount } else { 0 };
-						let diff = val.wrapping_sub(expected);
-						if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
-							is_valid_math = false; break;
-						}
+					if tx.outputs[0].amount != stake_amount {
+						println!("⛔ Rejet : Le montant staké ne correspond pas au montant verrouillé !");
+						continue; 
 					}
 					
-					if !is_valid_math {
-						println!("⛔ Rejet : Fraude mathématique ! L'engagement Lattice ne correspond pas au montant déclaré.");
-						continue;
-					}
 				}
 				
 				if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
@@ -473,18 +465,9 @@ impl Blockchain {
 						continue;
 					}
 
-					let mut is_valid_math = true;
-					for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
-						let expected = if i == 0 { bridge_amount } else { 0 };
-						let diff = val.wrapping_sub(expected);
-						if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
-							is_valid_math = false; break;
-						}
-					}
-					
-					if !is_valid_math {
-						println!("⛔ Rejet : Fraude mathématique ! L'engagement Lattice du Bridge ne correspond pas au montant déclaré.");
-						continue; 
+					if tx.outputs[0].amount != bridge_amount {
+						println!("⛔ Rejet : Le montant bridge ne correspond pas !");
+						continue;
 					}
 
 					println!("🌉 [BRIDGE L2] {} Flames verrouillés publiquement pour le réseau {}", bridge_amount, l2_target_name);
@@ -643,8 +626,7 @@ impl Blockchain {
                 stealth_address: format!("COINBASE_{}", miner_address), 
                 kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
                 aes_vault: final_finder_reward.to_string(), 
-                lattice_commitment: crate::lattice::LWECommitment::commit(final_finder_reward, &[0u64; crate::lattice::LATTICE_COLS]),
-				range_proof: String::new(),
+                amount: final_finder_reward,
             });
 
 			let mut aggregated_shares: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -660,8 +642,7 @@ impl Blockchain {
 					stealth_address: format!("COINBASE_{}", share_addr), 
 					kyber_capsule: format!("SHARE_CAPSULE_{}_{}", current_height, i),
 					aes_vault: total_reward.to_string(), 
-					lattice_commitment: crate::lattice::LWECommitment::commit(total_reward, &[0u64; crate::lattice::LATTICE_COLS]),
-					range_proof: String::new(),
+					amount: total_reward,
 				});
 			}
 			
@@ -675,8 +656,7 @@ impl Blockchain {
                 stealth_address: format!("COINBASE_{}", miner_address), 
                 kyber_capsule: format!("COINBASE_CAPSULE_{}", current_height),
                 aes_vault: total_solo_reward.to_string(), 
-                lattice_commitment: crate::lattice::LWECommitment::commit(total_solo_reward, &[0u64; crate::lattice::LATTICE_COLS]),
-				range_proof: String::new(),
+                amount: total_solo_reward,
             });
         }
 
@@ -685,8 +665,7 @@ impl Blockchain {
                 stealth_address: "LOTTERY_RESERVE".to_string(), 
                 kyber_capsule: format!("TAX_CAPSULE_{}", current_height),
                 aes_vault: total_lottery_tax.to_string(), 
-                lattice_commitment: crate::lattice::LWECommitment::commit(total_lottery_tax, &[0u64; crate::lattice::LATTICE_COLS]),
-				range_proof: String::new(),
+                amount: total_lottery_tax,
             });
         }
 		
@@ -742,8 +721,7 @@ impl Blockchain {
                     stealth_address: format!("JACKPOT_{}", winner_pubkey),
                     kyber_capsule: format!("JACKPOT_PAYOUT_{}", current_height),
                     aes_vault: jackpot_amount.to_string(),
-                    lattice_commitment: crate::lattice::LWECommitment::commit(jackpot_amount, &[0u64; crate::lattice::LATTICE_COLS]),
-					range_proof: String::new(),
+                    amount: jackpot_amount,
                 };
 
                 let lottery_payout_tx = Transaction {
@@ -1303,18 +1281,10 @@ impl Blockchain {
 					return Err("❌ FRAUDE : L'adresse de destination du Staking est invalide !".into());
 				}
 
-				let mut is_valid_math = true;
-				for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
-					let expected = if i == 0 { stake_amount } else { 0 };
-					let diff = val.wrapping_sub(expected);
-					if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
-						is_valid_math = false; break;
-					}
+				if tx.outputs[0].amount != stake_amount {
+					return Err("⛔ Rejet : Le montant staké ne correspond pas au montant verrouillé !".into());
 				}
 				
-				if !is_valid_math {
-					return Err("❌ FRAUDE : Fraude mathématique ! L'engagement Lattice ne correspond pas au montant déclaré.".into());
-				}
 			}
 			
 			if let TransactionType::L2Unstake { l2_name } = &tx.tx_type {
@@ -1354,19 +1324,10 @@ impl Blockchain {
 					return Err("⛔ Rejet : Le montant du bridge est invalide ou nul !".into());
 				}
 
-				let mut is_valid_math = true;
-				for (i, &val) in tx.outputs[0].lattice_commitment.t_vector.iter().enumerate() {
-					let expected = if i == 0 { bridge_amount } else { 0 };
-					let diff = val.wrapping_sub(expected);
-					if diff > 24 && diff < u64::MAX.wrapping_sub(24) {
-						is_valid_math = false; break;
-					}
+				if tx.outputs[0].amount != bridge_amount {
+					return Err("⛔ Rejet : Le montant bridge ne correspond pas !".into());
 				}
 				
-				if !is_valid_math {
-					return Err("⛔ Rejet : Fraude mathématique ! L'engagement Lattice du Bridge ne correspond pas au montant déclaré.".into());
-				}
-
 				println!("🌉 [BRIDGE L2] {} Flames verrouillés publiquement pour le réseau {}", bridge_amount, l2_target_name);
 			}
 			
@@ -1422,14 +1383,12 @@ impl Blockchain {
                     let mut hash_array = [0u8; 64];
                     hash_array.copy_from_slice(&hasher.finalize());
                     
-                    let mut hash_arr_32 = [0u8; 32];
-                    hash_arr_32.copy_from_slice(&hash_array[0..32]);
                     
                     if hex::encode(&sig.public_key) != *legit_sequencer {
                         return Err(format!("❌ FRAUDE VRF : La clé publique de la signature ne correspond pas au gagnant !"));
                     }
 
-                    if !wots::Wots::verify(&sig, &hash_arr_32) {
+                    if !wots::Wots::verify(&sig, &hash_array) {
                         return Err(format!("❌ FRAUDE VRF : Signature WOTS+ invalide ! Le Séquenceur a soumis un faux bloc."));
                     }
                 } else {
@@ -1574,10 +1533,8 @@ impl Blockchain {
         hasher.update(mb_data.as_bytes());
         let mut hash_arr = [0u8; 64];
         hash_arr.copy_from_slice(&hasher.finalize());
-        let mut hash_arr_32 = [0u8; 32];
-        hash_arr_32.copy_from_slice(&hash_arr[0..32]);
 
-        if !wots::Wots::verify(&micro_block.sequencer_sig, &hash_arr_32) {
+        if !wots::Wots::verify(&micro_block.sequencer_sig, &hash_arr) {
             return Err("❌ FRAUDE L2 : Signature WOTS+ du MicroBloc invalide ou transactions altérées !".into());
         }
 

@@ -1,7 +1,7 @@
 use dotenv::dotenv;
 use reqwest::Client;
 use serde_json::Value;
-use sha2::{Digest, Sha256}; 
+use sha2::{Digest, Sha512};
 use std::env;
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -431,7 +431,7 @@ async fn main() {
                             if is_my_gas && amt_collected > 0 {
                                 selected_inputs.push(wattcoin_core::transaction::TransactionInput {
                                     utxo_id: out.kyber_capsule.clone(), 
-                                    commitment: out.lattice_commitment.clone(),
+                                    amount: amt_collected, // On utilise l'amount en clair !
                                     source_height: height,
                                 });
                                 total_l1_collected += amt_collected;
@@ -454,9 +454,9 @@ async fn main() {
 
         let change_l1 = total_l1_collected - l1_fee_sats;
 
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha512::new();
         hasher.update(state_root.as_bytes());
-        let mut hash_array = [0u8; 32];
+        let mut hash_array = [0u8; 64];
         hash_array.copy_from_slice(&hasher.finalize());
         
         let secret_matrix = decode_wots_sk(&hot_wallet.secret_key_hex);
@@ -472,7 +472,7 @@ async fn main() {
                 stealth_address: l1_addr,
                 kyber_capsule: format!("UNPEG_WNS_{}", block_idx),
                 aes_vault: amt.to_string(),
-                lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(amt, &[0u64; wattcoin_core::lattice::LATTICE_DIM]),
+                amount: amt, // LE MONTANT EN CLAIR
             });
         }
 
@@ -481,7 +481,7 @@ async fn main() {
                 stealth_address: pubkey.clone(),
                 kyber_capsule: format!("CHANGE_WNS_{}", block_idx),
                 aes_vault: change_l1.to_string(),
-                lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(change_l1, &[0u64; wattcoin_core::lattice::LATTICE_DIM]),
+                amount: change_l1, // LE MONTANT EN CLAIR
             });
         }
 
@@ -500,9 +500,7 @@ async fn main() {
         };
 
         let tx_hash_64 = anchor_tx.hash_data();
-        let mut tx_hash_32 = [0u8; 32];
-        tx_hash_32.copy_from_slice(&tx_hash_64[0..32]);
-        anchor_tx.wots_signature = Some(wots::Wots::sign(&secret_matrix, block_idx, &tx_hash_32, &public_key_bytes));
+        anchor_tx.wots_signature = Some(wots::Wots::sign(&secret_matrix, block_idx, &tx_hash_64, &public_key_bytes)); // 64 OCTETS
 
         println!("⚓ Envoi de l'ancrage au L1 en cours (Frais payés : {} Flames)...", l1_fee_sats);
 

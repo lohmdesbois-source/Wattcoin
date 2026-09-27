@@ -5785,7 +5785,7 @@ dependencies = [
 
 [[package]]
 name = "wots"
-version = "0.1.0"
+version = "4.0.1"
 dependencies = [
  "hex",
  "hkdf",

@@ -540,10 +540,20 @@ pub async fn start_api_server(
 	let cancel_order = warp::delete()
         .and(warp::path!("order" / String))
         .and(dex_pool_filter.clone())
-        .map(|id: String, pool: SharedPool| {
+        .map(|token_hex: String, pool: SharedPool| {
+            // ANTI IDOR DEX : Le client envoie son jeton secret. On le hache pour retrouver l'ID public !
+            let token_bytes = hex::decode(&token_hex).unwrap_or_default();
+            let expected_id = hex::encode(sha2::Sha256::digest(&token_bytes));
+            
             let mut p = pool.lock().unwrap();
-            p.retain(|o| o.id != id);
-            warp::reply::json(&"✅ Ordre supprimé")
+            let initial_len = p.len();
+            p.retain(|o| o.id != expected_id);
+            
+            if p.len() < initial_len {
+                warp::reply::json(&"✅ Ordre supprimé")
+            } else {
+                warp::reply::json(&"❌ Échec : Ordre introuvable ou jeton d'annulation invalide")
+            }
         });
 
 	let info_route = warp::path("info")
@@ -1214,8 +1224,13 @@ pub async fn start_api_server(
             }))
         });
 
+    // SÉCURITÉ CORS : Interdit aux pages web de forger des requêtes en arrière-plan
+    // Le Wallet desktop n'utilise pas de navigateur, il n'est donc pas bloqué.
     let cors = warp::cors()
-        .allow_any_origin()
+        .allow_origins(vec![
+            "http://127.0.0.1:8100", 
+            "http://localhost:8100"
+        ])
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "DELETE"]);
 

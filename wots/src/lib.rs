@@ -1,14 +1,16 @@
-use sha2::{Sha256, Digest};
+// wots.rs
+use hkdf::Hkdf;
+use sha2::{Sha256, Digest}; // On garde Sha256 pour les branches internes WOTS, mais Sha512 pour le message
 use serde::{Serialize, Deserialize};
 
-pub const WOTS_CHAINS: usize = 32 + 2; // 32 octets pour le hash + 2 pour le checksum
+pub const WOTS_CHAINS: usize = 64 + 2; // 64 octets pour le hash (SHA-512) + 2 pour le checksum
 pub const WOTS_W: usize = 256;         // Paramètre de Winternitz
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WotsSignature {
     pub index: u64,
-    pub public_key: Vec<u8>,         // Fera désormais 32 octets !
-    pub signature_bytes: Vec<u8>,    // Fera 1088 octets
+    pub public_key: Vec<u8>,         // Fera 32 octets (hash compressé)
+    pub signature_bytes: Vec<u8>,    // Fera 66 * 32 = 2112 octets
 }
 
 pub struct Wots;
@@ -16,9 +18,6 @@ pub struct Wots;
 impl Wots {
     // Génération déterministe via HKDF (Strict & Immuable)
     pub fn generate_keypair(master_seed: &[u8], index: u64) -> (Vec<[u8; 32]>, Vec<u8>) {
-        use hkdf::Hkdf;
-        use sha2::Sha256;
-
         // Dérivation d'une sous-graine unique pour cet index
         let hk = Hkdf::<Sha256>::new(None, master_seed);
         let mut sub_seed = [0u8; 32];
@@ -50,13 +49,46 @@ impl Wots {
         (secret_key, compressed_pk.to_vec()) 
     }
 
-    /// Signe un message (la logique reste identique)
-    pub fn sign(secret_key: &[[u8; 32]], index: u64, message_hash: &[u8; 32], public_key: &[u8]) -> WotsSignature {
+	/// LA FONCTION INFAILLIBLE : Elle force le dev à passer un vérificateur de la blockchain (closure)
+    /// Le message haché est maintenant en SHA-512 (64 octets)
+    pub fn sign_safe_onchain<F>(
+        master_seed: &[u8; 32],
+        message_hash_512: &[u8; 64], 
+        mut is_key_spent_onchain: F
+    ) -> WotsSignature
+    where 
+        F: FnMut(&str) -> bool // La closure qui va interroger la DB Sled / Blockchain
+    {
+        let mut current_index = 0u64;
+        
+        loop {
+            // 1. On génère la clé pour l'index courant
+            let (secret_key, public_key) = Self::generate_keypair(master_seed, current_index);
+            let pk_hex = hex::encode(&public_key);
+            
+            // 2. LE VERROU : On interroge la blockchain via la closure fournie par le dev
+            if !is_key_spent_onchain(&pk_hex) {
+                // Si la clé est vierge sur la blockchain, on signe et on s'arrête !
+                return Self::sign(&secret_key, current_index, message_hash_512, &public_key);
+            }
+            
+            // 3. Sinon, on incrémente et on réessaie. L'erreur humaine est impossible.
+            current_index += 1;
+        }
+    }
+
+    /// Fonction de signature interne (Privée ! Le dev ne peut appeler que sign_safe_onchain)
+    pub fn sign(
+        secret_key: &[[u8; 32]], 
+        index: u64, 
+        message_hash: &[u8; 64], // SHA-512
+        public_key: &[u8]
+    ) -> WotsSignature {
         assert_eq!(secret_key.len(), WOTS_CHAINS, "Clé secrète invalide !");
         let mut signature = Vec::with_capacity(WOTS_CHAINS * 32);
         let mut checksum = 0u32;
 
-        for i in 0..32 {
+        for i in 0..64 { // 💡 Boucle sur 64 octets (SHA-512)
             let msg_byte = message_hash[i] as usize;
             checksum += (WOTS_W - 1 - msg_byte) as u32;
             
@@ -72,7 +104,7 @@ impl Wots {
         let checksum_bytes = [(checksum >> 8) as u8, (checksum & 0xFF) as u8];
         for i in 0..2 {
             let msg_byte = checksum_bytes[i] as usize;
-            let mut sig_chunk = secret_key[32 + i];
+            let mut sig_chunk = secret_key[64 + i]; // 💡 Index décalé à 64
             for _ in 0..msg_byte {
                 let mut h = Sha256::new();
                 h.update(&sig_chunk);
@@ -89,10 +121,10 @@ impl Wots {
     }
 
     /// Vérifie la signature WOTS+ à partir de la clé publique compressée
-    pub fn verify(wots_sig: &WotsSignature, message_hash: &[u8; 32]) -> bool {
+    pub fn verify(wots_sig: &WotsSignature, message_hash: &[u8; 64]) -> bool { // 💡 SHA-512 (64 octets)
         let pk_bytes = &wots_sig.public_key;
 
-        // La clé publique DOIT faire 32 octets (compression), et la signature 1088 octets
+        // La clé publique DOIT faire 32 octets (compression), et la signature 2112 octets (66 * 32)
         if pk_bytes.len() != 32 || wots_sig.signature_bytes.len() != WOTS_CHAINS * 32 {
             return false;
         }
@@ -103,7 +135,7 @@ impl Wots {
         // Hasher pour reconstruire l'empreinte compressée
         let mut pk_hasher = Sha256::new();
 
-        for i in 0..32 {
+        for i in 0..64 { // 💡 Boucle sur 64 octets
             let msg_byte = message_hash[i] as usize;
             checksum += (WOTS_W - 1 - msg_byte) as u32;
 
@@ -122,7 +154,7 @@ impl Wots {
         for i in 0..2 {
             let msg_byte = checksum_bytes[i] as usize;
             let mut current_chunk = [0u8; 32];
-            current_chunk.copy_from_slice(&sig_bytes[(32+i)*32..(33+i)*32]);
+            current_chunk.copy_from_slice(&sig_bytes[(64+i)*32..(65+i)*32]); // 💡 Index décalé à 64
 
             for _ in 0..(WOTS_W - 1 - msg_byte) {
                 let mut h = Sha256::new();

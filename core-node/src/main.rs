@@ -834,8 +834,7 @@ async fn main() {
                                         stealth_address: format!("L2_WATT_{}", hex::encode(&keypair.1)),
                                         kyber_capsule: format!("MICRO_COINBASE_{}", global_l2_index), // 💡 Propre
                                         aes_vault: sequencer_reward.to_string(),
-                                        lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(sequencer_reward, &[0u64; wattcoin_core::lattice::LATTICE_COLS]),
-										range_proof: String::new(),
+                                        amount: sequencer_reward,
                                     }
                                 ];
 
@@ -845,8 +844,7 @@ async fn main() {
                                         stealth_address: "LOTTERY_RESERVE".to_string(),
                                         kyber_capsule: format!("L2_TAX_CAPSULE_{}", global_l2_index), // 💡 Propre
                                         aes_vault: lottery_tax.to_string(),
-                                        lattice_commitment: wattcoin_core::lattice::LWECommitment::commit(lottery_tax, &[0u64; wattcoin_core::lattice::LATTICE_COLS]),
-										range_proof: String::new(),
+                                        amount: lottery_tax,
                                     });
                                 }
 
@@ -897,17 +895,11 @@ async fn main() {
 								let mut hash_arr = [0u8; 64];
 								hash_arr.copy_from_slice(&hasher.finalize());
 
-                                // On extrait les 32 premiers octets du hash SHA512 pour WOTS+
-								let mut hash_arr_32 = [0u8; 32];
-								hash_arr_32.copy_from_slice(&hash_arr[0..32]);
-
-								// Note: Wots::sign prend en paramètre : 
-								// (secret_key: &[[u8; 32]], index: u64, message_hash: &[u8; 32], public_key: &[u8])
 								micro_block.sequencer_sig = wots::Wots::sign(
-									&keypair.0, // <-- keypair.0 correspond à secret_key dans le tuple renvoyé par generate_keypair
+									&keypair.0, 
 									micro_block.micro_index,
-									&hash_arr_32,
-									&keypair.1  // <-- keypair.1 correspond à la clé publique
+									&hash_arr, // 64 octets directs !
+									&keypair.1 
 								);
 
                                 wattcoin_core::network::broadcast_micro_block(micro_block.clone(), Arc::clone(&active_peers_seq)).await;

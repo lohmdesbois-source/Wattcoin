@@ -145,10 +145,10 @@ pub fn start_peer_connection(
                     if block.index == state_guard.block_index + 1 {
                         println!("📦 [WNS P2P] Nouveau bloc L2 reçu (Index {}) !", block.index);
                         
-                        let mut hasher = sha2::Sha256::new(); 
+                        let mut hasher = sha2::Sha512::new(); 
                         use sha2::Digest;
                         hasher.update(block.state_root.as_bytes());
-                        let mut hash_array = [0u8; 32];
+                        let mut hash_array = [0u8; 64];
                         hash_array.copy_from_slice(&hasher.finalize());
                         
                         let is_valid = if let Ok(sig) = serde_json::from_str::<WotsSignature>(&block.signature) {

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use serde::{Serialize, Deserialize};
 use sha2::{Sha512, Digest};
-use crate::lattice::LWECommitment;
 use wots::WotsSignature;
 
 
@@ -40,7 +39,6 @@ impl L2Transaction {
             WnsAction::Withdraw => 3u8,
         };
         hasher.update(&[action_byte]);
-        
         hasher.update(self.domain_name.as_bytes());
         hasher.update(self.record_data.as_bytes());
         hasher.update(&self.amount.to_be_bytes()); 
@@ -92,11 +90,11 @@ pub enum TransactionType {
     },
 }
 
-// L'Input Anonyme
+// L'Input Pseudonyme
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
     pub utxo_id: String, // Identifiant strict (kyber_capsule d'origine)
-    pub commitment: LWECommitment,  
+    pub amount: u64, // On ne cache pas le montant, amount direct
     pub source_height: u64,
 }
 
@@ -105,11 +103,8 @@ pub struct TransactionInput {
 pub struct TransactionOutput {
     pub stealth_address: String,      
     pub kyber_capsule: String,        
-    pub aes_vault: String,            
-    pub lattice_commitment: LWECommitment, 
-	// Emplacement cryptographique pour le ZK Range Proof
-    // Empêche les montants négatifs (underflow) et les montants colossaux
-    pub range_proof: String,
+    pub aes_vault: String, // Contient potentiellement l'OTP/Message chiffré pour le destinataire
+    pub amount: u64,       // LE MONTANT EN CLAIR, LA FIN DE L'USINE À GAZ
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,10 +162,7 @@ impl Transaction {
         // 4. Validation stricte des signatures WOTS+
         if let Some(sig) = &self.wots_signature {
             let hash = self.hash_data();
-            let mut hash_32 = [0u8; 32];
-            hash_32.copy_from_slice(&hash[0..32]);
-            
-            if !wots::Wots::verify(sig, &hash_32) {
+            if !wots::Wots::verify(sig, &hash) {
                 println!("⛔ Rejet : Signature WOTS+ invalide.");
                 return false;
             }
@@ -193,19 +185,32 @@ impl Transaction {
         for out in &self.outputs { total_vault_size += out.aes_vault.len(); }
         if total_vault_size > 8_388_608 { return false; }
 
-        // 6. Validation Homomorphe (Appliquée SEULEMENT si la transaction dépense des UTXOs)
-        if !self.inputs.is_empty() {
-            let in_commitments: Vec<_> = self.inputs.iter().map(|i| i.commitment.clone()).collect();
-            let out_commitments: Vec<_> = self.outputs.iter().map(|o| o.lattice_commitment.clone()).collect();
-            if !LWECommitment::verify_balance(&in_commitments, &out_commitments, self.fee) { 
-                return false; 
+        // VÉRIFICATION MATHÉMATIQUE CLASSIQUE ET INFAILLIBLE
+        if !is_consensus_mint && !is_feeless_empty {
+            let mut sum_in = 0u64;
+            let mut sum_out = 0u64;
+            
+            for input in &self.inputs {
+                sum_in = match sum_in.checked_add(input.amount) {
+                    Some(s) => s,
+                    None => return false, // Anti-Overflow
+                };
             }
-        }
+            
+            for out in &self.outputs {
+                sum_out = match sum_out.checked_add(out.amount) {
+                    Some(s) => s,
+                    None => return false, // Anti-Overflow
+                };
+            }
+            
+            let expected_in = match sum_out.checked_add(self.fee) {
+                Some(s) => s,
+                None => return false,
+            };
 
-        // 7. RANGE PROOF UNIVERSEL : Personne n'y échappe, pas même la Loterie ou la Coinbase !
-        for out in &self.outputs {
-            if !LWECommitment::verify_range_proof(&out.lattice_commitment, &out.range_proof) {
-                println!("⛔ Rejet : Range Proof invalide (Montant illégal ou underflow).");
+            if sum_in != expected_in {
+                println!("⛔ Rejet : Les montants ne s'équilibrent pas (Entrée: {}, Sortie+Frais: {}).", sum_in, expected_in);
                 return false;
             }
         }
