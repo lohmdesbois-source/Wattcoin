@@ -1710,10 +1710,12 @@ impl Blockchain {
                 }
             }
             
-            // VERIFICATION STRICTE DU POW
-            let hash_val = num_bigint::BigUint::parse_bytes(chain_to_measure[i].header.hash.as_bytes(), 16).unwrap_or_else(|| max_target.clone());
-            if hash_val > current_target {
-                is_pow_valid = false;
+            // VERIFICATION STRICTE DU POW (SAUF POUR LE GENESIS !)
+            if chain_to_measure[i].header.index > 0 {
+                let hash_val = num_bigint::BigUint::parse_bytes(chain_to_measure[i].header.hash.as_bytes(), 16).unwrap_or_else(|| max_target.clone());
+                if hash_val > current_target {
+                    is_pow_valid = false;
+                }
             }
 
             total_work += &max_target / &current_target;
