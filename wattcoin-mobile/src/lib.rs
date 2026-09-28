@@ -285,15 +285,25 @@ pub fn get_swap_secrets_path() -> Result<PathBuf, String> {
 
 // Le client global : on désactive le recyclage des connexions TCP !
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    use reqwest::header;
+    let mut headers = header::HeaderMap::new();
+    
+    // LE WALLET SE PRÉSENTE OFFICIELLEMENT POUR PASSER LE CORS
+    headers.insert(
+        header::ORIGIN,
+        header::HeaderValue::from_static("wattcoin://native-wallet"),
+    );
+
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(120)) // On met 2 min (120),  on est sûr d'avoir la réponse BTC et tout.
+        .default_headers(headers) // On injecte les headers par défaut
         .build()
         .unwrap()
 });
 
 async fn node_call(method: &str, endpoint: &str, body: Option<Vec<u8>>) -> Result<String, String> {
     
-    // 💡 Le Wallet tente d'abord de communiquer avec le Nœud
+    // Le Wallet tente d'abord de communiquer avec le Nœud
     let target_ip = if LOCAL_DEV_MODE {
         "127.0.0.1:8100".to_string()
     } else {
@@ -686,14 +696,6 @@ pub async fn get_balances(keys: WalletKeys) -> Result<Balances, String> {
     let mut current_max_l1 = cache.last_scanned_height;
     let mut current_max_l2 = cache.last_scanned_micro_index;
 
-    let mut decrypt_amount = |out: &TransactionOutput, height: u64, is_l2: bool, micro_index: u64| -> Option<u64> {
-        if let Some(p_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
-            let parts: Vec<&str> = p_str.split('|').collect();
-            if parts.len() >= 2 { return parts[0].parse::<u64>().ok(); }
-        }
-        None
-    };
-
     for item in enriched {
         let height = item["height"].as_u64().unwrap_or(0);
         let is_l2 = item["is_l2"].as_bool().unwrap_or(false);
@@ -717,16 +719,22 @@ pub async fn get_balances(keys: WalletKeys) -> Result<Balances, String> {
             }
             if !is_mature { continue; }
 
-            // LE NETTOYAGE CYPHPERPUNK :
+            // LECTURE DIRECTE DU MONTANT EN CLAIR
             if out.stealth_address == format!("COINBASE_{}", keys.watt_short_address)
+                || out.stealth_address == format!("COINBASE_{}", keys.watt_address)
                 || out.stealth_address == format!("JACKPOT_{}", keys.watt_short_address)
+                || out.stealth_address == format!("JACKPOT_{}", keys.watt_address)
                 || out.stealth_address == keys.watt_address 
             {
-                if let Ok(amt) = out.aes_vault.parse::<u64>() { l1_flames += amt; }
+                l1_flames += out.amount; 
             } else if out.stealth_address.starts_with("pq_watt_") {
-                if let Some(amt) = decrypt_amount(out, height, is_l2, micro_index) { l1_flames += amt; }
+                if try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated).is_some() {
+                    l1_flames += out.amount; 
+                }
             } else if out.stealth_address.starts_with("L2_WATT_") {
-                if let Some(amt) = decrypt_amount(out, height, is_l2, micro_index) { l2_flames += amt; }
+                if try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated).is_some() {
+                    l2_flames += out.amount; 
+                }
             }
         }
     }
@@ -811,44 +819,35 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             let mut label = String::new();
 
             // Détection des montants en clair
+			// LECTURE DIRECTE DU MONTANT EN CLAIR
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
                 || out.stealth_address == format!("COINBASE_{}", keys.watt_short_address)
                 || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) 
-				|| out.stealth_address == format!("JACKPOT_{}", keys.watt_short_address)
+                || out.stealth_address == format!("JACKPOT_{}", keys.watt_short_address)
                 || out.stealth_address == keys.watt_address 
             {
-                if let Ok(amt) = out.aes_vault.parse::<u64>() {
-                    amt_to_add = amt as f64 / 1_000_000_000.0;
-                    
-                    // Séparation claire du Finder, des Parts, et du Jackpot
-                    if out.stealth_address.starts_with("JACKPOT") {
-                        label = "Jackpot gagné ! 🎰".to_string();
-                    } else if out.stealth_address == keys.watt_address {
-                        label = "Swap Atomique Réclamé ⚡".to_string(); 
-                    } else if out.kyber_capsule.starts_with("SHARE_") {
-                        label = "Part de minage (P2Pool) ⛏".to_string();
-                    } else {
-                        label = "Récompense bloc + Frais ⛏".to_string();
-                    }
+                amt_to_add = out.amount as f64 / 1_000_000_000.0;
+                
+                if out.stealth_address.starts_with("JACKPOT") {
+                    label = "Jackpot gagné ! 🎰".to_string();
+                } else if out.stealth_address == keys.watt_address {
+                    label = "Swap Atomique Réclamé ⚡".to_string(); 
+                } else if out.kyber_capsule.starts_with("SHARE_") {
+                    label = "Part de minage (P2Pool) ⛏".to_string();
+                } else {
+                    label = "Récompense bloc + Frais ⛏".to_string();
                 }
             } 
-            // 2. Détection des montants chiffrés
             else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
-                
-                // Appel propre à notre nouveau déchiffreur :
-                if let Some(payload_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
-                    let parts: Vec<&str> = payload_str.split('|').collect();
-                    if parts.len() >= 2 {
-                        if let Ok(amt) = parts[0].parse::<u64>() {
-                            amt_to_add = amt as f64 / 1_000_000_000.0;
-                            if matches!(tx.tx_type, TransactionType::MicroCoinbase) {
-                                label = "Frais Séquenceur ⚡".to_string();
-                            } else if out.stealth_address.starts_with("L2_WATT_") && !is_l2 {
-                                label = "Dépôt (Bridge L1 ➡ L2) 🌉".to_string(); 
-                            } else { 
-                                label = "Transfert".to_string(); 
-                            }
-                        }
+                if try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated).is_some() {
+                    amt_to_add = out.amount as f64 / 1_000_000_000.0;
+                    
+                    if matches!(tx.tx_type, TransactionType::MicroCoinbase) {
+                        label = "Frais Séquenceur ⚡".to_string();
+                    } else if out.stealth_address.starts_with("L2_WATT_") && !is_l2 {
+                        label = "Dépôt (Bridge L1 ➡ L2) 🌉".to_string(); 
+                    } else { 
+                        label = "Transfert".to_string(); 
                     }
                 }
             }

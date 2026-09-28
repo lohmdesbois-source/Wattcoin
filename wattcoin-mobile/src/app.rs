@@ -283,59 +283,73 @@ impl WattcoinApp {
         }
     }
 
-    // 3. FONCTION DE RAFRAÎCHISSEMENT DU DASHBOARD
+    // 3. FONCTION DE RAFRAÎCHISSEMENT DU DASHBOARD ULTRA-RAPIDE
     fn refresh_dashboard(&mut self, ctx: egui::Context) {
         if self.is_refreshing { return; }
         self.is_refreshing = true;
         
         if let Some(keys) = self.wallet_keys.clone() {
             let tx = self.tx.clone();
-            
-            // On extrait l'ancienne balance
             let old_btc_balance = self.balance_btc; 
             
             tokio::spawn(async move {
-                // A. Récupération des Soldes WATT
+                // On lance TOUTES les requêtes en même temps (Parallélisme massif)
+                let keys_1 = keys.clone();
+                let f_bal = tokio::spawn(async move { crate::get_balances(keys_1).await });
+                
+                let f_btc_usd = tokio::spawn(async move {
+                    let binance_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+                    if let Ok(resp) = binance_client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").send().await {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(price_str) = json["price"].as_str() {
+                                return price_str.parse().unwrap_or(60_000.0);
+                            }
+                        }
+                    }
+                    60_000.0
+                });
+
+                let keys_2 = keys.clone();
+                let f_btc_bal = tokio::spawn(async move {
+                    crate::get_btc_balance(keys_2.master_seed_hex, Some(keys_2.btc_address)).await
+                });
+
+                let keys_3 = keys.clone();
+                let f_wns = tokio::spawn(async move {
+                    let resolver = if crate::LOCAL_DEV_MODE { "http://127.0.0.1:8200" } else { "http://80.78.26.243/wns" };
+                    let wns_url = format!("{}/balance/{}", resolver, keys_3.watt_address);
+                    let wns_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+                    if let Ok(res) = wns_client.get(&wns_url).send().await {
+                        if let Ok(json) = res.json::<serde_json::Value>().await {
+                            return json["balance"].as_u64().unwrap_or(0) as f64 / 1_000_000_000.0;
+                        }
+                    }
+                    0.0
+                });
+
+                let f_info = tokio::spawn(async move { crate::get_network_info().await });
+                let f_supply = tokio::spawn(async move { crate::get_total_supply().await });
+                let f_jackpot = tokio::spawn(async move { crate::get_current_jackpot().await });
+
+                // On attend que TOUTES les requêtes terminent 
+                // Le temps total sera dicté par la requête la plus lente, au lieu de les additionner !
+                let (r_bal, r_btc_usd, r_btc_bal, r_wns, r_info, r_supply, r_jackpot) = 
+                    tokio::join!(f_bal, f_btc_usd, f_btc_bal, f_wns, f_info, f_supply, f_jackpot);
+
                 let mut l1_balance = 0.0;
                 let mut l2_balance = 0.0;
-                
-                if let Ok(balances) = crate::get_balances(keys.clone()).await {
+                if let Ok(Ok(balances)) = r_bal {
                     l1_balance = balances.l1;
                     l2_balance = balances.l2;
                 }
                 
-				// B. Récupération du prix BTC/USD (Avec Timeout de sécurité !)
-                let mut btc_usd = 60_000.0; 
-                let binance_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
-                if let Ok(resp) = binance_client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").send().await {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        if let Some(price_str) = json["price"].as_str() {
-                            btc_usd = price_str.parse().unwrap_or(60_000.0);
-                        }
-                    }
-                }
+                let btc_usd = r_btc_usd.unwrap_or(60_000.0);
+                let btc_balance = r_btc_bal.unwrap_or_else(|_| Ok(old_btc_balance)).unwrap_or(old_btc_balance);
+                let wns_balance = r_wns.unwrap_or(0.0);
 
-                // C. Récupération du Solde BITCOIN (Via Tor/Proxy)
-                let mut btc_balance = old_btc_balance;
-                if let Ok(b) = crate::get_btc_balance(keys.master_seed_hex.clone(), Some(keys.btc_address.clone())).await {
-                    btc_balance = b; 
-                }
-                
-                // Récupération du Solde WNS !
-                let mut wns_balance = 0.0;
-                let resolver = if crate::LOCAL_DEV_MODE { "http://127.0.0.1:8200" } else { "http://80.78.26.243/wns" };
-                let wns_url = format!("{}/balance/{}", resolver, keys.watt_address);
-                let wns_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
-                if let Ok(res) = wns_client.get(&wns_url).send().await {
-                    if let Ok(json) = res.json::<serde_json::Value>().await {
-                        wns_balance = json["balance"].as_u64().unwrap_or(0) as f64 / 1_000_000_000.0;
-                    }
-                }
-                
-                // D. Calcul des prix
                 let mut price_sats = 0;
                 let mut current_block_height = 0; 
-                if let Ok(info) = crate::get_network_info().await {
+                if let Ok(Ok(info)) = r_info {
                     let price_val = &info["last_price_sats"];
                     price_sats = price_val.as_u64()
                         .or_else(|| price_val.as_f64().map(|f| f as u64))
@@ -344,32 +358,16 @@ impl WattcoinApp {
                     current_block_height = info["blocks"].as_u64().unwrap_or(0); 
                 }
                 
-                // PRIX DEX : Empêche la ruine visuelle en cas de perte de connexion
-                let watt_price_usd = if price_sats > 0 {
-                    (price_sats as f64 / 100_000_000.0) * btc_usd
-                } else {
-                    -1.0 // Un flag clair d'erreur
-                };
-				
-				// Récupération des métriques réseau
-                let mut total_supply = 0;
-                let mut jackpot = 0;
-                if let Ok(s) = crate::get_total_supply().await { total_supply = s; }
-                if let Ok(j) = crate::get_current_jackpot().await { jackpot = j; }
+                let watt_price_usd = if price_sats > 0 { (price_sats as f64 / 100_000_000.0) * btc_usd } else { -1.0 };
+                let total_supply = r_supply.unwrap_or(Ok(0)).unwrap_or(0);
+                let jackpot = r_jackpot.unwrap_or(Ok(0)).unwrap_or(0);
                 
-                // Envoi des données à l'interface
                 let _ = tx.send(AppMessage::DashboardData { 
-                    balance_l1: l1_balance, 
-                    balance_l2: l2_balance,
-                    balance_btc: btc_balance,  
-					balance_wns: wns_balance,
-                    price_usd: watt_price_usd,
-                    btc_price_usd: btc_usd,
-					total_supply,
-                    jackpot,
-					current_block_height
+                    balance_l1: l1_balance, balance_l2: l2_balance, balance_btc: btc_balance, balance_wns: wns_balance,
+                    price_usd: watt_price_usd, btc_price_usd: btc_usd, total_supply, jackpot, current_block_height
                 }).await;
-				crate::set_status("");
+                
+                crate::set_status("");
                 ctx.request_repaint(); 
             });
         }

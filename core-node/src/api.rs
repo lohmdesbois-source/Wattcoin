@@ -193,35 +193,43 @@ pub async fn start_api_server(
 		});
 	
 	let secret_for_onion = node_kyber_secret.clone(); 
+	// On clone le port pour pouvoir l'utiliser dans la closure
+	let port_for_ssrf = port; 
 
-    let relay_onion = warp::path!("relay_onion")
-        .and(warp::post())
-        .and(warp::body::content_length_limit(1024 * 1024 * 32)) 
-        .and(warp::body::bytes()) 
-        .then(move |body_bytes: warp::hyper::body::Bytes| {
-            let secret_for_onion = secret_for_onion.clone();
-            async move {
-                use warp::Reply;
+	let relay_onion = warp::path!("relay_onion")
+		.and(warp::post())
+		.and(warp::body::content_length_limit(1024 * 1024 * 32)) 
+		.and(warp::body::bytes()) 
+		.then(move |body_bytes: warp::hyper::body::Bytes| {
+			let secret_for_onion = secret_for_onion.clone();
+			async move {
+				use warp::Reply;
                 
                 let packet: crate::mixnet::OnionPacket = match bincode::deserialize(&body_bytes) {
-                    Ok(p) => p,
-                    Err(e) => return warp::reply::with_status(warp::reply::json(&format!("❌ Format oignon binaire invalide: {}", e)), warp::http::StatusCode::BAD_REQUEST).into_response(),
-                };
+					Ok(p) => p,
+					Err(e) => return warp::reply::with_status(warp::reply::json(&format!("❌ Format invalide : {}", e)), warp::http::StatusCode::BAD_REQUEST).into_response(),
+				};
 
-                match packet.peel(&secret_for_onion) {
-                    Ok(hop_payload) => {
-                        if hop_payload.next_hop_address.starts_with("http") {
-                            let target_url = hop_payload.next_hop_address.clone();
-							// SSRF : On interdit formellement au nœud de requêter le réseau local !
-                            if target_url.contains("127.0.0.1") 
-                                || target_url.contains("localhost") 
-                                || target_url.contains("169.254.") // AWS/GCP Metadata
-                                || target_url.contains("10.")      // LAN
-                                || target_url.contains("192.168.") // LAN
-                            {
-                                println!("🚨 [SÉCURITÉ] Tentative de SSRF bloquée vers : {}", target_url);
-                                return warp::reply::with_status(warp::reply::json(&"❌ [SÉCURITÉ] SSRF Interdit"), warp::http::StatusCode::FORBIDDEN).into_response();
-                            }
+				match packet.peel(&secret_for_onion) {
+					Ok(hop_payload) => {
+						if hop_payload.next_hop_address.starts_with("http") {
+							let target_url = hop_payload.next_hop_address.clone();
+							
+							// On autorise le nœud à se parler à LUI-MÊME sur SON port API !
+							let is_self_api = target_url.starts_with(&format!("http://127.0.0.1:{}/", port_for_ssrf)) 
+										   || target_url.starts_with(&format!("http://localhost:{}/", port_for_ssrf));
+
+							// SSRF : On bloque les requêtes locales, SAUF si c'est pour notre propre API !
+							if !is_self_api && (
+								target_url.contains("127.0.0.1") 
+								|| target_url.contains("localhost") 
+								|| target_url.contains("169.254.") 
+								|| target_url.contains("10.")      
+								|| target_url.contains("192.168.") 
+							) {
+								println!("🚨 [SÉCURITÉ] Tentative de SSRF bloquée vers : {}", target_url);
+								return warp::reply::with_status(warp::reply::json(&"❌ [SÉCURITÉ] SSRF Interdit"), warp::http::StatusCode::FORBIDDEN).into_response();
+							}
 
                             println!("🎯 [MIXNET] Nœud de Sortie (Exit Node) ! Routage final...");
                             let payload = hop_payload.inner_data.clone();
@@ -877,22 +885,49 @@ pub async fn start_api_server(
 	use reqwest::Client;
 	use std::time::Duration;
 
-	async fn btc_proxy(method: &str, url: &str, body: Option<String>) -> Result<String, String> {
+	async fn btc_proxy(method: &str, endpoint: &str, body: Option<String>) -> Result<String, String> {
 		let client = Client::builder()
-			.timeout(Duration::from_secs(15))
+			.timeout(Duration::from_secs(30)) // Le nœud a 30s par tentative (le wallet attend 120s, on est large)
+			// ON UTILISE UNE IDENTITÉ HONNÊTE ET OFFICIELLE !
+			//.user_agent("WattcoinCore/3.0 (Rust HTTP Client)")
 			.build()
 			.unwrap();
 
-		let req = match method {
-			"POST" => client.post(url).body(body.unwrap_or_default()),
-			_ => client.get(url),
-		};
-		
-		let resp = req.send().await.map_err(|e| format!("BTC proxy: {}", e))?;
-		if !resp.status().is_success() {
-			return Err(format!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+		let providers = [
+			"https://mempool.space/testnet/api",
+			"https://blockstream.info/testnet/api"
+		];
+
+		let mut last_error = String::new();
+
+		for provider in providers {
+			let url = format!("{}{}", provider, endpoint);
+			let req = match method {
+				"POST" => client.post(&url).body(body.clone().unwrap_or_default()),
+				_ => client.get(&url),
+			};
+			
+			match req.send().await {
+				Ok(resp) if resp.status().is_success() => {
+					return resp.text().await.map_err(|e| e.to_string());
+				}
+				Ok(resp) => {
+					let status = resp.status(); // On sauvegarde le statut AVANT de détruire resp
+					let text = resp.text().await.unwrap_or_default(); // Ceci détruit resp
+					
+					last_error = format!("HTTP {}: {}", status, text);
+					println!("⚠️ [NODE BTC] Rejet de {} : {}", provider, last_error);
+					
+					if status == 400 { return Err(last_error); }
+				}
+				Err(e) => {
+					last_error = e.to_string();
+					println!("⚠️ [NODE BTC] Timeout/Erreur sur {} : Bascule sur le secours...", provider);
+				}
+			}
 		}
-		resp.text().await.map_err(|e| e.to_string())
+
+		Err(format!("Tous les explorateurs BTC sont HS. Dernière erreur : {}", last_error))
 	}
 
 	let btc_create_htlc = warp::path!("btc" / "htlc" / "create")
@@ -1024,8 +1059,8 @@ pub async fn start_api_server(
 		.and(warp::query::<std::collections::HashMap<String, String>>())
 		.and_then(|params: std::collections::HashMap<String, String>| async move {
 			let address = params.get("address").cloned().unwrap_or_default();
-			let url = format!("https://mempool.space/testnet/api/address/{}/utxo", address);
-			match btc_proxy("GET", &url, None).await {
+			let endpoint = format!("/address/{}/utxo", address); 
+			match btc_proxy("GET", &endpoint, None).await {
 				Ok(text) => {
 					let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!([]));
 					Ok::<_, warp::Rejection>(warp::reply::json(&json))
@@ -1047,9 +1082,9 @@ pub async fn start_api_server(
             };
 
 			let raw_tx = payload["raw_tx"].as_str().unwrap_or_default().to_string();
-			let broadcast_url = "https://mempool.space/testnet/api/tx";
+			let endpoint = "/tx"; 
 			
-			match btc_proxy("POST", broadcast_url, Some(raw_tx)).await {
+			match btc_proxy("POST", endpoint, Some(raw_tx)).await {
 				Ok(txid) => Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
 					"success": true,
 					"txid": txid.trim(),
@@ -1067,10 +1102,9 @@ pub async fn start_api_server(
 		.and(warp::query::<std::collections::HashMap<String, String>>())
 		.and_then(|params: std::collections::HashMap<String, String>| async move {
 			let address = params.get("address").cloned().unwrap_or_default();
+			let endpoint = format!("/address/{}", address); 
 
-			let url = format!("https://mempool.space/testnet/api/address/{}", address);
-
-			match btc_proxy("GET", &url, None).await {
+			match btc_proxy("GET", &endpoint, None).await {
 				Ok(text) => {
 					let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
 					let chain = &json["chain_stats"];
@@ -1091,9 +1125,9 @@ pub async fn start_api_server(
 		.and(warp::query::<std::collections::HashMap<String, String>>())
 		.and_then(|params: std::collections::HashMap<String, String>| async move {
 			let address = params.get("address").cloned().unwrap_or_default();
-			let url = format!("https://mempool.space/testnet/api/address/{}/txs", address);
+			let endpoint = format!("/address/{}/txs", address); 
 			
-			match btc_proxy("GET", &url, None).await {
+			match btc_proxy("GET", &endpoint, None).await {
 				Ok(text) => {
 					let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!([]));
 					Ok::<_, warp::Rejection>(warp::reply::json(&json))
@@ -1321,10 +1355,14 @@ pub async fn start_api_server(
     // SÉCURITÉ CORS : Interdit aux pages web de forger des requêtes en arrière-plan
     // Le Wallet desktop n'utilise pas de navigateur, il n'est donc pas bloqué.
     let cors = warp::cors()
+		//*
         .allow_origins(vec![
             "http://127.0.0.1:8100", 
-            "http://localhost:8100"
+            "http://localhost:8100",
+            "wattcoin://native-wallet" // On autorise cette origine "inventée"
         ])
+		//*/
+		//.allow_any_origin()
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "DELETE"]);
 

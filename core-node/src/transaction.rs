@@ -119,21 +119,22 @@ pub struct Transaction {
 
 impl Transaction {
 	pub fn hash_data(&self) -> [u8; 64] {
-		let mut hasher = Sha512::new();
+        let mut hasher = Sha512::new();
         
-		// SPLIT CONSENSUS : Sérialisation binaire canonique pure
-		let mut temp_tx = self.clone();
-		temp_tx.wots_signature = None; // On exclut la signature de son propre hash
-		
-		if let Ok(bytes) = bincode::serialize(&temp_tx) {
-			hasher.update(&bytes);
-		}
+        // SPLIT CONSENSUS : Sérialisation binaire canonique pure
+        let mut temp_tx = self.clone();
+        temp_tx.wots_signature = None; // On exclut la signature...
+        temp_tx.public_key = String::new(); // On exclut la clé publique du hash !
         
-		let result = hasher.finalize();
-		let mut hash_arr = [0u8; 64];
-		hash_arr.copy_from_slice(&result);
-		hash_arr
-	}
+        if let Ok(bytes) = bincode::serialize(&temp_tx) {
+            hasher.update(&bytes);
+        }
+        
+        let result = hasher.finalize();
+        let mut hash_arr = [0u8; 64];
+        hash_arr.copy_from_slice(&result);
+        hash_arr
+    }
 
     pub fn is_valid(&self) -> bool {
         let is_consensus_mint = matches!(self.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::LotteryPayout { .. });

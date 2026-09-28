@@ -83,7 +83,7 @@ impl Block {
                 TransactionOutput {
                     stealth_address: "GENESIS".to_string(),
                     kyber_capsule: "GENESIS_KEY".to_string(),
-                    aes_vault: "Wattcoin Nertwork: L'énergie libre, anonyme et post-quantique. 07/Septembre/2026 - Wattcoin casse les règles.".to_string(),
+                    aes_vault: "Wattcoin Nertwork: L'énergie libre et post-quantique. 07/Septembre/2026 - Wattcoin casse les règles.".to_string(),
                     amount: 0,
                 }
             ],

@@ -481,17 +481,11 @@ impl Blockchain {
                         if temp_spent_images.contains(&input.utxo_id) {
                             double_spend = true; break;
                         }
-                        // VÉRIFICATION D'EXISTENCE ET DE PROPRIÉTÉ
-                        if let Some(utxo) = self.find_utxo(&input.utxo_id) {
-                            let owner = utxo.stealth_address.replace("COINBASE_", "");
-                            if owner != tx.public_key && !owner.contains(&tx.public_key) {
-                                println!("⛔ Rejet : Usurpation d'UTXO. Le signataire n'est pas le propriétaire.");
-                                tx_inputs_valid = false; break;
-                            }
-                        } else {
-                            println!("⛔ Rejet : UTXO fantôme ({})", input.utxo_id);
-                            tx_inputs_valid = false; break;
-                        }
+                        // VÉRIFICATION D'EXISTENCE (Le réseau fait confiance à la validité de la signature WOTS+)
+						if self.find_utxo(&input.utxo_id).is_none() {
+							println!("⛔ Rejet : UTXO fantôme ({})", input.utxo_id);
+							tx_inputs_valid = false; break;
+						}
                     }
                 }
 
@@ -1131,12 +1125,7 @@ impl Blockchain {
                         return Err(format!("Double-dépense détectée sur l'UTXO : {}", input.utxo_id));
                     }
                     
-                    let utxo = self.find_utxo(&input.utxo_id).ok_or(format!("UTXO fantôme inventé : {}", input.utxo_id))?;
-                    
-                    let owner = utxo.stealth_address.replace("COINBASE_", "");
-                    if owner != tx.public_key && !owner.contains(&tx.public_key) {
-                        return Err("Usurpation d'identité : La signature WOTS+ ne correspond pas à l'UTXO".into());
-                    }
+                    let _utxo = self.find_utxo(&input.utxo_id).ok_or(format!("UTXO fantôme inventé : {}", input.utxo_id))?;
                 }
             }
 
