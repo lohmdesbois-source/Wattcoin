@@ -288,10 +288,10 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     use reqwest::header;
     let mut headers = header::HeaderMap::new();
     
-    // LE WALLET SE PRÉSENTE OFFICIELLEMENT POUR PASSER LE CORS
+    // Un faux domaine parfait pour satisfaire le parseur strict de Warp
     headers.insert(
         header::ORIGIN,
-        header::HeaderValue::from_static("wattcoin://native-wallet"),
+        header::HeaderValue::from_static("https://wallet.wattcoin.network"),
     );
 
     reqwest::Client::builder()
@@ -303,23 +303,24 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 
 async fn node_call(method: &str, endpoint: &str, body: Option<Vec<u8>>) -> Result<String, String> {
     
-    // Le Wallet tente d'abord de communiquer avec le Nœud
-    let target_ip = if LOCAL_DEV_MODE {
-        "127.0.0.1:8100".to_string()
+    // Le Wallet tente d'abord de communiquer avec le Nœud via NGINX
+    let target_base = if LOCAL_DEV_MODE {
+        "http://127.0.0.1:8100".to_string()
     } else {
-        // Le Phare public de secours si l'utilisateur n'a pas son propre nœud local
-        "80.78.26.243:8100".to_string() 
+        // En prod, on passe par le port 80 de Nginx vers le préfixe /api
+        "http://80.78.26.243/api".to_string() 
     };
 
-    let original_public_url = format!("http://{}{}", target_ip, endpoint);
+    // endpoint commence déjà par un "/" (ex: "/info"), donc on concatène simplement
+    let original_public_url = format!("{}{}", target_base, endpoint);
 
     // GESTION DU TYPE (JSON vs BINAIRE) ET DU CHIFFREMENT MIXNET
     let (final_url, final_body, final_ct) = if method == "POST" && body.is_some() {
         
         crate::set_status("🔍 Demande de la clé publique au nœud relais...");
 
-        // 1. On demande la clé publique du nœud dynamiquement !
-        let pubkey_url = format!("http://{}/pubkey", target_ip);
+        // 1. On demande la clé publique du nœud via Nginx !
+        let pubkey_url = format!("{}/pubkey", target_base);
         let pubkey_res = HTTP_CLIENT.get(&pubkey_url).send().await
             .map_err(|e| format!("Impossible de joindre le nœud pour obtenir sa clé Kyber : {}", e))?;
         
@@ -328,13 +329,13 @@ async fn node_call(method: &str, endpoint: &str, body: Option<Vec<u8>>) -> Resul
 
         crate::set_status("🧅 Chiffrement Mixnet et envoi au relais...");
 
-        // 2. On fabrique l'oignon avec la clé fraîchement récupérée
+        // 2. On fabrique l'oignon
         let internal_target_url = format!("http://127.0.0.1:8100{}", endpoint);
         let packet = wrap_in_onion(&internal_target_url, &body.clone().unwrap(), node_pubkey_hex)?;
         let onion_bytes = bincode::serialize(&packet).map_err(|_| "Erreur bincode Onion".to_string())?;
         
-        // 3. On frappe la route onion_relay du nœud avec l'oignon binaire
-        (format!("http://{}/relay_onion", target_ip), Some(onion_bytes), "application/octet-stream")
+        // 3. On frappe la route onion_relay via Nginx
+        (format!("{}/relay_onion", target_base), Some(onion_bytes), "application/octet-stream")
     } else {
         let ct = if endpoint == "/send_tx" { "application/octet-stream" } else { "application/json" };
         (original_public_url, body.clone(), ct)
@@ -904,6 +905,9 @@ pub async fn get_messages(keys: WalletKeys) -> Result<Vec<DataItem>, String> {
     let mut data_items = Vec::new();
     let mut cache = load_cache();
     let mut cache_updated = false;
+	
+	// On met à jour le carnet des UTXOs dépensés AVANT d'avancer le curseur !
+    crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
     
     let mut current_max_l1 = cache.last_scanned_height;
     let mut current_max_l2 = cache.last_scanned_micro_index;
@@ -1136,24 +1140,29 @@ pub async fn send_wattcoin(
         });
 
         // Gestion de la monnaie rendue (Change)
-        if change_amount > 0 {
-            let my_pk_bytes = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).unwrap();
+        // On force la création d'une monnaie L1 lors d'un passage L1 -> L2
+        // Cela crée une transaction "mixte" qui empêche le Séquenceur L2 de la voler !
+        if change_amount > 0 || (!spend_from_l2 && send_to_l2) {
+            // La monnaie DOIT retourner d'où elle vient
             let change_prefix = if spend_from_l2 { "L2_WATT_" } else { "pq_watt_" };
-
-            let (kyber_capsule_change, my_shared_secret) = pqc_kyber::encapsulate(&my_pk_bytes, &mut rand::thread_rng()).map_err(|_| "❌ Erreur Kyber (Change)".to_string())?;
-            let mut otp_c = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp_c);
-            let payload_c = format!("{}|{}", change_amount, hex::encode(otp_c));
+            let my_pk_bytes = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).unwrap();
+            let (kyber_capsule_change, my_shared_secret) = pqc_kyber::encapsulate(&my_pk_bytes, &mut rand::thread_rng())
+                .map_err(|_| "❌ Erreur de chiffrement interne (Change).".to_string())?;
+            let mut otp2 = [0u8; 32]; rand::thread_rng().fill_bytes(&mut otp2);
             
-            let aes_key_c = Key::<Aes256Gcm>::from_slice(&my_shared_secret);
-            let mut nonce_bytes_c = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes_c);
-            let encrypted_data_c = Aes256Gcm::new(aes_key_c).encrypt(Nonce::from_slice(&nonce_bytes_c), payload_c.as_bytes()).unwrap();
-            let mut final_vault_c = nonce_bytes_c.to_vec(); final_vault_c.extend_from_slice(&encrypted_data_c);
+            let payload2 = format!("{}|{}", change_amount, hex::encode(otp2));
+            
+            let aes_key2 = Key::<Aes256Gcm>::from_slice(&my_shared_secret);
+            let mut nonce_bytes2 = [0u8; 12]; rand::thread_rng().fill_bytes(&mut nonce_bytes2);
+            let encrypted_data2 = Aes256Gcm::new(aes_key2).encrypt(Nonce::from_slice(&nonce_bytes2), payload2.as_bytes()).unwrap();
+            let mut final_vault2 = nonce_bytes2.to_vec(); final_vault2.extend_from_slice(&encrypted_data2);
 
             outputs.push(TransactionOutput {
-                stealth_address: format!("{}{}", change_prefix, hex::encode(&otp_c[0..8])),
+                // On utilise bien 'change_prefix' ici  pour que l'output soit dans le bon layer
+                stealth_address: format!("{}{}", change_prefix, hex::encode(&otp2[0..8])), 
                 kyber_capsule: hex::encode(&kyber_capsule_change),
-                aes_vault: hex::encode(final_vault_c),
-                amount: change_amount, // MONNAIE EN CLAIR
+                aes_vault: hex::encode(final_vault2),
+                amount: change_amount,
             });
         }
 
@@ -1235,7 +1244,8 @@ pub async fn send_data_internal(
     
     let schedule = get_fee_schedule().await?; 
     let mut num_inputs = 0;
-    let mut fee = calculate_dynamic_fee(1, 2, false, &schedule);
+    // On passe 'use_l2' au lieu de 'false' pour les frais bon du L1 ou L2
+    let mut fee = calculate_dynamic_fee(1, 2, use_l2, &schedule);
     let mut required_total = fee;
 
     let res_str = get_all_transactions_cached().await?;
@@ -1310,7 +1320,8 @@ pub async fn send_data_internal(
                 collected_flames += val;
                 num_inputs += 1;
                 
-                fee = calculate_dynamic_fee(num_inputs, 2, false, &schedule);
+                // On passe 'use_l2' au lieu de 'false' ici aussi
+                fee = calculate_dynamic_fee(num_inputs, 2, use_l2, &schedule);
                 required_total = fee;
 
                 if collected_flames >= required_total { break; }
@@ -2687,11 +2698,16 @@ pub fn try_decrypt_output(
         height > 0 && height <= cache.last_scanned_height
     };
 
+    // Si le bloc est vieux, on regarde dans le cache.
+    // Si on le trouve, on le renvoie. Si on ne le trouve PAS, on ne fait pas de "return None" anticipé,
+    // on relance la procédure de déchiffrement Kyber juste en dessous.
     if is_old {
-        return cache.my_decrypted_payloads.get(&out.kyber_capsule).cloned();
+        if let Some(cached_payload) = cache.my_decrypted_payloads.get(&out.kyber_capsule) {
+            return Some(cached_payload.clone());
+        }
     }
     
-    // Sinon, nouveau bloc : on lance la cryptographie
+    // Sinon (nouveau bloc OU bloc vieux mais capsule introuvable en cache), on lance la cryptographie
     if let Ok(capsule_bytes) = hex::decode(&out.kyber_capsule) {
         if let Ok(shared_secret) = decapsulate(&capsule_bytes, sk_bytes) {
             if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
@@ -3144,8 +3160,8 @@ async fn submit_wns_transaction(
 pub async fn resolve_wns_domain_opsec(domain: &str) -> Result<String, String> {
     crate::set_status("🔍 Interrogation sécurisée du WNS...");
     
-    // On tape sur l'API HTTP du WNS local (ou relais de production)
-    let resolver = if LOCAL_DEV_MODE { "http://127.0.0.1:8200" } else { "http://80.78.26.243/api_wns" };
+    // On pointe bien vers /wns (comme dans ton Nginx)
+    let resolver = if LOCAL_DEV_MODE { "http://127.0.0.1:8200" } else { "http://80.78.26.243/wns" };
     let url = format!("{}/resolve/{}", resolver, domain);
     
     match HTTP_CLIENT.get(&url).send().await {

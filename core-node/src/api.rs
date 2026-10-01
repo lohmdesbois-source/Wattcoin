@@ -367,6 +367,31 @@ pub async fn start_api_server(
                         return warp::reply::with_status(warp::reply::json(&"❌ UTXO déjà en cours de dépense dans la mempool"), warp::http::StatusCode::BAD_REQUEST); 
                     }
                 }
+				
+				// VERROU API WOTS+
+				if let Some(sig) = &tx.wots_signature {
+					let ki = hex::encode(&sig.public_key);
+					
+					// 1. Vérification on-chain
+					if chain_lock.spent_key_images.contains(&ki) {
+						return warp::reply::with_status(warp::reply::json(&"❌ Clé WOTS+ déjà cramée on-chain"), warp::http::StatusCode::BAD_REQUEST); 
+					}
+					
+					// 2. Vérification mempool simplifiée
+					let mut in_mempool = false;
+					for m_tx in pool_lock.iter() {
+						if let Some(m_sig) = &m_tx.wots_signature {
+							if hex::encode(&m_sig.public_key) == ki {
+								in_mempool = true;
+								break;
+							}
+						}
+					}
+					
+					if in_mempool {
+						return warp::reply::with_status(warp::reply::json(&"❌ Clé WOTS+ déjà utilisée dans la mempool"), warp::http::StatusCode::BAD_REQUEST); 
+					}
+				}
             }
             
             if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
@@ -434,7 +459,9 @@ pub async fn start_api_server(
                     for item in l2_tree.iter() {
                         if let Ok((_, value)) = item {
                             if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
-                                let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
+                                // RÉSOLUTION INFAILLIBLE DU PARENT L1 VIA L'INDEX RAM
+                                let parent_height = hash_to_height.get(&mb.l1_parent_hash).copied().unwrap_or(0);
+
                                 for tx in &mb.transactions {
                                     enriched_txs.push(serde_json::json!({
                                         "height": parent_height,
@@ -488,7 +515,10 @@ pub async fn start_api_server(
                         if let Ok((_, value)) = item {
                             if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
                                 if mb.micro_index > last_l2 {
-                                    let parent_height = hash_to_height.get(&mb.l1_parent_hash).cloned().unwrap_or(0);
+                                    
+                                    // RÉSOLUTION INFAILLIBLE DU PARENT L1 VIA L'INDEX RAM
+                                    let parent_height = hash_to_height.get(&mb.l1_parent_hash).copied().unwrap_or(0);
+
                                     for tx in &mb.transactions {
                                         new_txs.push(serde_json::json!({
                                             "height": parent_height,
@@ -743,9 +773,14 @@ pub async fn start_api_server(
 		.map(|body_bytes: warp::hyper::body::Bytes, chain_arc: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
 
             let tx: Transaction = match bincode::deserialize(&body_bytes) {
-                Ok(t) => t,
-                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
-            };
+				Ok(t) => t,
+				Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
+			};
+
+			// Rejet immédiat si la structure de la transaction est invalide
+			if !tx.is_valid() {
+				return warp::reply::with_status(warp::reply::json(&"❌ HTLCClaim invalide (structure interne rejetée)"), warp::http::StatusCode::BAD_REQUEST);
+			}
 
 			let secret = match &tx.tx_type {
 				TransactionType::HTLCClaim { secret } if !secret.is_empty() => secret.clone(),
@@ -1359,7 +1394,7 @@ pub async fn start_api_server(
         .allow_origins(vec![
             "http://127.0.0.1:8100", 
             "http://localhost:8100",
-            "wattcoin://native-wallet" // On autorise cette origine "inventée"
+            "https://wallet.wattcoin.network"
         ])
 		//*/
 		//.allow_any_origin()

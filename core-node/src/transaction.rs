@@ -137,42 +137,63 @@ impl Transaction {
     }
 
     pub fn is_valid(&self) -> bool {
-        let is_consensus_mint = matches!(self.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::LotteryPayout { .. });
-        let is_feeless_empty = matches!(self.tx_type, TransactionType::DexSettlement { .. } | TransactionType::MiningShare { .. });
+		let is_consensus_mint = matches!(self.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::LotteryPayout { .. });
+		
+		// Transactions sans frais (Certaines, comme HTLCClaim, ont besoin d'un output)
+		let is_feeless = matches!(self.tx_type, 
+			TransactionType::DexSettlement { .. } | 
+			TransactionType::MiningShare { .. } |
+			TransactionType::HTLCClaim { .. } | 
+			TransactionType::HTLCRefund { .. }
+		);
 
-        // 1. Bloquer les transactions sans input (SAUF consensus/mint)
-        if !is_consensus_mint && !is_feeless_empty && self.inputs.is_empty() {
-            println!("⛔ Rejet : Transaction standard sans input.");
-            return false;
-        }
+		// Signaux purs (Strictement 0 input et 0 output)
+		let is_strictly_empty = matches!(self.tx_type, 
+			TransactionType::DexSettlement { .. } | 
+			TransactionType::MiningShare { .. } |
+			TransactionType::HTLCRefund { .. }
+		);
 
-        // 2. Empêcher la création d'outputs fantômes sur les signaux P2P (Dex/Minage)
-        if is_feeless_empty && (!self.outputs.is_empty() || !self.inputs.is_empty()) {
-            println!("⛔ Rejet : Les DexSettlement et MiningShare ne peuvent avoir ni input ni output.");
-            return false;
-        }
+		// 1. Bloquer les transactions sans input (SAUF consensus/mint et feeless)
+		if !is_consensus_mint && !is_feeless && self.inputs.is_empty() {
+			println!("⛔ Rejet : Transaction standard sans input.");
+			return false;
+		}
 
-        // 3. Bloquer l'underflow sur les frais
-        // Limite fixée à 10 milliards de WATT (10^19 Flames), ce qui rentre parfaitement dans un u64
-        let max_supply_flames = 10_000_000_000_u64 * 1_000_000_000_u64;
-        if self.fee > max_supply_flames {
-            println!("⛔ Rejet : Frais aberrants.");
-            return false;
-        }
+		// 2. Empêcher la création d'outputs fantômes sur les signaux P2P
+		if is_strictly_empty && (!self.outputs.is_empty() || !self.inputs.is_empty()) {
+			println!("⛔ Rejet : Les DexSettlement, MiningShare et HTLCRefund ne peuvent avoir ni input ni output.");
+			return false;
+		}
 
-        // 4. Validation stricte des signatures WOTS+
+		// 3. Règle structurelle stricte pour HTLCClaim
+		if let TransactionType::HTLCClaim { .. } = self.tx_type {
+			if !self.inputs.is_empty() || self.outputs.len() != 1 {
+				println!("⛔ Rejet : HTLCClaim doit avoir 0 input et exactement 1 output.");
+				return false;
+			}
+		}
+
+		// 4. Bloquer l'underflow sur les frais
+		let max_supply_flames = 10_000_000_000_u64 * 1_000_000_000_u64;
+		if self.fee > max_supply_flames {
+			println!("⛔ Rejet : Frais aberrants.");
+			return false;
+		}
+
+        // 5. Validation stricte des signatures WOTS+
         if let Some(sig) = &self.wots_signature {
             let hash = self.hash_data();
             if !wots::Wots::verify(sig, &hash) {
                 println!("⛔ Rejet : Signature WOTS+ invalide.");
                 return false;
             }
-        } else if !is_consensus_mint && !is_feeless_empty {
+        } else if !is_consensus_mint && !is_feeless {
             println!("⛔ Rejet : Transaction non signée.");
             return false;
         }
 
-        // 5. Validation de la Preuve de Secret (HTLC)
+        // 6. Validation de la Preuve de Secret (HTLC)
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
             if secret.is_empty() { return false; }
             let secret_bytes = hex::decode(secret).unwrap_or_default();
@@ -187,7 +208,7 @@ impl Transaction {
         if total_vault_size > 8_388_608 { return false; }
 
         // VÉRIFICATION MATHÉMATIQUE CLASSIQUE ET INFAILLIBLE
-        if !is_consensus_mint && !is_feeless_empty {
+        if !is_consensus_mint && !is_feeless {
             let mut sum_in = 0u64;
             let mut sum_out = 0u64;
             

@@ -26,9 +26,10 @@ const BAN_DURATION_SECS: i64 = 3600; // Banni pour 1 heure
 #[derive(Serialize, Deserialize, Debug)]
 pub enum P2PMessage {
     Handshake { genesis_hash: String, current_height: u64, sender_port: String },
-    // On remplace height et last_hash par la liste dynamique
-    SyncRequest { locator_hashes: Vec<String>, sender_port: String },
-    SyncResponse { blocks: Vec<Block> },
+    // AJOUT DU DERNIER INDEX L2 DANS LA REQUÊTE
+    SyncRequest { locator_hashes: Vec<String>, last_l2_index: u64, sender_port: String },
+    // AJOUT DES MICROBLOCS L2 DANS LA RÉPONSE
+    SyncResponse { blocks: Vec<Block>, micro_blocks: Vec<crate::block::MicroBlock> },
     NewBlock { block: Block, sender_port: String }, 
     WhisperTransaction { tx: Transaction },    
     BroadcastTransaction { tx: Transaction },  
@@ -186,54 +187,58 @@ pub fn start_peer_connection(
                             ap.insert(actual_peer_id.clone(), sender);
                         }
                     } 
-					
-                    let (is_behind, i_am_ahead, my_height, genesis_valid) = {
+
+                    let (is_behind, i_am_ahead, my_height, genesis_valid, my_l2_index, locator_hashes) = {
                         let chain = blockchain.lock().unwrap(); 
                         let my_h = chain.current_height + 1;
-                        (
-                            current_height > my_h, 
-                            my_h > current_height, 
-                            my_h, 
-                            genesis_hash == chain.get_block_by_height(0).unwrap().header.hash
-                        )
+                        let genesis_ok = genesis_hash == chain.get_block_by_height(0).unwrap().header.hash;
+                        
+                        // 1. Récupérer notre index L2 actuel
+                        let mut l2_idx = 0;
+                        if let Ok(l2_tree) = chain.db.open_tree("l2_blocks") {
+                            if let Some(Ok((_, value))) = l2_tree.iter().rev().next() {
+                                if let Ok(last_mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                    l2_idx = last_mb.micro_index;
+                                }
+                            }
+                        }
+
+                        // 2. Générer les locators L1
+                        let mut locators = Vec::new();
+                        let len = my_h as usize;
+                        if len > 0 {
+                            locators.push(chain.get_block_by_height((len - 1) as u64).unwrap().header.hash.clone());
+                            if len > 1 { locators.push(chain.get_block_by_height((len - 2) as u64).unwrap().header.hash.clone()); }
+                            let mut idx = len.saturating_sub(2).saturating_sub(5);
+                            while idx > 0 && locators.len() < 10 {
+                                locators.push(chain.get_block_by_height(idx as u64).unwrap().header.hash.clone());
+                                idx = idx.saturating_sub(5);
+                            }
+                            if locators.last() != Some(&chain.get_block_by_height(0).unwrap().header.hash) {
+                                locators.push(chain.get_block_by_height(0).unwrap().header.hash.clone()); 
+                            }
+                        }
+                        
+                        (current_height > my_h, my_h > current_height, my_h, genesis_ok, l2_idx, locators)
                     }; 
 
                     if !genesis_valid { break; }
 
-                    if is_behind {
-                        // GÉNÉRATION DU LOCATOR (1, 2, puis de 5 en 5)
-                        let locator_hashes = {
-                            let chain = blockchain.lock().unwrap(); 
-                            let mut locators = Vec::new();
-                            let len = (chain.current_height + 1) as usize;
-                            
-                            if len > 0 {
-                                locators.push(chain.get_block_by_height((len - 1) as u64).unwrap().header.hash.clone());
-                                if len > 1 { locators.push(chain.get_block_by_height((len - 2) as u64).unwrap().header.hash.clone()); }
-                                
-                                let mut idx = len.saturating_sub(2).saturating_sub(5);
-                                while idx > 0 && locators.len() < 10 {
-                                    locators.push(chain.get_block_by_height(idx as u64).unwrap().header.hash.clone());
-                                    idx = idx.saturating_sub(5);
-                                }
-                                // Le parachute final : on s'assure que le Genesis est toujours là
-                                if locators.last() != Some(&chain.get_block_by_height(0).unwrap().header.hash) {
-                                    locators.push(chain.get_block_by_height(0).unwrap().header.hash.clone()); 
-                                }
-                            }
-                            locators
-                        };
-
-                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port.clone() }).await;
+                    // On demande une synchro si le L1 est en retard, OU si le L1 est à la même hauteur (pour vérifier le L2)
+                    if is_behind || current_height == my_height {
+                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes, last_l2_index: my_l2_index, sender_port: my_port.clone() }).await;
                     } else if i_am_ahead {
                         send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash, current_height: my_height, sender_port: my_port.clone() }).await;
-                    }
+                    } else {
+						// Nous sommes à la même hauteur, on demande directement la mempool !
+						send_message_to_channel(&tx, P2PMessage::GetMempool).await;
+					}
                 },
 
-                P2PMessage::SyncRequest { locator_hashes, sender_port: _ } => {
-                    let blocks_to_send = {
-                        let chain = blockchain.lock().unwrap(); 
-                        let mut found_idx = 0; // Par défaut, on remonte au Genesis
+                P2PMessage::SyncRequest { locator_hashes, last_l2_index, sender_port: _ } => {
+                    let data_to_send = {
+                        let chain = blockchain.lock().unwrap();
+                        let mut found_idx = 0; 
                         
                         // RECHERCHE DYNAMIQUE DE L'ANCÊTRE
                         for locator in locator_hashes {
@@ -247,112 +252,227 @@ pub fn start_peer_connection(
                             if found { break; }
                         }
                         
-                        // On envoie uniquement les blocs APRÈS l'ancêtre commun
-                        // SYNC PING-PONG : 1 bloc binaire à la fois
+                        let mut blocks = Vec::new();
                         if (found_idx as u64) < chain.current_height {
-                            Some(vec![chain.get_block_by_height(found_idx as u64 + 1).unwrap()])
+                            for i in (found_idx as u64 + 1)..=chain.current_height {
+                                if let Some(b) = chain.get_block_by_height(i) {
+                                    blocks.push(b);
+                                }
+                            }
+                        }
+
+                        // RECHERCHE DES MICROBLOCS L2 MANQUANTS
+                        let mut m_blocks = Vec::new();
+                        if let Ok(l2_tree) = chain.db.open_tree("l2_blocks") {
+                            for item in l2_tree.iter() {
+                                if let Ok((_, value)) = item {
+                                    if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                        if mb.micro_index > last_l2_index {
+                                            m_blocks.push(mb);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !blocks.is_empty() || !m_blocks.is_empty() {
+                            Some((blocks, m_blocks))
                         } else {
                             None
                         }
                     }; 
 
-                    if let Some(blocks) = blocks_to_send {
-                        send_message_to_channel(&tx, P2PMessage::SyncResponse { blocks }).await;
-                    }
+					// Extrait les vecteurs, ou crée des vecteurs vides si data_to_send est None
+					let (blocks_to_send, micro_blocks_to_send) = data_to_send.unwrap_or_default();
+
+					// On répond TOUJOURS pour ne pas bloquer la machine à états de l'autre nœud
+					send_message_to_channel(&tx, P2PMessage::SyncResponse { 
+						blocks: blocks_to_send, 
+						micro_blocks: micro_blocks_to_send 
+					}).await;
                 },
                 
-                P2PMessage::SyncResponse { blocks } => {
-                    if blocks.is_empty() {
-                        println!("⚠️ [SYNC] Lot de blocs vide reçu, ignoré.");
+                P2PMessage::SyncResponse { blocks, micro_blocks } => {
+                    if blocks.is_empty() && micro_blocks.is_empty() {
+                        println!("✅ [SYNC] Nœud parfaitement à jour (L1 et L2). Récupération de la Mempool...");
+                        send_message_to_channel(&tx, P2PMessage::GetMempool).await;
                         continue;
                     }
                     
-                    let incoming_last = blocks.last().unwrap();
                     let mut needs_sync_request = false;
                     let mut locators = Vec::new();
 
-                    { // DÉBUT DE LA ZONE SOUS VERROU BLOCKCHAIN
+                    // ===================================
+                    // 1. SYNCHRONISATION DU L1
+                    // ===================================
+                    if !blocks.is_empty() {
+                        let incoming_last = blocks.last().unwrap();
+                        
                         let mut chain = blockchain.lock().unwrap(); 
                         let current_height = chain.current_height + 1;
 
                         if incoming_last.header.index < current_height {
                             let our_hash = &chain.get_block_by_height(incoming_last.header.index).unwrap().header.hash;
                             if our_hash == &incoming_last.header.hash {
-                                continue;
-                            }
-                        }
-
-                        println!("📥 [SYNC] Lot de {} blocs téléchargé ! (Index {} à {})", blocks.len(), blocks[0].header.index, incoming_last.header.index);
-                        
-                        if chain.resolve_partial_fork(blocks.clone()) { 
-                            println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
-                            
-                            let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
-
-                            { // SOUS-VERROU MEMPOOL (isolé dans ses propres accolades)
-                                let mut mp = mempool.lock().unwrap();
-                                mp.retain(|tx| { 
-                                    let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
-                                    let is_valid_share = match &tx.tx_type {
-                                        TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-                                        _ => true
+                                // On est déjà à jour sur ce bloc L1
+                            } else {
+                                // Cas de fork
+                                println!("📥 [SYNC] Bloc téléchargé ! (Index {})", incoming_last.header.index);
+                                if chain.resolve_partial_fork(blocks.clone()) {
+                                    println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
+                                    let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
+                                    { // SOUS-VERROU MEMPOOL
+                                        let mut mp = mempool.lock().unwrap();
+                                        mp.retain(|tx| { 
+                                            let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
+                                            let is_valid_share = match &tx.tx_type {
+                                                TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+                                                _ => true
+                                            };
+                                            not_in_block && is_valid_share
+                                        });
+                                    } // FIN VERROU MEMPOOL
+                                    
+                                    let now = chrono::Local::now().format("%d-%m-%Y %H:%M:%S");
+                                    let tx_count = incoming_last.transactions.len();
+                                    let tx_detail = if tx_count == 1 { 
+                                        "1 Coinbase".to_string() 
+                                    } else { 
+                                        format!("1 Coinbase + {} Publique/Swap/Loto", tx_count - 1) 
                                     };
-                                    not_in_block && is_valid_share
-                                });
-                            } // FIN VERROU MEMPOOL
-
-                            // On relaie la bonne nouvelle au reste du réseau !
-                            if let Some(last_block) = blocks.last() {
+                                    println!("\n====================================================================");
+                                    println!("🔄 [SYNC] BLOC {} RATTRAPÉ ET REDIFFUSÉ !", incoming_last.header.index);
+                                    println!("🕒 Synchronisé le : {}", now);
+                                    println!("🔗 Hash           : {}", incoming_last.header.hash);
+                                    println!("📝 Contenu        : {} transactions incluses ({})", tx_count, tx_detail);
+                                    println!("====================================================================");
+                                    
+                                    let env = P2PMessage::NewBlock { 
+                                        block: incoming_last.clone(), 
+                                        sender_port: my_port.clone() 
+                                    };
+                                    if let Ok(payload) = bincode::serialize(&env) {
+                                        let length = (payload.len() as u32).to_be_bytes();
+                                        let mut framed = Vec::with_capacity(4 + payload.len());
+                                        framed.extend_from_slice(&length);
+                                        framed.extend_from_slice(&payload);
+                                        let ap = active_peers.lock().unwrap().clone();
+                                        for (peer_id, sender) in ap.iter() {
+                                            if peer_id != &actual_peer_id {
+                                                let _ = sender.try_send(framed.clone()); 
+                                            }
+                                        }
+                                    }
+                                    needs_sync_request = true;
+                                    locators = vec![incoming_last.header.hash.clone()];
+                                } else {
+                                    println!("❌ [SYNC] Échec de la fusion !");
+                                }
+                            }
+                        } else {
+                            println!("📥 [SYNC] Bloc téléchargé ! (Index {})", incoming_last.header.index);
+                            
+                            if chain.resolve_partial_fork(blocks.clone()) { 
+                                println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
                                 
-                                // --- NOUVEL AFFICHAGE VISUEL POUR LE RELAIS ---
-                                let now = chrono::Local::now().format("%d-%m-%Y %H:%M:%S");
-                                let tx_count = last_block.transactions.len();
-                                let tx_detail = if tx_count == 1 { 
-                                    "1 Coinbase".to_string() 
-                                } else { 
-                                    format!("1 Coinbase + {} Publique/Swap/Loto", tx_count - 1) 
-                                };
+                                let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
 
-                                println!("\n====================================================================");
-                                println!("🔄 [SYNC] BLOC {} RATTRAPÉ ET REDIFFUSÉ !", last_block.header.index);
-                                println!("🕒 Synchronisé le : {}", now);
-                                println!("🔗 Hash           : {}", last_block.header.hash);
-                                println!("📝 Contenu        : {} transactions incluses ({})", tx_count, tx_detail);
-                                println!("====================================================================");
-                                // ----------------------------------------------
+                                { // SOUS-VERROU MEMPOOL (isolé dans ses propres accolades)
+                                    let mut mp = mempool.lock().unwrap();
+                                    mp.retain(|tx| { 
+                                        let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
+                                        let is_valid_share = match &tx.tx_type {
+                                            TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
+                                            _ => true
+                                        };
+                                        not_in_block && is_valid_share
+                                    });
+                                } // FIN VERROU MEMPOOL
 
-                                let env = P2PMessage::NewBlock { 
-                                    block: last_block.clone(), 
-                                    sender_port: my_port.clone() 
-                                };
-                                if let Ok(payload) = bincode::serialize(&env) {
-                                    let length = (payload.len() as u32).to_be_bytes();
-                                    let mut framed = Vec::with_capacity(4 + payload.len());
-                                    framed.extend_from_slice(&length);
-                                    framed.extend_from_slice(&payload);
+                                // On relaie la bonne nouvelle au reste du réseau !
+                                if let Some(last_block) = blocks.last() {
+                                    
+                                    let now = chrono::Local::now().format("%d-%m-%Y %H:%M:%S");
+                                    let tx_count = last_block.transactions.len();
+                                    let tx_detail = if tx_count == 1 { 
+                                        "1 Coinbase".to_string() 
+                                    } else { 
+                                        format!("1 Coinbase + {} Publique/Swap/Loto", tx_count - 1) 
+                                    };
 
-                                    let ap = active_peers.lock().unwrap().clone();
-                                    for (peer_id, sender) in ap.iter() {
-                                        if peer_id != &actual_peer_id {
-                                            let _ = sender.try_send(framed.clone()); 
+                                    println!("\n====================================================================");
+                                    println!("🔄 [SYNC] BLOC {} RATTRAPÉ ET REDIFFUSÉ !", last_block.header.index);
+                                    println!("🕒 Synchronisé le : {}", now);
+                                    println!("🔗 Hash           : {}", last_block.header.hash);
+                                    println!("📝 Contenu        : {} transactions incluses ({})", tx_count, tx_detail);
+                                    println!("====================================================================");
+
+                                    let env = P2PMessage::NewBlock { 
+                                        block: last_block.clone(), 
+                                        sender_port: my_port.clone() 
+                                    };
+                                    if let Ok(payload) = bincode::serialize(&env) {
+                                        let length = (payload.len() as u32).to_be_bytes();
+                                        let mut framed = Vec::with_capacity(4 + payload.len());
+                                        framed.extend_from_slice(&length);
+                                        framed.extend_from_slice(&payload);
+
+                                        let ap = active_peers.lock().unwrap().clone();
+                                        for (peer_id, sender) in ap.iter() {
+                                            if peer_id != &actual_peer_id {
+                                                let _ = sender.try_send(framed.clone()); 
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            if blocks.len() == 1 {
                                 needs_sync_request = true;
                                 locators = vec![incoming_last.header.hash.clone()];
+
+                            } else {
+                                println!("❌ [SYNC] Échec de la fusion !");
                             }
-
-                        } else {
-                            println!("❌ [SYNC] Échec de la fusion !");
                         }
-                    } // FIN DE LA ZONE SOUS VERROU BLOCKCHAIN (chain est 100% purgée)
+                    }
 
-                    // L'APPEL ASYNCHRONE EST TOTALEMENT ISOLÉ ICI
+                    // ===================================
+                    // 2. SYNCHRONISATION DU L2
+                    // ===================================
+                    if !micro_blocks.is_empty() {
+                        let mut chain = blockchain.lock().unwrap();
+                        let mut added_l2 = 0;
+                        
+                        for mb in micro_blocks {
+                            // Le tribunal L2 s'occupe de valider l'ancre parent L1 et la signature
+                            if let Ok(_) = chain.validate_and_add_microblock(mb) {
+                                added_l2 += 1;
+                            }
+                        }
+                        if added_l2 > 0 {
+                            println!("✅ [SYNC] {} MicroBlocs L2 synchronisés avec succès via P2P !", added_l2);
+                        }
+                    }
+
+                    // ===================================
+                    // 3. CONTINUITÉ
+                    // ===================================
                     if needs_sync_request {
-                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes: locators, sender_port: my_port.clone() }).await;
+                        let my_l2_index = {
+                            let chain = blockchain.lock().unwrap();
+                            let mut idx = 0;
+                            if let Ok(l2_tree) = chain.db.open_tree("l2_blocks") {
+                                if let Some(Ok((_, value))) = l2_tree.iter().rev().next() {
+                                    if let Ok(last_mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                        idx = last_mb.micro_index;
+                                    }
+                                }
+                            }
+                            idx
+                        };
+                        send_message_to_channel(&tx, P2PMessage::SyncRequest { locator_hashes: locators, last_l2_index: my_l2_index, sender_port: my_port.clone() }).await;
+                    } else {
+                        // La blockchain est totalement synchronisée (L1 et L2 à jour), on aspire la mempool !
+                        send_message_to_channel(&tx, P2PMessage::GetMempool).await;
                     }
                 },
 
@@ -471,8 +591,21 @@ pub fn start_peer_connection(
                             Err((_, my_height, locator_hashes)) => {
                                 // SI LE BLOC EST INVALIDE, ON RELÂCHE LE KILL SWITCH POUR LE MINEUR !
                                 crate::network::HIGHEST_KNOWN_BLOCK.store(my_height.saturating_sub(1), Ordering::Relaxed);
+                                
+                                let my_l2_index = {
+                                    let chain = bc_clone.lock().unwrap();
+                                    let mut idx = 0;
+                                    if let Ok(l2_tree) = chain.db.open_tree("l2_blocks") {
+                                        if let Some(Ok((_, value))) = l2_tree.iter().rev().next() {
+                                            if let Ok(last_mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                                                idx = last_mb.micro_index;
+                                            }
+                                        }
+                                    }
+                                    idx
+                                };
 
-                                send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, sender_port: my_port_clone.clone() }).await;
+                                send_message_to_channel(&tx_clone, P2PMessage::SyncRequest { locator_hashes, last_l2_index: my_l2_index, sender_port: my_port_clone.clone() }).await;
                             },
                             Ok(is_new) => {
 								// BOUCLIER ANTI-TEMPÊTE
@@ -698,7 +831,7 @@ pub fn start_peer_connection(
 								}
 							}
                         }
-                        if !local_mp.iter().any(|x| x.outputs[0].kyber_capsule == t.outputs[0].kyber_capsule) && !spent {
+                        if !local_mp.iter().any(|x| x.hash_data() == t.hash_data()) && !spent {
                             local_mp.push(t);
                             added += 1;
                         }

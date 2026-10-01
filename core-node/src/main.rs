@@ -774,7 +774,7 @@ async fn main() {
                             use sha2::Digest; 
                             let mut already_sequenced = std::collections::HashSet::new();
 
-                            // LECTURE DU VRAI COMPTEUR GLOBAL VIA SLED
+                            // LECTURE DU VRAI COMPTEUR GLOBAL L2 VIA SLED
                             let mut global_l2_index = 0;
                             {
                                 let chain = chain_seq.lock().unwrap();
@@ -787,12 +787,16 @@ async fn main() {
                                 }
                             }
 
-                            for i in 0..128 {
+                            // COMPTEUR DE CLÉS INDÉPENDANT DU CHRONOMÈTRE
+                            let mut current_key_index = 0;
+
+                            // 128 représente le budget de clés dispo, on boucle 128 secondes max
+                            for _ in 0..128 {
                                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                 
                                 let mut txs_to_sequence = Vec::new();
-                                let mut expected_fees = 0u64; // On calcule les vrais frais
-                                let mut current_mb_size = 1024; // 1 Ko de base pour l'en-tête
+                                let mut expected_fees = 0u64; 
+                                let mut current_mb_size = 1024; 
 
                                 {
                                     let mp = mempool_seq.lock().unwrap();
@@ -803,14 +807,13 @@ async fn main() {
 										if is_pure_l2 && !already_sequenced.contains(&tx_hash_hex) {
                                             let tx_size = bincode::serialized_size(tx).unwrap_or(0) as usize;
                                             
-                                            // LE BOUCLIER L2 : Limite stricte à 2 Mo par MicroBloc !
                                             if current_mb_size + tx_size > 2 * 1024 * 1024 {
                                                 println!("⚠️ [L2] MicroBloc plein ! (2 Mo max). Fin du remplissage pour ce tour.");
                                                 break;
                                             }
 
                                             current_mb_size += tx_size;
-                                            expected_fees += tx.fee; // On additionne les vrais frais payés !
+                                            expected_fees += tx.fee; 
 											txs_to_sequence.push(tx.clone());
 											already_sequenced.insert(tx_hash_hex);
 										}
@@ -819,30 +822,28 @@ async fn main() {
 
                                 if txs_to_sequence.is_empty() { continue; }
                                 
-                                // On incrémente SEULEMENT parce qu'on a trouvé des transactions !
                                 global_l2_index += 1; 
                                 let true_tx_count = txs_to_sequence.len(); 
-                                let keypair = &sequencer_keys[i];
+                                
+                                // ON UTILISE LE BON INDEX DE CLÉ
+                                let keypair = &sequencer_keys[current_key_index];
 
-                                // Répartition 99% Séquenceur / 1% Loto
                                 let lottery_tax = expected_fees / 100;
                                 let sequencer_reward = expected_fees - lottery_tax;
 
-                                // 1. La part du Séquenceur
                                 let mut coinbase_outputs = vec![
                                     wattcoin_core::transaction::TransactionOutput {
                                         stealth_address: format!("L2_WATT_{}", hex::encode(&keypair.1)),
-                                        kyber_capsule: format!("MICRO_COINBASE_{}", global_l2_index), // 💡 Propre
+                                        kyber_capsule: format!("MICRO_COINBASE_{}", global_l2_index), 
                                         aes_vault: sequencer_reward.to_string(),
                                         amount: sequencer_reward,
                                     }
                                 ];
 
-                                // 2. La part de la Loterie (s'il y a des frais à taxer)
                                 if lottery_tax > 0 {
                                     coinbase_outputs.push(wattcoin_core::transaction::TransactionOutput {
                                         stealth_address: "LOTTERY_RESERVE".to_string(),
-                                        kyber_capsule: format!("L2_TAX_CAPSULE_{}", global_l2_index), // 💡 Propre
+                                        kyber_capsule: format!("L2_TAX_CAPSULE_{}", global_l2_index), 
                                         aes_vault: lottery_tax.to_string(),
                                         amount: lottery_tax,
                                     });
@@ -864,8 +865,8 @@ async fn main() {
 
 								let mut micro_block = wattcoin_core::block::MicroBlock {
                                     l1_parent_hash: l1_parent_hash.clone(),
-                                    micro_index: global_l2_index, // Le Compteur Global !
-                                    key_index: i as u32,          // L'index pour la sécurité WOTS
+                                    micro_index: global_l2_index, 
+                                    key_index: current_key_index as u32, // 💡 ON GRAVE LE BON INDEX
                                     timestamp: chrono::Utc::now().timestamp(),
                                     transactions: txs_to_sequence,
                                     sequencer_pubkey: hex::encode(&keypair.1),
@@ -874,20 +875,18 @@ async fn main() {
                                     merkle_proof: l2_pubkeys.clone(), 
                                 };
 
-                                // On scelle cryptographiquement les transactions !
 								let mut tx_hasher = sha2::Sha512::new();
 								for tx in &micro_block.transactions {
 									tx_hasher.update(&tx.hash_data());
 								}
 								let txs_hash = hex::encode(tx_hasher.finalize());
 
-								// On hache TOUT pour la signature (incluant les transactions)
 								let mb_data = format!("{}{}{}{}{}", 
 									micro_block.l1_parent_hash, 
 									micro_block.micro_index, 
 									micro_block.key_index, 
 									micro_block.timestamp, 
-									txs_hash // Le contenu est maintenant verrouillé !
+									txs_hash 
 								);
 
 								let mut hasher = sha2::Sha512::new();
@@ -898,40 +897,51 @@ async fn main() {
 								micro_block.sequencer_sig = wots::Wots::sign(
 									&keypair.0, 
 									micro_block.micro_index,
-									&hash_arr, // 64 octets directs !
+									&hash_arr, 
 									&keypair.1 
 								);
 
+                                // On valide LOCALEMENT via le Tribunal L2 avant de diffuser !
+                                let is_valid_locally = {
+                                    let mut chain = chain_seq.lock().unwrap();
+                                    match chain.validate_and_add_microblock(micro_block.clone()) {
+                                        Ok(_) => {
+                                            // Le Tribunal a tout géré (Sled + UTXOs). On purge juste la mempool.
+                                            let mut mp = mempool_seq.lock().unwrap();
+                                            mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
+                                            true
+                                        }
+                                        Err(e) => {
+                                            println!("🚨 [L2 SEQUENCER FATAL] Auto-validation échouée : {}", e);
+                                            false
+                                        }
+                                    }
+                                };
+
+                                // Si la base locale rejette notre propre bloc (ex: parent orphelin), on coupe tout !
+                                if !is_valid_locally {
+                                    println!("🛑 Arrêt du séquenceur pour éviter la corruption de la base locale.");
+                                    break; 
+                                }
+
+                                // Si c'est validé, on diffuse enfin au réseau !
                                 wattcoin_core::network::broadcast_micro_block(micro_block.clone(), Arc::clone(&active_peers_seq)).await;
                                 
                                 println!("\n====================================================================");
                                 println!("⚡ NOUVEAU MICRO-BLOC L2 SÉQUENCÉ !");
                                 println!("====================================================================");
-                                println!("📦 Micro-Index   : {}", micro_block.micro_index); // 💡 L'affichage est propre
+                                println!("📦 Micro-Index   : {}", micro_block.micro_index); 
                                 println!("🔗 Parent L1     : {}", micro_block.l1_parent_hash);
                                 println!("🕒 Date et Heure : {}", chrono::Local::now().format("%d-%m-%Y %H:%M:%S"));
                                 println!("📝 Transactions  : {} incluses (Instantanées)", true_tx_count);
                                 println!("💰 Frais perçus  : {} Flames", sequencer_reward);
                                 println!("====================================================================\n");
 
-                                // MISE À JOUR SÉCURISÉE DE L'ÉTAT LOCAL DU SÉQUENCEUR
-                                // 1 & 2. Enregistrement direct dans Sled + Protection Anti-Double Dépense & Nettoyage Mempool
-                                {
-                                    let mut chain = chain_seq.lock().unwrap();
-                                    
-                                    // SAUVEGARDE L2 VIA SLED
-                                    let _ = chain.push_microblock(&micro_block);
-                                    
-                                    for tx in &micro_block.transactions {
-                                        if tx.tx_type != TransactionType::MicroCoinbase {
-											if let Some(sig) = &tx.wots_signature {
-												chain.spent_key_images.insert(hex::encode(&sig.public_key));
-											}
-										}
-                                    }
-                                    
-                                    let mut mp = mempool_seq.lock().unwrap();
-                                    mp.retain(|tx| !micro_block.transactions.iter().any(|m_tx| m_tx.hash_data() == tx.hash_data()));
+                                // On a consommé une clé, on avance d'un pas !
+                                current_key_index += 1;
+                                if current_key_index >= 128 {
+                                    println!("⚡ [L2 SEQUENCER] Toutes les clés WOTS+ sont épuisées ! Fin du règne.");
+                                    break;
                                 }
                             }
                             println!("⚡ [L2 SEQUENCER] Mon règne est terminé. J'attends le prochain bloc L1...");

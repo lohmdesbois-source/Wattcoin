@@ -20,7 +20,7 @@ const INITIAL_DIFFICULTY_SHIFT: u32 = 12;
 pub const LOTTERY_TIME_BLOCK: u64 = 10; // 720 blocks pour un jour
 pub const EPOCH_BLOCKS: u64 = 255;  // toutes les 8H30 (8,5 Heures = 255 blocks)
 const MONTANT_STAKE: u64 = 100; // 10 000 Pour la prod (840 $)
-const FENETRE_DIFFICULTY: usize = 17; // 720 Pour la prod (un jour)
+const FENETRE_DIFFICULTY: usize = 720; // 720 Pour la prod (un jour)
 
 pub struct Blockchain {
     pub db: Db,
@@ -487,6 +487,14 @@ impl Blockchain {
 							tx_inputs_valid = false; break;
 						}
                     }
+					
+					// LE BOUCLIER WOTS+ DU MINEUR
+                    if let Some(sig) = &tx.wots_signature {
+                        if temp_spent_images.contains(&hex::encode(&sig.public_key)) {
+                            println!("⛔ Rejet : Clé WOTS+ déjà utilisée dans ce bloc !");
+                            double_spend = true;
+                        }
+                    }
                 }
 
                 if !double_spend && tx_inputs_valid {
@@ -591,10 +599,21 @@ impl Blockchain {
                     let header_data = format!("{}{}{}{}{}{}{}", share_miner, share_height, timestamp, share_prev_hash, nonce, l2_root, tx_root);
                     
                     if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
-                        if hex::encode(&hash_bytes) == *hash {
-                            if valid_shares.len() < 50 { valid_shares.push(tx.clone()); }
-                        }
-                    }
+						if hex::encode(&hash_bytes) == *hash {
+							
+							// SOLUTION KISS : Le mineur vérifie la difficulté du bloc précédent
+							let hash_bigint = num_bigint::BigUint::parse_bytes(hash.as_bytes(), 16).unwrap_or_default();
+							let share_target_hex = previous_block.header.target_hex.clone();
+							let share_base_target = num_bigint::BigUint::parse_bytes(share_target_hex.as_bytes(), 16)
+								.unwrap_or_else(|| self.target.clone());
+
+							if hash_bigint <= (&share_base_target * 20u32) {
+								if valid_shares.len() < 50 { valid_shares.push(tx.clone()); }
+							} else {
+								println!("⛔ Rejet de la part de {} : PoW insuffisant.", share_miner);
+							}
+						}
+					}
                 }
             }
         }
@@ -1046,9 +1065,17 @@ impl Blockchain {
 			return Err("Hash frauduleux.".to_string()); 
 		}
 
+		// On parse le hash du BLOC, pas une variable "hash" inexistante
 		let hash_bigint = num_bigint::BigUint::parse_bytes(block.header.hash.as_bytes(), 16).unwrap_or_default();
-		if hash_bigint > self.target { 
-			return Err("Preuve de travail insuffisante.".to_string()); 
+
+		// SOLUTION KISS : On utilise la difficulté gravée dans le bloc précédent !
+		let share_target_hex = last_block.header.target_hex.clone();
+		let share_base_target = num_bigint::BigUint::parse_bytes(share_target_hex.as_bytes(), 16)
+			.unwrap_or_else(|| self.target.clone());
+
+		// La part de minage doit être 20x plus facile que la cible de l'époque
+		if hash_bigint > (&share_base_target * 20u32) { 
+			return Err("❌ MiningShare: Preuve de travail insuffisante pour son époque !".into()); 
 		}
 
 		let mut coinbase_count = 0;
@@ -1183,7 +1210,13 @@ impl Blockchain {
 				}
 				
 				let hash_bigint = num_bigint::BigUint::parse_bytes(hash.as_bytes(), 16).unwrap_or_default();
-				if hash_bigint > (&self.target * 20u32) { 
+
+				// On utilise bien la difficulté du bloc PRECEDENT (last_block)
+				let share_target_hex = last_block.header.target_hex.clone();
+				let share_base_target = num_bigint::BigUint::parse_bytes(share_target_hex.as_bytes(), 16)
+					.unwrap_or_else(|| self.target.clone());
+
+				if hash_bigint > (&share_base_target * 20u32) { 
 					return Err("❌ MiningShare: Preuve de travail insuffisante !".into()); 
 				}
 			}
@@ -1544,7 +1577,15 @@ impl Blockchain {
 
         for tx in micro_block.transactions.iter().skip(1) {
             if !tx.is_valid() {
-                return Err("❌ FRAUDE L2 : Transaction interne invalide (Maths Lattice ou Signature).".into());
+                return Err("❌ FRAUDE L2 : Transaction interne invalide (Maths ou Signature).".into());
+            }
+			
+			// MARQUER L'UTXO COMME DÉPENSÉ
+            for input in &tx.inputs {
+                if self.spent_key_images.contains(&input.utxo_id) || temp_spent.contains(&input.utxo_id) {
+                    return Err("❌ FRAUDE L2 : Double dépense UTXO détectée dans le MicroBloc !".into());
+                }
+                temp_spent.insert(input.utxo_id.clone());
             }
 
             let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
@@ -1591,8 +1632,11 @@ impl Blockchain {
         l2_tree.insert(&key, value).map_err(|e| e.to_string())?;
         self.db.flush().map_err(|e| e.to_string())?;
 
-        println!("⚡ [L2 TRIBUNAL] MicroBloc {}/128 validé ! (Taille: {} Ko, Frais légitimes: {} Flames)", 
-                 micro_block.micro_index, mb_size / 1024, expected_fees);
+		println!("⚡ [L2 TRIBUNAL] MicroBloc #{} validé ! (Clé: {}/128, Taille: {} Ko, Frais légitimes: {} Flames)", 
+			micro_block.micro_index, 
+			micro_block.key_index + 1, 
+			mb_size / 1024, 
+			expected_fees);
 
         Ok(())
     }

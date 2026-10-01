@@ -317,7 +317,7 @@ impl WattcoinApp {
                 let keys_3 = keys.clone();
                 let f_wns = tokio::spawn(async move {
                     let resolver = if crate::LOCAL_DEV_MODE { "http://127.0.0.1:8200" } else { "http://80.78.26.243/wns" };
-                    let wns_url = format!("{}/balance/{}", resolver, keys_3.watt_address);
+					let wns_url = format!("{}/balance/{}", resolver, keys_3.watt_address);
                     let wns_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
                     if let Ok(res) = wns_client.get(&wns_url).send().await {
                         if let Ok(json) = res.json::<serde_json::Value>().await {
