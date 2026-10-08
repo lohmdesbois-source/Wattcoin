@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use bip39::Language;
 use unicode_normalization::UnicodeNormalization;
 use rand::RngCore;
+use crate::HLTC_LOCK_TIME;
 
 // PONT JNI : Variables globales pour communiquer avec Android
 #[cfg(target_os = "android")]
@@ -42,7 +43,7 @@ enum OnboardingStep {
     RestoreSeed,
 }
 
-// 1. LE NOUVEAU SYSTÈME DE MESSAGERIE ROBUSTE
+// LE SYSTÈME DE MESSAGERIE ROBUSTE
 #[allow(dead_code)]
 enum AppMessage {
     UnlockSuccess(crate::WalletKeys),
@@ -61,7 +62,7 @@ enum AppMessage {
 		current_block_height: u64
     },
 	HistoryData(Vec<crate::HistoryItem>),
-	DexData { pool: Vec<crate::Order>, swaps: Vec<crate::SwapContract> },
+	DexData { pool: Vec<crate::Order>, swaps: Vec<crate::SwapContract>, btc_locked_hashes: std::collections::HashSet<String> }, 
 	SwapCompleted(String),
 	DataFetched(Vec<crate::DataItem>), // Pour recevoir l'historique messages
     FileHashed(String, String),
@@ -104,7 +105,7 @@ struct WattcoinApp {
 	
 	recipient_input: String,
     amount_input: String,
-    transfer_tip: String, // 👈 NOUVEAU : Le pourboire mineur !
+    transfer_tip: String, // Le pourboire mineur !
     transfer_from_l2: bool,
     transfer_to_l2: bool,
 	transfer_asset: String, // "WATT" ou "BTC"
@@ -122,6 +123,7 @@ struct WattcoinApp {
     is_loading_dex: bool,
     swap_secrets: std::collections::HashMap<String, String>, // Stocke temporairement les secrets générés
 	completed_swaps: std::collections::HashSet<String>, // Historique des swaps finis
+	btc_locked_hashes: std::collections::HashSet<String>,
     last_watchtower_tick: Option<std::time::Instant>,   // Chronomètre
 	
 	// VARIABLES POUR MESSAGES ET NOTAIRE
@@ -189,7 +191,7 @@ impl WattcoinApp {
             *APP_TX.lock().unwrap() = Some(tx.clone());
         }
         
-        // NOUVELLE LOGIQUE DE DÉMARRAGE
+        // LOGIQUE DE DÉMARRAGE
         let wallets = crate::list_wallets();
         let initial_view = if wallets.is_empty() {
             crate::set_active_wallet("Principal");
@@ -231,7 +233,7 @@ impl WattcoinApp {
 			
 			recipient_input: String::new(),
 			amount_input: String::new(),
-            transfer_tip: String::new(), // 👈 NOUVEAU
+            transfer_tip: String::new(), // Pourboire
 			transfer_from_l2: false,
 			transfer_to_l2: false,
 			transfer_asset: "WATT".to_string(), // Transfert WATT par défaut
@@ -249,6 +251,7 @@ impl WattcoinApp {
             is_loading_dex: false,
             swap_secrets: std::collections::HashMap::new(),
 			completed_swaps: std::collections::HashSet::new(),
+			btc_locked_hashes: std::collections::HashSet::new(),
             last_watchtower_tick: None,
 			
 			data_items: Vec::new(),
@@ -283,7 +286,7 @@ impl WattcoinApp {
         }
     }
 
-    // 3. FONCTION DE RAFRAÎCHISSEMENT DU DASHBOARD ULTRA-RAPIDE
+    // FONCTION DE RAFRAÎCHISSEMENT DU DASHBOARD ULTRA-RAPIDE
     fn refresh_dashboard(&mut self, ctx: egui::Context) {
         if self.is_refreshing { return; }
         self.is_refreshing = true;
@@ -429,9 +432,16 @@ impl WattcoinApp {
                 if let Ok(s) = crate::get_active_swaps(keys.btc_address.clone(), keys.watt_address.clone()).await { 
                     swaps = s; 
                 }
+				
+				let mut btc_locked_hashes = std::collections::HashSet::new();
 
                 // LE WATCHTOWER BAVARD
                 for swap in &swaps {
+					// On vérifie systématiquement si le BTC est verrouillé pour l'UI
+                    if let Ok(true) = crate::check_btc_contract_exists(&swap.htlc_hash).await {
+                        btc_locked_hashes.insert(swap.htlc_hash.clone());
+                    }
+					
                     if completed.contains(&swap.htlc_hash) { continue; }
 
                     let is_buyer = keys.watt_address == swap.buyer_watt_address;
@@ -447,7 +457,7 @@ impl WattcoinApp {
 								
 								match crate::claim_wattcoin_swap(secret.clone(), swap.htlc_hash.clone(), swap.watt_amount_flames, swap.buyer_watt_address.clone()).await {
 									Ok(_) => {
-                                        // 💡 LE WATCHTOWER NETTOIE SON CACHE !
+                                        // LE WATCHTOWER NETTOIE SON CACHE !
                                         crate::remove_swap_from_cache(&swap.htlc_hash);
 										let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
 									}
@@ -485,7 +495,7 @@ impl WattcoinApp {
                     }
                 }
                 
-                let _ = tx.send(AppMessage::DexData { pool, swaps }).await;
+                let _ = tx.send(AppMessage::DexData { pool, swaps, btc_locked_hashes }).await;
 				crate::set_status("");
                 ctx.request_repaint();
             });
@@ -660,9 +670,10 @@ impl eframe::App for WattcoinApp {
 					self.history_items = items;
 					self.is_loading_history = false;
 				},
-				AppMessage::DexData { pool, swaps } => {
+				AppMessage::DexData { pool, swaps, btc_locked_hashes } => { 
                     self.dark_pool = pool;
                     self.active_swaps = swaps;
+                    self.btc_locked_hashes = btc_locked_hashes; 
                     self.is_loading_dex = false;
                 },
 				AppMessage::SwapCompleted(hash) => {
@@ -735,7 +746,7 @@ impl eframe::App for WattcoinApp {
                     if ui.button("⚙ Paramètres").clicked() { self.view = AppView::Settings; ui.close_menu(); }
                     if ui.button("❌ Verrouiller").clicked() { 
                         self.view = AppView::Unlock; 
-                        self.wallet_keys = None; // 🛡️ On purge les clés de la mémoire !
+                        self.wallet_keys = None; // On purge les clés de la mémoire !
                         self.decrypted_seed.clear();
                         self.password_input.clear();
                         ui.close_menu(); 
@@ -1382,7 +1393,7 @@ impl eframe::App for WattcoinApp {
                                         let keys = keys.clone();
                                         let from_l2 = self.transfer_from_l2;
                                         tokio::spawn(async move {
-                                            // 👈 On passe bien le tip_val à la fonction d'estimation
+                                            // On passe bien le tip_val à la fonction d'estimation
                                             if let Ok((utxos, size, fee)) = crate::estimate_tx_weight(amt_val, tip_val, &keys.kyber_secret_hex, &keys.watt_address, from_l2, false).await {
                                                 let _ = tx.send(AppMessage::TxWeightEstimated(utxos, size, fee)).await;
                                             }
@@ -1433,7 +1444,7 @@ impl eframe::App for WattcoinApp {
 							} else {
 								// 2. TOUT EST BON, ON RÉCUPÈRE LES VARIABLES PROPRES
 								let amount = self.amount_input.trim().replace(",", ".").parse::<f64>().unwrap();
-                                let tip = self.transfer_tip.trim().replace(",", ".").parse::<f64>().unwrap_or(0.0); // 👈 On capte le pourboire
+                                let tip = self.transfer_tip.trim().replace(",", ".").parse::<f64>().unwrap_or(0.0); // On capte le pourboire
 								let keys = self.wallet_keys.as_ref().unwrap().clone();
 								let recipient = self.recipient_input.trim().to_string();
 								let tx = self.tx.clone();
@@ -1617,7 +1628,7 @@ impl eframe::App for WattcoinApp {
 							});
 							ui.add_space(10.0);
 
-							// APRÈS (Bouton grisé pendant le traitement)
+							// Bouton grisé pendant le traitement
 							let is_submitting_order = self.sync_message == "Envoi de l'ordre...";
 
 							if ui.add_enabled(!is_submitting_order, egui::Button::new("🚀 Soumettre l'ordre au réseau")).clicked() {
@@ -1635,7 +1646,7 @@ impl eframe::App for WattcoinApp {
 									if o_type == "sell" {
 										let total_watt_needed = amt;
 										if (self.balance_l1 + self.balance_l2) < total_watt_needed {
-											self.sync_message = format!("❌ Solde WATT insuffisant. Requis : {:.3} WATT", total_watt_needed);
+											self.sync_message = format!("❌ Solde WATT insuffisant. Requis : {:.9} WATT", total_watt_needed);
 											can_proceed = false;
 										}
 									}
@@ -1704,7 +1715,7 @@ impl eframe::App for WattcoinApp {
 										let btc_usd = btc_amt * self.btc_price_usd;
 
 										ui.horizontal(|ui| {
-											ui.label(format!("Montant : {} WATT", watt_amt));
+											ui.label(format!("Montant : {:.9} WATT", watt_amt));
 											ui.label(egui::RichText::new(format!("(≈ $ {:.2})", watt_usd)).color(egui::Color32::GRAY));
 											ui.label("↔");
 											ui.label(format!("{} Sats", swap.btc_amount_sats));
@@ -1716,7 +1727,13 @@ impl eframe::App for WattcoinApp {
 										ui.vertical(|ui| {
 											if is_buyer {
 												// ACTIONS ACHETEUR
-												if ui.button("1. Verrouiller mes BTC").clicked() {
+												let is_btc_ready = self.btc_locked_hashes.contains(&swap.htlc_hash);
+                                                
+												// On grise le bouton si le BTC est déjà verrouillé
+												if ui.add_enabled(!is_btc_ready, egui::Button::new("1. Verrouiller mes BTC"))
+                                                    .on_disabled_hover_text("Vos BTC sont déjà verrouillés et en sécurité sur le réseau Bitcoin.")
+                                                    .clicked() 
+                                                {
 													self.sync_message = "Création du contrat HTLC Bitcoin et envoi...".to_string();
 													let tx = self.tx.clone();
 													let swap_clone = swap.clone();
@@ -1730,19 +1747,55 @@ impl eframe::App for WattcoinApp {
 													});
 												}
 												ui.add_space(5.0);
+                                                
+												// Le bouton Refund n'apparaît que SI l'argent a été verrouillé
+                                                if is_btc_ready {
+                                                    if ui.button("🔙 Remboursement BTC").on_hover_text("Si le Vendeur n'envoie jamais les WATT (délai BTC expiré)").clicked() {
+                                                        self.sync_message = "Demande de remboursement BTC en cours...".to_string();
+                                                        let tx = self.tx.clone();
+                                                        let swap_clone = swap.clone();
+                                                        let master_seed = keys.master_seed_hex.clone();
+                                                        
+														tokio::spawn(async move {
+                                                            match crate::refund_btc_swap(&swap_clone, master_seed).await { 
+                                                                Ok(msg) => { 
+																	let _ = tx.send(AppMessage::SwapCompleted(swap_clone.htlc_hash.clone())).await;
+																	let _ = tx.send(AppMessage::Info(msg)).await; 
+																},
+                                                                Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+                                                            }
+                                                        });
+                                                    }
+                                                    ui.add_space(5.0);
+                                                }
+
 												ui.label(egui::RichText::new("👁 Watchtower en attente du dépôt WATT...").color(egui::Color32::GRAY).italics());
 											} else {
 												// ACTIONS VENDEUR
-												if ui.button("1. Verrouiller mes WATT").clicked() {
-													self.sync_message = "Création du HTLC Quantique en cours...".to_string();
+												let is_btc_ready = self.btc_locked_hashes.contains(&swap.htlc_hash);
+                                                
+												// On grise le bouton si le BTC n'est pas prêt, et on explique pourquoi au survol !
+												if ui.add_enabled(is_btc_ready, egui::Button::new("1. Verrouiller mes WATT"))
+                                                    .on_disabled_hover_text("En attente de la confirmation des BTC par l'acheteur...")
+                                                    .clicked() 
+                                                {
+													self.sync_message = "Vérification du verrou Bitcoin en cours...".to_string();
 													let tx = self.tx.clone();
 													let keys_clone = keys.clone();
 													let amount_watt = swap.watt_amount_flames as f64 / 1_000_000_000.0;
 													let recipient = swap.buyer_watt_address.clone();
 													let htlc_hash = swap.htlc_hash.clone();
 													
+													// on extrait la valeur AVANT de lancer la tâche asynchrone
+													let target_timeout = self.current_block_height + HLTC_LOCK_TIME; 
+													
 													tokio::spawn(async move {
-														match crate::send_wattcoin(recipient, amount_watt, 0.0, keys_clone.kyber_secret_hex, keys_clone.watt_address, keys_clone.master_seed_hex, Some(htlc_hash), Some(999_999), false, false).await {
+														match crate::send_wattcoin(
+															recipient, amount_watt, 0.0, keys_clone.kyber_secret_hex, 
+															keys_clone.watt_address, keys_clone.master_seed_hex, 
+															Some(htlc_hash), Some(target_timeout), // On utilise la copie !
+															false, false
+														).await {
 															Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 															Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 														}
@@ -1754,11 +1807,10 @@ impl eframe::App for WattcoinApp {
 													self.sync_message = "Demande de remboursement WATT...".to_string();
 													let tx = self.tx.clone();
 													let hash = swap.htlc_hash.clone();
-													let addr = keys.watt_address.clone();
-													let amt = swap.watt_amount_flames as f64 / 1_000_000_000.0;
+													let keys_clone = keys.clone(); 
 													
 													tokio::spawn(async move {
-														match crate::refund_wattcoin_swap(hash, addr, amt).await {
+														match crate::refund_wattcoin_swap(hash, keys_clone).await { 
 															Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
 															Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 														}
@@ -1794,7 +1846,7 @@ impl eframe::App for WattcoinApp {
 										ui.label(egui::RichText::new(&order.order_type.to_uppercase()).color(color).strong());
 										let watt_amt = order.amount_flames as f64 / 1_000_000_000.0;
 										let watt_usd = watt_amt * self.watt_price_usd;
-										ui.label(format!("{:.3} WATT", watt_amt));
+										ui.label(format!("{:.9} WATT", watt_amt));
 										ui.label(egui::RichText::new(format!("(≈ $ {:.2})", watt_usd)).color(egui::Color32::GRAY));
 										ui.label(format!("@ {} Sats", order.price_sats));
 										
@@ -1997,7 +2049,7 @@ impl eframe::App for WattcoinApp {
 										tokio::spawn(async move {
 											let mut final_recipient = recipient.clone();
 
-											// MAGIE WNS OPSEC : Résolution locale pour les messages !
+											// WNS OPSEC : Résolution locale pour les messages !
 											if final_recipient.ends_with(".watt") || final_recipient.ends_with(".chain") {
 												let _ = tx.send(AppMessage::Info("🔍 Recherche locale (OpSec)...".to_string())).await;
 												match crate::resolve_wns_domain_opsec(&final_recipient).await {
@@ -2065,7 +2117,7 @@ impl eframe::App for WattcoinApp {
 										let hash_content = self.notary_hash.clone();
 										let use_l2 = self.notary_use_l2;
 										
-										// 💡 On s'envoie la preuve à nous-mêmes pour la retrouver dans notre propre historique !
+										// On s'envoie la preuve à nous-mêmes pour la retrouver dans notre propre historique !
 										let recipient = keys.watt_address.clone();
 
 										tokio::spawn(async move {
@@ -2099,7 +2151,7 @@ impl eframe::App for WattcoinApp {
 						ui.add(egui::TextEdit::singleline(&mut self.l2_target_name));
 						ui.add_space(10.0);
 
-						// 🔍 VÉRIFIER LE STATUT L2
+						// VÉRIFIER LE STATUT L2
 						ui.horizontal(|ui| {
 							if ui.button("🔍 Interroger le Tribunal VRF du L1").clicked() {
 								if self.l2_target_name.is_empty() {
@@ -2370,7 +2422,7 @@ impl eframe::App for WattcoinApp {
 						});
 						ui.add_space(20.0);
 
-						// LOGIQUE SIMPLIFIÉE : On achète, ou on contemple.
+						// On achète, ou on contemple.
 						let is_mine = self.wns_domain_status.starts_with("👤");
 						let is_available = self.wns_domain_status.starts_with("✅");
 
@@ -2441,7 +2493,7 @@ impl eframe::App for WattcoinApp {
                             if ui.add_sized([300.0, 40.0], egui::Button::new("💾 Télécharger le QR Code")).clicked() {
 								let seed = self.decrypted_seed.clone();
 								let tx = self.tx.clone();
-								// 💡 SOLUTION ANTI-FREEZE OS : FileDialog déporté dans un thread !
+								// ANTI-FREEZE OS : FileDialog déporté dans un thread !
 								tokio::task::spawn_blocking(move || {
 									save_qr_code_to_disk(&seed, "wattcoin_seed_qr.png");
 									let _ = tx.blocking_send(AppMessage::Info("✅ QR Code sauvegardé !".into()));
@@ -2512,7 +2564,7 @@ impl eframe::App for WattcoinApp {
                             }
                         });
 
-                        // Petite astuce pour lire le message spécifique de Settings
+                        // lire le message spécifique de Settings
                         if self.sync_message.starts_with("SEED_SHOW:") {
                             self.decrypted_seed = self.sync_message.replace("SEED_SHOW:", "");
                             self.show_seed = true;
@@ -2678,7 +2730,7 @@ fn get_qr_texture(ctx: &egui::Context, data: &str) -> egui::TextureHandle {
         if color == qrcode::Color::Dark {
             pixels.push(egui::Color32::BLACK);
         } else {
-            pixels.push(egui::Color32::WHITE); // 👈 Toujours blanc pour les scanners
+            pixels.push(egui::Color32::WHITE); // Toujours blanc pour les scanners
         }
     }
     

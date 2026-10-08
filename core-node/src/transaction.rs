@@ -26,7 +26,7 @@ pub struct L2Transaction {
 }
 
 impl L2Transaction {
-    /// Hache les données pour vérifier la signature
+    // Hache les données pour vérifier la signature
     pub fn hash_data(&self) -> [u8; 64] {
         let mut hasher = sha2::Sha512::new();
         hasher.update(self.sender_pubkey.as_bytes());
@@ -77,20 +77,20 @@ pub enum TransactionType {
     LotteryPayout { target_block: u64, winner_pubkey: String },
 	MiningShare { miner_address: String, nonce: u64, hash: String, timestamp: i64 },
 	// POUR L'OUVERTURE AUX L2 EXTERNES :
-    /// Le Séquenceur verrouille ses propres fonds pour prouver sa légitimité (Skin in the game)
+    // Le Séquenceur verrouille ses propres fonds pour prouver sa légitimité (Skin in the game)
     L2Stake { l2_name: String, sequencer_pubkey: String },
-    /// Le Séquenceur ferme sa chaîne et récupère ses fonds (après un délai de sécurité)
+    // Le Séquenceur ferme sa chaîne et récupère ses fonds (après un délai de sécurité)
     L2Unstake { l2_name: String },
-    /// Le Séquenceur grave l'état de sa chaîne (La racine de son arbre de Merkle) sur le L1
+    // Le Séquenceur grave l'état de sa chaîne (La racine de son arbre de Merkle) sur le L1
     L2Anchor { l2_name: String, state_root: String, sequencer_signature: String, withdrawals: Vec<TransactionOutput> },
 	// L'utilisateur verrouille ses WATT pour lui-même sur le L2 !
     L2BridgeLock { 
-        l2_target_name: String,       // ex: "AVA"
-        l2_receiver_pubkey: String,   // La clé WOTS+ de l'utilisateur sur le L2 AVA
+        l2_target_name: String,       // ex: "WNS"
+        l2_receiver_pubkey: String,   // La clé WOTS+ de l'utilisateur sur le L2 WNS
     },
 }
 
-// L'Input Pseudonyme
+// L'Input
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionInput {
     pub utxo_id: String, // Identifiant strict (kyber_capsule d'origine)
@@ -98,7 +98,7 @@ pub struct TransactionInput {
     pub source_height: u64,
 }
 
-// L'Output Masqué (Capsule Kyber + Montant Masqué)
+// L'Output
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransactionOutput {
     pub stealth_address: String,      
@@ -150,8 +150,7 @@ impl Transaction {
 		// Signaux purs (Strictement 0 input et 0 output)
 		let is_strictly_empty = matches!(self.tx_type, 
 			TransactionType::DexSettlement { .. } | 
-			TransactionType::MiningShare { .. } |
-			TransactionType::HTLCRefund { .. }
+			TransactionType::MiningShare { .. }
 		);
 
 		// 1. Bloquer les transactions sans input (SAUF consensus/mint et feeless)
@@ -170,6 +169,14 @@ impl Transaction {
 		if let TransactionType::HTLCClaim { .. } = self.tx_type {
 			if !self.inputs.is_empty() || self.outputs.len() != 1 {
 				println!("⛔ Rejet : HTLCClaim doit avoir 0 input et exactement 1 output.");
+				return false;
+			}
+		}
+		
+		// 3.5 POUR LE REFUND
+		if let TransactionType::HTLCRefund { .. } = self.tx_type {
+			if !self.inputs.is_empty() || self.outputs.len() != 1 {
+				println!("⛔ Rejet : HTLCRefund doit avoir 0 input et exactement 1 output.");
 				return false;
 			}
 		}

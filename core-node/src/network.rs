@@ -76,7 +76,7 @@ async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R, 
     if length > MAX_MESSAGE_SIZE {
         println!("🚨 [SÉCURITÉ] Flux TCP ignoré : Message binaire trop volumineux ({} octets).", length);
         ban_peer(peer_ip, "Spam Mémoire (Payload géant)");
-        return None; // 👈 Coupe la connexion instantanément
+        return None; // Coupe la connexion instantanément
     }
     
     // 3. On lit exactement le reste du message
@@ -671,7 +671,7 @@ pub fn start_peer_connection(
 
 									let ap = active_peers_clone.lock().unwrap().clone();
 									for (peer_id, sender) in ap.iter() {
-										// CORRECTION : Utilisation des bonnes variables du scope
+										// Utilisation des bonnes variables du scope
 										if peer_id != &actual_peer_id_clone {
 											let _ = sender.try_send(framed.clone());
 										}
@@ -683,7 +683,7 @@ pub fn start_peer_connection(
                 },
 
                 P2PMessage::WhisperTransaction { tx: in_tx } => {
-					// 🛡️ PATCH SÉCURITÉ P2P : On drop les Coinbase volantes !
+					// SÉCURITÉ P2P : On drop les Coinbase volantes !
 					if in_tx.tx_type == TransactionType::Coinbase || in_tx.tx_type == TransactionType::MicroCoinbase {
 						println!("🚨 [SÉCURITÉ] Drop d'une transaction Coinbase ou MicroCoinbase illégale reçue via P2P.");
 						continue; 
@@ -801,7 +801,7 @@ pub fn start_peer_connection(
 
 								let ap = active_peers.lock().unwrap().clone();
 								for (peer_id, sender) in ap.iter() {
-									// CORRECTION : On envoie 'framed'
+									// On envoie 'framed'
 									if peer_id != &actual_peer_id {
 										let _ = sender.try_send(framed.clone());
 									}
@@ -924,7 +924,7 @@ pub fn start_peer_connection(
                             } else {
                                 println!("🧅 [MIXNET] Couche épluchée. Transfert aveugle vers : {}", hop_payload.next_hop_address);
                                 
-                                // 💡 CORRECTION ICI : Décodage Binaire au lieu de JSON
+                                // Décodage Binaire
                                 if let Ok(next_packet) = bincode::deserialize::<OnionPacket>(&hop_payload.inner_data) {
                                     let target_ip = hop_payload.next_hop_address.clone();
                                     tokio::spawn(async move {

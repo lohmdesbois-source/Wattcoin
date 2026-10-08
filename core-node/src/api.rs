@@ -7,11 +7,10 @@ use serde::{Serialize, Deserialize};
 use bitcoin::hashes::Hash;
 use std::str::FromStr;
 use sha2::Digest;
-use std::collections::HashSet;
 
 pub type SharedPool = Arc<Mutex<Vec<Order>>>;
 
-// Devenu 'pub' pour que le mineur (main.rs) et le validateur puissent le mettre à jour
+// 'pub' pour que le mineur (main.rs) et le validateur puissent le mettre à jour
 pub static LAST_PRICE_SATS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +61,6 @@ pub async fn start_api_server(
     let chain_filter = warp::any().map(move || Arc::clone(&chain));
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
     let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
-	
-	let btc_htlcs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-	let btc_htlc_set_filter = warp::any().map(move || Arc::clone(&btc_htlcs));
 
     // ===================================================================
     // Route pour que les Wallets connaissent la tarification !
@@ -352,7 +348,7 @@ pub async fn start_api_server(
             }
 
             if !tx.is_valid() {
-                return warp::reply::with_status(warp::reply::json(&"❌ Preuve ZKP ou signature invalide"), warp::http::StatusCode::BAD_REQUEST);
+                return warp::reply::with_status(warp::reply::json(&"❌ Math ou signature invalide"), warp::http::StatusCode::BAD_REQUEST);
             }
 
             if tx.tx_type != crate::transaction::TransactionType::Coinbase {
@@ -398,14 +394,21 @@ pub async fn start_api_server(
                 let chain_lock = chain_arc.lock().unwrap();
                 let current_height = chain_lock.current_height;
                 let mut timeout_passed = false;
+                let mut seller_watt_address = None;
                 
                 for i in 0..=chain_lock.current_height {
                     if let Some(block) = chain_lock.get_block_by_height(i) {
                         for past_tx in &block.transactions {
+                            if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
+                                for swap in swaps {
+                                    if swap.htlc_hash == *hash {
+                                        seller_watt_address = Some(swap.seller_watt_address.clone());
+                                    }
+                                }
+                            }
                             if let crate::transaction::TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
                                 if lock_hash == hash {
                                     if current_height >= *timeout_block { timeout_passed = true; }
-                                    break;
                                 }
                             }
                         }
@@ -413,6 +416,13 @@ pub async fn start_api_server(
                 }
                 
                 if !timeout_passed { return warp::reply::with_status(warp::reply::json(&"⏳ Délai non expiré"), warp::http::StatusCode::BAD_REQUEST); }
+                
+                // VÉRIFICATION STRICTE DU DESTINATAIRE
+                if let Some(seller_addr) = seller_watt_address {
+                    if tx.outputs.is_empty() || tx.outputs[0].stealth_address != seller_addr {
+                        return warp::reply::with_status(warp::reply::json(&"❌ HTLCRefund doit retourner les fonds au Vendeur d'origine !"), warp::http::StatusCode::BAD_REQUEST);
+                    }
+                }
             }
 			
 			let mut pool = mempool.lock().unwrap();
@@ -968,8 +978,8 @@ pub async fn start_api_server(
 	let btc_create_htlc = warp::path!("btc" / "htlc" / "create")
 		.and(warp::post())
 		.and(warp::body::json())
-		.and(btc_htlc_set_filter.clone())
-		.map(|params: serde_json::Value, btc_htlcs: Arc<Mutex<HashSet<String>>>| {
+		.and(chain_filter.clone()) 
+		.map(|params: serde_json::Value, chain_arc: Arc<Mutex<Blockchain>>| {
 			let buyer_pubkey_hex = params["buyer_pubkey"].as_str().unwrap_or_default().to_string();
 			let seller_pubkey_hex = params["seller_pubkey"].as_str().unwrap_or_default().to_string();
 			let secret_hex = params["secret"].as_str().unwrap_or_default().to_string();
@@ -978,11 +988,8 @@ pub async fn start_api_server(
 			let secret_bytes = hex::decode(&secret_hex).unwrap_or_default();
 			let hash = bitcoin::hashes::sha256::Hash::hash(&secret_bytes);
 			let hash_hex = hex::encode(hash.to_byte_array());
-
-			{
-				let mut set = btc_htlcs.lock().unwrap();
-				set.insert(hash_hex.clone());
-			}
+			// ÉCRITURE SLED (C'est la seule chose dont on a besoin maintenant)
+			let _ = chain_arc.lock().unwrap().lock_btc_htlc(&hash_hex);
 
 			let hash_bytes = hash.to_byte_array();
 			let buyer_pk: bitcoin::PublicKey = match bitcoin::PublicKey::from_str(&buyer_pubkey_hex) {
@@ -1025,8 +1032,8 @@ pub async fn start_api_server(
 	let btc_send_to_htlc = warp::path!("btc" / "send" / "to_htlc")
 		.and(warp::post())
 		.and(warp::body::bytes()) 
-		.and(btc_htlc_set_filter.clone()) 
-		.map(|body_bytes: warp::hyper::body::Bytes, btc_htlcs: Arc<Mutex<HashSet<String>>>| {
+		.and(chain_filter.clone()) 
+		.map(|body_bytes: warp::hyper::body::Bytes, chain_arc: Arc<Mutex<Blockchain>>| {
 			
             let payload: serde_json::Value = match serde_json::from_slice(&body_bytes) {
                 Ok(p) => p,
@@ -1034,28 +1041,25 @@ pub async fn start_api_server(
             };
 
 			let htlc_hash = payload["htlc_address"].as_str().unwrap_or_default().to_string();
-			
 			if !htlc_hash.is_empty() {
-				let mut set = btc_htlcs.lock().unwrap();
-				set.insert(htlc_hash.clone());
-				println!("🔍 [NODE] BTC verrouillés pour le hash : {}", htlc_hash);
+                // ÉCRITURE SLED UNIQUEMENT
+				let _ = chain_arc.lock().unwrap().lock_btc_htlc(&htlc_hash);
+				println!("🔍 [NODE] BTC verrouillés et enregistré pour le hash : {}", htlc_hash);
 			}
 
 			warp::reply::json(&serde_json::json!({
 				"success": true,
 				"message": "✅ BTC verrouillé dans le HTLC",
-				"htlc_txid": "Broadcasted via Tor"
+				"htlc_txid": "Broadcasted via Mixnet"
 			}))
 		});
 		
 	let btc_check_htlc_exists = warp::path!("btc" / "htlc" / "exists" / String)
 		.and(warp::get())
-		.and(btc_htlc_set_filter.clone())
-		.map(|hash: String, btc_htlcs: Arc<Mutex<HashSet<String>>>| {
-			let exists = {
-				let set = btc_htlcs.lock().unwrap();
-				set.contains(&hash)
-			};
+		.and(chain_filter.clone()) 
+		.map(|hash: String, chain_arc: Arc<Mutex<Blockchain>>| {
+			// LECTURE SLED
+			let exists = chain_arc.lock().unwrap().is_btc_htlc_locked(&hash);
 
 			warp::reply::json(&serde_json::json!({
 				"exists": exists,

@@ -37,6 +37,8 @@ pub static SYNC_STATUS: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(Stri
 
 const MATURITY_BLOCKS: u64 = 1; 
 const FLAME: u64 = 1_000_000_000;
+const HLTC_LOCK_TIME : u64 = 5; // 1440 Pour la prod (48H / 2 jours)
+const HLTC_LOCK_BTC_TIME : i64 = 1; // 144 Pour la prod (24H / 1 jour)
 
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
@@ -141,7 +143,7 @@ pub struct WalletCache {
 	pub last_scanned_micro_index: u64,
     pub my_decrypted_payloads: std::collections::HashMap<String, String>, 
 	pub known_spent_key_images: std::collections::HashSet<String>,
-	// AJOUT DU STOCKAGE DES JETONS D'ANNULATION ORDER DEX
+	// STOCKAGE DES JETONS D'ANNULATION ORDER DEX
     #[serde(default)]
     pub my_order_secrets: std::collections::HashMap<String, String>,
 }
@@ -390,8 +392,8 @@ pub fn wrap_in_onion(
     encrypted_payload.extend(ciphertext);
     
     Ok(OnionPacket {
-        kyber_capsule: capsule.to_vec(), // Hexa supprimé !
-        encrypted_payload, // Hexa supprimé !
+        kyber_capsule: capsule.to_vec(), 
+        encrypted_payload, 
     })
 }
 
@@ -509,7 +511,7 @@ pub async fn generate_pro_wallet(phrase_option: Option<String>, password: String
 			let phrase1 = words[0..24].join(" ");
 			let phrase2 = words[24..48].join(" ");
 			
-			// MAGIE CRYPTO : bip39 exige le format NFKD pour parser
+			// bip39 exige le format NFKD pour parser
 			let _ = Mnemonic::parse_in(Language::French, &phrase1.nfkd().collect::<String>())
 				.map_err(|_| "La première moitié (1-24) est invalide ou contient un mot inconnu.")?;
 			let _ = Mnemonic::parse_in(Language::French, &phrase2.nfkd().collect::<String>())
@@ -523,7 +525,7 @@ pub async fn generate_pro_wallet(phrase_option: Option<String>, password: String
 			let m1 = Mnemonic::from_entropy_in(Language::French, &ent1).unwrap();
 			let m2 = Mnemonic::from_entropy_in(Language::French, &ent2).unwrap();
 			
-			// MAGIE VISUELLE : On force le NFC dès la création pour que le coffre soit propre !
+			// On force le NFC dès la création pour que le coffre soit propre !
 			format!("{} {}", m1, m2).nfc().collect::<String>()
 		}
 	};
@@ -690,9 +692,9 @@ pub async fn get_balances(keys: WalletKeys) -> Result<Balances, String> {
     let mut cache = load_cache();
     let mut cache_updated = false;
     crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
-    
-    let spent_keys_snapshot = cache.known_spent_key_images.clone();
-    let pending_snapshot: std::collections::HashSet<String> = PENDING_SPENDS.lock().unwrap().keys().cloned().collect();
+	
+	let spent_keys_snapshot = cache.known_spent_key_images.clone();
+	let pending_snapshot: std::collections::HashSet<String> = PENDING_SPENDS.lock().unwrap().keys().cloned().collect();
 
     let mut current_max_l1 = cache.last_scanned_height;
     let mut current_max_l2 = cache.last_scanned_micro_index;
@@ -771,7 +773,8 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
     let mut cache_updated = false;
 	
 	crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
-	let spent_keys_snapshot = cache.known_spent_key_images.clone();
+    
+    let spent_keys_snapshot = cache.known_spent_key_images.clone();
 	let pending_snapshot: std::collections::HashSet<String> = PENDING_SPENDS.lock().unwrap().keys().cloned().collect();
     
     let mut current_max_l1 = cache.last_scanned_height;
@@ -827,18 +830,15 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                 || out.stealth_address == format!("JACKPOT_{}", keys.watt_short_address)
                 || out.stealth_address == keys.watt_address 
             {
-                amt_to_add = out.amount as f64 / 1_000_000_000.0;
-                
-                if out.stealth_address.starts_with("JACKPOT") {
-                    label = "Jackpot gagné ! 🎰".to_string();
-                } else if out.stealth_address == keys.watt_address {
-                    label = "Swap Atomique Réclamé ⚡".to_string(); 
-                } else if out.kyber_capsule.starts_with("SHARE_") {
-                    label = "Part de minage (P2Pool) ⛏".to_string();
-                } else {
-                    label = "Récompense bloc + Frais ⛏".to_string();
+                if let Ok(amt) = out.aes_vault.parse::<u64>() {
+                    amt_to_add = amt as f64 / 1_000_000_000.0;
+                    if out.stealth_address.starts_with("JACKPOT") { label = "Jackpot gagné ! 🎰".to_string(); } 
+                    else if out.kyber_capsule == "HTLC_CLAIM" { label = "Swap Atomique Réclamé ⚡".to_string(); } 
+                    else if out.kyber_capsule == "HTLC_REFUND" { label = "Remboursement HTLC 🔙".to_string(); } 
+                    else if out.kyber_capsule.starts_with("SHARE_") { label = "Part de minage (P2Pool) ⛏".to_string(); } 
+                    else { label = "Récompense bloc + Frais ⛏".to_string(); }
                 }
-            } 
+            }
             else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
                 if try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated).is_some() {
                     amt_to_add = out.amount as f64 / 1_000_000_000.0;
@@ -1207,7 +1207,7 @@ pub async fn send_wattcoin(
     let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
     node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
-    crate::mark_tx_as_pending_in_ram(&tx_pq); // 👈 MÉMOIRE IMMÉDIATE
+    crate::mark_tx_as_pending_in_ram(&tx_pq); // MÉMOIRE IMMÉDIATE
 
     Ok("✅ Succès".to_string())
 }
@@ -1226,7 +1226,7 @@ pub async fn send_data(
     send_data_internal(recipient_kyber_hex, sender_kyber_secret_hex, sender_kyber_public_hex, master_seed_hex, data_type, content, use_l2).await
 }
 
-// 2. Le Moteur Public (Testable par Cargo !)
+// Le Moteur Public (Testable par Cargo !)
 pub async fn send_data_internal(
     recipient_kyber_hex: String, 
     sender_kyber_secret_hex: String,
@@ -1320,7 +1320,7 @@ pub async fn send_data_internal(
                 collected_flames += val;
                 num_inputs += 1;
                 
-                // On passe 'use_l2' au lieu de 'false' ici aussi
+                // On passe 'use_l2' au lieu de 'false'
                 fee = calculate_dynamic_fee(num_inputs, 2, use_l2, &schedule);
                 required_total = fee;
 
@@ -1597,18 +1597,50 @@ pub async fn buy_lottery_ticket(
 }
 
 
-pub async fn refund_wattcoin_swap(hash: String, _watt_address: String, _amount: f64) -> Result<String, String> {
+pub async fn refund_wattcoin_swap(hash: String, keys: WalletKeys) -> Result<String, String> {
+    // 1. On cherche le montant verrouillé dans l'historique du DEX
+    let res_str = get_all_transactions_cached().await?;
+    let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON")?;
+    
+    let mut locked_amount = 0u64;
+    for item in enriched {
+        if let Ok(tx) = serde_json::from_value::<Transaction>(item["transaction"].clone()) {
+            if let TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
+                for swap in swaps {
+                    if swap.htlc_hash == hash {
+                        locked_amount = swap.watt_amount_flames;
+                        break;
+                    }
+                }
+            }
+        }
+        if locked_amount > 0 { break; }
+    }
+
+    if locked_amount == 0 { return Err("❌ Contrat introuvable".into()); }
+
+    // 2. Création de l'Output avec le drapeau de Refund
+    let output = TransactionOutput {
+        stealth_address: keys.watt_address.clone(), // Retour à nous-même
+        kyber_capsule: "HTLC_REFUND".to_string(),   // Le drapeau officiel !
+        aes_vault: locked_amount.to_string(),       // Montant en clair
+        amount: locked_amount,
+    };
+
+    // 3. Forger le signal cryptographique gratuit (Ni input, ni WOTS, ni frais)
     let refund_tx = Transaction {
         tx_type: TransactionType::HTLCRefund { hash: hash.clone() },
-        inputs: vec![],
-        outputs: vec![],
-        fee: 0, // 0 frais 
+        inputs: vec![],  // Pas d'input
+        outputs: vec![output],
+        fee: 0, // Pas de frais
         wots_signature: None,
-        public_key: hash,
+        public_key: hash, // On l'associe au contrat
     };
+
     let tx_bytes = bincode::serialize(&refund_tx).map_err(|e| e.to_string())?;
-    let _ = node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-    Ok("🔙 REMBOURSEMENT WATT DEMANDÉ !".to_string())
+    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
+
+    Ok("🔙 REMBOURSEMENT WATT ENVOYÉ AU RÉSEAU !".to_string())
 }
 
 
@@ -1643,7 +1675,7 @@ pub async fn get_active_swaps(btc_address: String, watt_address: String) -> Resu
             .collect();
     }
 
-    // FIX ANTI-AMNÉSIE : On sauvegarde dans le VRAI dossier sécurisé de l'OS (pas /tmp/)
+    // ANTI-AMNÉSIE : On sauvegarde dans le VRAI dossier sécurisé de l'OS (pas /tmp/)
     let mut cache_path = get_swap_secrets_path().unwrap_or_else(|_| PathBuf::from("swaps.json"));
     cache_path.set_file_name("active_swaps_cache.json");
 
@@ -1735,7 +1767,7 @@ pub fn delete_wallet(name: &str) -> Result<String, String> {
         let cache_path = path.join(format!("{}.cache", name));
         let chain_path = path.join(format!("{}_chain.json", name));
         let swap_path = path.join(format!("{}_swap_secrets.json", name));
-        let db_path = path.join(format!("{}.db", name)); // 👈 NOUVEAU : SLED DB
+        let db_path = path.join(format!("{}.db", name)); // SLED DB
         
         if vault_path.exists() { let _ = std::fs::remove_file(vault_path); }
         if spends_path.exists() { let _ = std::fs::remove_file(spends_path); }
@@ -1743,7 +1775,7 @@ pub fn delete_wallet(name: &str) -> Result<String, String> {
         if cache_path.exists() { let _ = std::fs::remove_file(cache_path); }
         if chain_path.exists() { let _ = std::fs::remove_file(chain_path); }
         if swap_path.exists() { let _ = std::fs::remove_file(swap_path); }
-        // 👈 Sled génère un dossier, on supprime donc tout le dossier et son contenu :
+        // Sled génère un dossier, on supprime donc tout le dossier et son contenu :
         if db_path.exists() { let _ = std::fs::remove_dir_all(db_path); } 
         
         Ok(format!("Le portefeuille '{}' a été supprimé.", name))
@@ -1768,9 +1800,9 @@ pub fn save_miner_script(os: String, address: String) -> Result<String, String> 
     let short_addr = if address.len() > 15 { &address[0..15] } else { &address };
 
     let content = if os == "linux" {
-        format!("#!/bin/bash\n\n# Lancement du Nœud Wattcoin\necho \"🔥 Démarrage du Nœud pour {}...\"\n./wattcoin_core 8001 {} 80.78.26.243:8000 --live\n", short_addr, address)
+        format!("#!/bin/bash\n\n# Lancement du Nœud Wattcoin\necho \"🔥 Démarrage du Nœud pour {}...\"\n./wattcoin_core 8000 {} 80.78.26.243:8000 --live\n", short_addr, address)
     } else {
-        format!("@echo off\n:: Lancement du Nœud Wattcoin\necho 🔥 Demarrage du Noeud pour {}...\nwattcoin_core.exe 8001 {} 80.78.26.243:8000 --live\npause\n", short_addr, address)
+        format!("@echo off\n:: Lancement du Nœud Wattcoin\necho 🔥 Demarrage du Noeud pour {}...\nwattcoin_core.exe 8000 {} 80.78.26.243:8000 --live\npause\n", short_addr, address)
     };
 
     std::fs::write(&file_path, content).map_err(|e| format!("Erreur d'écriture : {}", e))?;
@@ -1874,7 +1906,7 @@ pub async fn get_btc_history(btc_address: &str) -> Result<Vec<HistoryItem>, Stri
             coin: "BTC".to_string(),
             date: date_str,
             status: format!("{} ({})", prefix, display_status),
-            layer: "BTC".to_string(), // 👈 Le nouvel onglet !
+            layer: "BTC".to_string(), // onglet BTC
             raw_timestamp: timestamp,
         });
     }
@@ -1895,7 +1927,6 @@ pub async fn send_btc_to_htlc(
     let buyer_pk = PublicKey::from_str(&swap.buyer_btc_pubkey).map_err(|_| "Buyer PK invalide")?;
     let seller_pk = PublicKey::from_str(&swap.seller_btc_pubkey).map_err(|_| "Seller PK invalide")?;
     let hash_bytes = hex::decode(&swap.htlc_hash).map_err(|_| "Hash invalide")?;
-    let locktime = 144i64; 
 
     // Conversion PushBytes pour bitcoin 0.32[cite: 12]
     let push_hash = <&bitcoin::script::PushBytes>::try_from(hash_bytes.as_slice())
@@ -1909,7 +1940,7 @@ pub async fn send_btc_to_htlc(
         .push_key(&seller_pk)
         .push_opcode(OP_CHECKSIG)
         .push_opcode(OP_ELSE)
-        .push_int(locktime)
+        .push_int(HLTC_LOCK_BTC_TIME)
         .push_opcode(OP_CLTV)
         .push_opcode(OP_DROP)
         .push_key(&buyer_pk)
@@ -2043,13 +2074,13 @@ pub async fn auto_claim_btc_swap(
 
     *sighash_cache.witness_mut(0).unwrap() = witness;
 
-    // 7. Broadcast via le proxy Tor
+    // Broadcast via le proxy Tor
     let raw_tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
     let payload = serde_json::json!({ "raw_tx": raw_tx_hex });
 
     match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await {
         Ok(resp) => {
-            // 💡 CORRECTION DU MIXNET : On "épluche" le double encodage JSON !
+            // MIXNET : On "épluche" le double encodage JSON !
             let mut json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
             
             if let Some(inner_str) = json.as_str() {
@@ -2062,6 +2093,139 @@ pub async fn auto_claim_btc_swap(
                 Ok(format!("🎉 CLAIM BTC RÉUSSI ! TXID : {}...", &json["txid"].as_str().unwrap_or("")[0..10]))
             } else {
                 Err(format!("❌ Erreur Nœud : {}", json["error"].as_str().unwrap_or("Rejeté")))
+            }
+        },
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn refund_btc_swap(
+    swap: &SwapContract, 
+    master_seed_hex: String
+) -> Result<String, String> {
+    use bitcoin::{Network, Address, Amount, OutPoint, Sequence, TxIn, TxOut, Witness, Txid};
+    use bitcoin::transaction::{Transaction as BtcTransaction, Version};
+    use bitcoin::absolute::LockTime;
+    use bitcoin::sighash::{SighashCache, EcdsaSighashType};
+    use bitcoin::blockdata::script::Builder;
+    use bitcoin::opcodes::all::*;
+    use std::str::FromStr;
+    use bitcoin::bip32::{Xpriv, DerivationPath};
+    use bitcoin::secp256k1::Secp256k1;
+
+    let seed = hex::decode(&master_seed_hex).map_err(|_| "Seed invalide")?;
+    let secp = Secp256k1::new();
+    let root = Xpriv::new_master(Network::Testnet, &seed).unwrap();
+    let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
+    let child = root.derive_priv(&secp, &path).unwrap();
+    let privkey = bitcoin::PrivateKey::new(child.private_key, Network::Testnet);
+    let pubkey = privkey.public_key(&secp);
+    let compressed_pubkey = bitcoin::CompressedPublicKey::try_from(pubkey).unwrap();
+    let my_address = Address::p2wpkh(&compressed_pubkey, Network::Testnet).to_string();
+    let my_addr_obj = Address::from_str(&my_address).unwrap().require_network(Network::Testnet).unwrap();
+
+    let buyer_pk = bitcoin::PublicKey::from_str(&swap.buyer_btc_pubkey).map_err(|_| "Buyer PK invalide")?;
+    let seller_pk = bitcoin::PublicKey::from_str(&swap.seller_btc_pubkey).map_err(|_| "Seller PK invalide")?;
+    let hash_bytes = hex::decode(&swap.htlc_hash).map_err(|_| "Hash invalide")?;
+    
+    // Le même délai que pour la création
+    let locktime_val = crate::HLTC_LOCK_BTC_TIME;
+
+    let push_hash = <&bitcoin::script::PushBytes>::try_from(hash_bytes.as_slice())
+        .map_err(|_| "Erreur de conversion PushBytes")?;
+
+    let witness_script = Builder::new()
+        .push_opcode(OP_IF)
+        .push_opcode(OP_SHA256)
+        .push_slice(push_hash)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_key(&seller_pk)
+        .push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_ELSE)
+        .push_int(locktime_val as i64)
+        .push_opcode(OP_CLTV)
+        .push_opcode(OP_DROP)
+        .push_key(&buyer_pk)
+        .push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_ENDIF)
+        .into_script();
+
+    let htlc_addr = Address::p2wsh(&witness_script, Network::Testnet).to_string();
+    let utxos_str = node_call("GET", &format!("/btc/utxos?address={}", htlc_addr), None).await?;
+    let utxos: Vec<EsploraUtxo> = serde_json::from_str(&utxos_str).map_err(|_| "Erreur parsing UTXOs HTLC")?;
+
+    if utxos.is_empty() {
+        return Err("❌ Aucun fond BTC à rembourser (déjà réclamé ou non financé).".to_string());
+    }
+
+    let utxo = &utxos[0]; 
+    let txid = Txid::from_str(&utxo.txid).unwrap();
+    let value = utxo.value;
+    let fee_sats = 500u64;
+    
+    if value <= fee_sats {
+        return Err("❌ Montant HTLC trop faible pour payer les frais.".to_string());
+    }
+
+    let txin = TxIn {
+        previous_output: OutPoint { txid, vout: utxo.vout },
+        script_sig: bitcoin::ScriptBuf::new(),
+        // OBLIGATOIRE POUR OP_CLTV : Sequence doit être < 0xFFFFFFFF
+        sequence: Sequence::from_consensus(0xFFFFFFFE), 
+        witness: Witness::new(),
+    };
+
+    let txout = TxOut {
+        value: Amount::from_sat(value - fee_sats),
+        script_pubkey: my_addr_obj.script_pubkey(),
+    };
+
+    let mut tx = BtcTransaction {
+        version: Version::TWO,
+        // OBLIGATOIRE POUR OP_CLTV : LockTime de la TX >= locktime_val
+        lock_time: LockTime::from_height(locktime_val as u32).map_err(|_| "Locktime invalide")?,
+        input: vec![txin],
+        output: vec![txout],
+    };
+
+    let mut sighash_cache = SighashCache::new(&mut tx);
+    let sighash = sighash_cache.p2wsh_signature_hash(
+        0,
+        &witness_script,
+        Amount::from_sat(value),
+        EcdsaSighashType::All,
+    ).unwrap();
+
+    let msg = bitcoin::secp256k1::Message::from_digest_slice(sighash.as_ref()).unwrap();
+    let sig = secp.sign_ecdsa(&msg, &privkey.inner);
+
+    let mut sig_with_hashtype = sig.serialize_der().to_vec();
+    sig_with_hashtype.push(EcdsaSighashType::All as u8);
+
+    let mut witness = Witness::new();
+    witness.push(sig_with_hashtype); // Signature de l'acheteur
+    witness.push(vec![]);            // Un vecteur vide (OP_0) force le contrat à prendre la branche OP_ELSE (Refund)
+    witness.push(witness_script.into_bytes());
+
+    *sighash_cache.witness_mut(0).unwrap() = witness;
+
+    // Broadcast via le proxy Tor
+    let raw_tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
+    let payload = serde_json::json!({ "raw_tx": raw_tx_hex });
+
+    match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await {
+        Ok(resp) => {
+            let mut json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+            if let Some(inner_str) = json.as_str() {
+                if let Ok(parsed) = serde_json::from_str(inner_str) {
+                    json = parsed;
+                }
+            }
+
+            if json["success"].as_bool().unwrap_or(false) {
+                Ok(format!("🎉 REFUND BTC RÉUSSI ! TXID : {}...", &json["txid"].as_str().unwrap_or("")[0..10]))
+            } else {
+                Err(format!("❌ Erreur Nœud BTC (délai non expiré ?) : {}", json["error"].as_str().unwrap_or("Rejeté")))
             }
         },
         Err(e) => Err(e),
@@ -2182,13 +2346,13 @@ pub async fn send_btc_direct(
         *sighash_cache.witness_mut(i).unwrap() = witness;
     }
 
-    // 5. ENVOI AU NŒUD POUR DIFFUSION TOR
+    // 5. ENVOI AU NŒUD POUR DIFFUSION
     let raw_tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
     
     let payload = serde_json::json!({ "raw_tx": raw_tx_hex });
     match node_call("POST", "/btc/broadcast", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await {
         Ok(resp) => {
-            // 💡 CORRECTION DU MIXNET : On "épluche" le double encodage JSON !
+            // MIXNET : On "épluche" le double encodage JSON !
             let mut json: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
             
             // Si la réponse est une chaîne de caractères (String), on la re-parse en objet JSON
@@ -2915,7 +3079,7 @@ pub async fn bridge_to_l2(
     let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
     node_call("POST", "/send_tx", Some(tx_bytes)).await?;
 
-    crate::mark_tx_as_pending_in_ram(&tx_pq); // 👈 MÉMOIRE IMMÉDIATE
+    crate::mark_tx_as_pending_in_ram(&tx_pq); // MÉMOIRE IMMÉDIATE
 
     Ok("✅ Succès".to_string())
 }
@@ -2945,12 +3109,13 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
             if h > current_height { current_height = h; }
         }
     }
-
+	
     let sk_bytes = hex::decode(&keys.kyber_secret_hex).unwrap_or_default();
-    let mut cache = load_cache();
+	let mut cache = load_cache();
     let mut cache_updated = false;
-
-    crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
+	
+	crate::update_spent_cache_fast(&enriched, &mut cache, &mut cache_updated);
+    
     let spent_keys_snapshot = cache.known_spent_key_images.clone();
 	let pending_snapshot: std::collections::HashSet<String> = PENDING_SPENDS.lock().unwrap().keys().cloned().collect();
 
@@ -2998,17 +3163,20 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
             let mut label = String::new();
 
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
+                || out.stealth_address == format!("COINBASE_{}", keys.watt_short_address)
                 || out.stealth_address == format!("JACKPOT_{}", keys.watt_address) 
+                || out.stealth_address == format!("JACKPOT_{}", keys.watt_short_address)
                 || out.stealth_address == keys.watt_address 
             {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     amt_to_add = amt as f64 / 1_000_000_000.0;
                     if out.stealth_address.starts_with("JACKPOT") { label = "Jackpot gagné ! 🎰".to_string(); } 
-                    else if out.stealth_address == keys.watt_address { label = "Swap Atomique Réclamé ⚡".to_string(); } 
+                    else if out.kyber_capsule == "HTLC_CLAIM" { label = "Swap Atomique Réclamé ⚡".to_string(); } 
+                    else if out.kyber_capsule == "HTLC_REFUND" { label = "Remboursement HTLC 🔙".to_string(); } 
                     else if out.kyber_capsule.starts_with("SHARE_") { label = "Part de minage (P2Pool) ⛏".to_string(); } 
                     else { label = "Récompense bloc + Frais ⛏".to_string(); }
                 }
-            } 
+            }
             else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
                 if let Some(payload_str) = try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated) {
                     let parts: Vec<&str> = payload_str.split('|').collect();
@@ -3068,7 +3236,7 @@ pub async fn register_wns_alias(
     submit_wns_transaction(domain, target_wallet, fee, keys, WnsAction::Register).await
 }
 
-// La vraie mécanique interne (l'ancienne register_wns_domain)
+// La vraie mécanique interne (nom de domaine)
 async fn submit_wns_transaction(
     domain: String, 
     record_data: String, 

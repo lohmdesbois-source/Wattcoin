@@ -56,6 +56,23 @@ impl Blockchain {
 
         Ok(blockchain)
     }
+	
+	// ==========================================
+    // PREUVES BTC : Sauvegarde persistante Sled
+    // ==========================================
+    pub fn lock_btc_htlc(&self, hash: &str) -> Result<(), WattError> {
+        let tree = self.db.open_tree("btc_locks").map_err(|e| WattError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        tree.insert(hash.as_bytes(), &[]).map_err(|e| WattError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        self.db.flush().map_err(|e| WattError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        Ok(())
+    }
+
+    pub fn is_btc_htlc_locked(&self, hash: &str) -> bool {
+        if let Ok(tree) = self.db.open_tree("btc_locks") {
+            return tree.contains_key(hash.as_bytes()).unwrap_or(false);
+        }
+        false
+    }
 
     fn get_last_height(&self) -> u64 {
         if let Some(Ok((key, _))) = self.db.iter().rev().next() {
@@ -1275,10 +1292,21 @@ impl Blockchain {
             if let TransactionType::HTLCRefund { hash } = &tx.tx_type {
                 let mut timeout = 0;
                 let mut lock_found = false;
+                let mut seller_addr = None;
+                let mut expected_amount = 0;
                 
+                // On fouille l'historique pour retrouver l'accord du DEX et le verrouillage
                 for i in (0..=self.current_height).rev() {
                     if let Some(b) = self.get_block_by_height(i) {
                         for past_tx in &b.transactions {
+                            if let TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
+                                for swap in swaps {
+                                    if swap.htlc_hash == *hash {
+                                        seller_addr = Some(swap.seller_watt_address.clone());
+                                        expected_amount = swap.watt_amount_flames;
+                                    }
+                                }
+                            }
                             if let TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
                                 if lock_hash == hash {
                                     timeout = *timeout_block;
@@ -1294,6 +1322,12 @@ impl Blockchain {
                 if !lock_found || current_height < timeout {
                     return Err(format!("❌ FRAUDE : HTLCRefund invalide ou délai non expiré ! (Actuel: {}, Timeout: {})", current_height, timeout));
                 }
+                
+                // VÉRIFICATIONS STRICTES DE L'OUTPUT DE REMBOURSEMENT
+                if seller_addr.is_none() { return Err("❌ FRAUDE : Swap d'origine introuvable pour ce Refund.".to_string()); }
+                if tx.outputs.len() != 1 { return Err("❌ FRAUDE : HTLCRefund doit avoir exactement 1 output.".to_string()); }
+                if tx.outputs[0].aes_vault.parse::<u64>().unwrap_or(0) != expected_amount { return Err("❌ FRAUDE : HTLCRefund tente de voler un montant incorrect.".to_string()); }
+                if tx.outputs[0].stealth_address != seller_addr.unwrap() { return Err("❌ FRAUDE : HTLCRefund redirige les fonds vers la mauvaise adresse.".to_string()); }
             }
 			
 			if let TransactionType::L2Stake { l2_name, .. } = &tx.tx_type {

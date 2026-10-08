@@ -149,7 +149,7 @@ async fn main() {
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
     
     // ====================================================================
-    // ⚛️ AFFICHAGE DU GENESIS ET GESTION DU LANCEMENT (MAINNET)
+    // AFFICHAGE DU GENESIS ET GESTION DU LANCEMENT (MAINNET)
     // ====================================================================
     let (genesis_timestamp, genesis_hash) = {
         let chain = shared_chain.lock().unwrap();
@@ -174,13 +174,15 @@ async fn main() {
     let now_ts = chrono::Utc::now().timestamp();
     if now_ts < genesis_timestamp {
         let wait_seconds = genesis_timestamp - now_ts;
-        println!("⏳ [TESTNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
+        //println!("⏳ [MAINNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
+		println!("⏳ [TESTNET STARTING BLOCK] Le réseau principal n'a pas encore démarré !");
         println!("⏳ Le nœud est en mode veille. Lancement automatique dans {} secondes...", wait_seconds);
         println!("⏳ Laissez ce terminal ouvert. Les moteurs s'allumeront à l'heure H.\n");
         
         tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds as u64)).await;
         
-        println!("🚀 [TESTNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
+        //println!("🚀 [MAINNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
+		println!("🚀 [TESTNET LIVE] C'EST PARTI ! Allumage des moteurs Cypherpunk !");
     }
 
     let active_peers: wattcoin_core::network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
@@ -205,7 +207,7 @@ async fn main() {
     let api_dex_pool = Arc::clone(&dex_pool);
     let api_active_peers = Arc::clone(&active_peers);
     
-    // 💡 ICI ON UTILISE DIRECTEMENT LES VARIABLES DU SCOPE PRINCIPAL
+    // ON UTILISE DIRECTEMENT LES VARIABLES DU SCOPE PRINCIPAL
     let api_kyber_secret = node_kyber_secret.clone(); 
     let api_kyber_pub = node_kyber_pub.clone(); 
     
@@ -402,7 +404,7 @@ async fn main() {
             let _ = chain.db.flush(); // On s'assure juste que Sled a bien écrit sur le disque
         }
     } else {
-        // 💡 On force le mineur à attendre la synchro initiale
+        // On force le mineur à attendre la synchro initiale
         if peer_target.is_some() {
             println!("⏳ [SYNCHRONISATION] Pause de 15 secondes...");
             println!("⏳ Laissons le temps au tunnel Tor de s'établir et de télécharger l'historique du Relais.");
@@ -411,7 +413,7 @@ async fn main() {
         }
 
         // ====================================================================
-        // 🛡️ PATCH ANTI-STARVATION : ISOLATION DU MINAGE
+        // PATCH ANTI-STARVATION : ISOLATION DU MINAGE
         // On prépare des clones de tous nos pointeurs intelligents (Arc) 
         // pour pouvoir les envoyer dans le thread de minage isolé.
         // ====================================================================
@@ -422,7 +424,7 @@ async fn main() {
         let miner_address_clone = miner_address.clone();
         let miner_port_clone = port.clone();
 
-        // 🚀 On lance le minage lourd dans le pool de threads bloquants de Tokio.
+        // On lance le minage lourd dans le pool de threads bloquants de Tokio.
         // Cela libère à 100% l'API Web et le serveur P2P qui tourneront sur les autres threads !
         tokio::task::spawn_blocking(move || {
             println!("\n⚙️  Initialisation du moteur RandomX...");
@@ -452,7 +454,7 @@ async fn main() {
                 let current_height = { miner_chain.lock().unwrap().current_height };
                 let highest_known = wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed);
                 
-                // 💡 CORRECTION : On vérifie si le réseau a déjà trouvé le PROCHAIN bloc (+1) !
+                // On vérifie si le réseau a déjà trouvé le PROCHAIN bloc (+1) !
                 if highest_known >= current_height + 1 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     continue; 
@@ -471,7 +473,7 @@ async fn main() {
                     handles.push(std::thread::spawn(move || {
                         let mut chunk_keys = Vec::with_capacity(chunk_size);
                         for _ in 0..chunk_size {
-                            // 💡 CORRECTION DU KILL SWITCH WOTS+ (+1) !
+                            // KILL SWITCH WOTS+ (+1) !
                             if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height + 1 {
                                 break; // On avorte la génération instantanément !
                             }
@@ -493,7 +495,7 @@ async fn main() {
                     pre_generated_l2_keys.extend(keys);
                 }
 
-                // CORRECTION DU KILL SWITCH GLOBAL (+1) !
+                // KILL SWITCH GLOBAL (+1) !
                 if wattcoin_core::network::HIGHEST_KNOWN_BLOCK.load(std::sync::atomic::Ordering::Relaxed) >= current_height + 1 || pre_generated_l2_keys.len() < 128 {
                     continue; // On annule tout et on laisse la place au réseau !
                 }
@@ -762,7 +764,7 @@ async fn main() {
                         // On prépare la blockchain et le fichier L2 pour l'état local
                         let chain_seq = Arc::clone(&miner_chain);
 
-                        // RÉGICIDE : On tue brutalement l'ancien séquenceur s'il tourne encore
+                        // On tue brutalement l'ancien séquenceur s'il tourne encore
                         if let Some(task) = current_sequencer_task.take() {
                             println!("🛑 [L2 SEQUENCER] Fin de règne prématurée (Nouveau bloc L1 miné).");
                             task.abort(); // Coupe instantanément le thread asynchrone
@@ -866,7 +868,7 @@ async fn main() {
 								let mut micro_block = wattcoin_core::block::MicroBlock {
                                     l1_parent_hash: l1_parent_hash.clone(),
                                     micro_index: global_l2_index, 
-                                    key_index: current_key_index as u32, // 💡 ON GRAVE LE BON INDEX
+                                    key_index: current_key_index as u32, // ON GRAVE LE BON INDEX
                                     timestamp: chrono::Utc::now().timestamp(),
                                     transactions: txs_to_sequence,
                                     sequencer_pubkey: hex::encode(&keypair.1),
@@ -969,7 +971,7 @@ async fn main() {
                         }
                     };
 
-                    // L'astuce : on liste les HASHES des transactions fraîchement minées
+                    // on liste les HASHES des transactions fraîchement minées
 					let mined_hashes: Vec<_> = candidate_block.transactions.iter().map(|tx| tx.hash_data()).collect();
 					
 					mp.retain(|tx| {
