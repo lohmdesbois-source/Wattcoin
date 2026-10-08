@@ -125,6 +125,7 @@ struct WattcoinApp {
 	completed_swaps: std::collections::HashSet<String>, // Historique des swaps finis
 	btc_locked_hashes: std::collections::HashSet<String>,
     last_watchtower_tick: Option<std::time::Instant>,   // Chronomètre
+	in_flight_locks: std::collections::HashSet<String>,
 	
 	// VARIABLES POUR MESSAGES ET NOTAIRE
     data_items: Vec<crate::DataItem>,
@@ -253,6 +254,7 @@ impl WattcoinApp {
 			completed_swaps: std::collections::HashSet::new(),
 			btc_locked_hashes: std::collections::HashSet::new(),
             last_watchtower_tick: None,
+			in_flight_locks: std::collections::HashSet::new(),
 			
 			data_items: Vec::new(),
             data_tab: "inbox".to_string(),
@@ -1775,10 +1777,13 @@ impl eframe::App for WattcoinApp {
 												let is_btc_ready = self.btc_locked_hashes.contains(&swap.htlc_hash);
                                                 
 												// On grise le bouton si le BTC n'est pas prêt, et on explique pourquoi au survol !
-												if ui.add_enabled(is_btc_ready, egui::Button::new("1. Verrouiller mes WATT"))
+												let in_flight = self.in_flight_locks.contains(&swap.htlc_hash);
+												if ui.add_enabled(is_btc_ready && !in_flight, egui::Button::new(
+													if in_flight { "⏳ Verrouillage envoyé..." } else { "1. Verrouiller mes WATT" }))
                                                     .on_disabled_hover_text("En attente de la confirmation des BTC par l'acheteur...")
                                                     .clicked() 
                                                 {
+													self.in_flight_locks.insert(swap.htlc_hash.clone());
 													self.sync_message = "Vérification du verrou Bitcoin en cours...".to_string();
 													let tx = self.tx.clone();
 													let keys_clone = keys.clone();

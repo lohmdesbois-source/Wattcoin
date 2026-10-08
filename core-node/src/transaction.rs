@@ -161,7 +161,7 @@ impl Transaction {
 
 		// 2. Empêcher la création d'outputs fantômes sur les signaux P2P
 		if is_strictly_empty && (!self.outputs.is_empty() || !self.inputs.is_empty()) {
-			println!("⛔ Rejet : Les DexSettlement, MiningShare et HTLCRefund ne peuvent avoir ni input ni output.");
+			println!("⛔ Rejet : Les DexSettlement et MiningShare ne peuvent avoir ni input ni output.");
 			return false;
 		}
 

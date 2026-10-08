@@ -37,8 +37,8 @@ pub static SYNC_STATUS: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(Stri
 
 const MATURITY_BLOCKS: u64 = 1; 
 const FLAME: u64 = 1_000_000_000;
-const HLTC_LOCK_TIME : u64 = 5; // 1440 Pour la prod (48H / 2 jours)
-const HLTC_LOCK_BTC_TIME : i64 = 1; // 144 Pour la prod (24H / 1 jour)
+const HLTC_LOCK_TIME : u64 = 5; // 7200 Pour la prod (24H / 1 jours)
+const HLTC_LOCK_BTC_TIME : i64 = 1; // CSV relatif, en blocs BTC. Prod : 288 (~48H). DOIT rester > délai WATT (HLTC_LOCK_TIME)
 
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
@@ -178,6 +178,25 @@ pub fn mark_tx_as_pending_in_ram(tx: &Transaction) {
     
     if let Some(sig) = &tx.wots_signature {
         pending.insert(hex::encode(&sig.public_key), now);
+    }
+}
+
+pub fn unmark_pending(tx: &Transaction) {
+    let mut pending = PENDING_SPENDS.lock().unwrap();
+    for input in &tx.inputs { pending.remove(&input.utxo_id); }
+    if let Some(sig) = &tx.wots_signature { pending.remove(&hex::encode(&sig.public_key)); }
+}
+
+// Envoi unique pour toutes les TX signées
+pub async fn submit_signed_tx(tx: &Transaction) -> Result<(), String> {
+    let tx_bytes = bincode::serialize(tx).map_err(|e| e.to_string())?;
+    mark_tx_as_pending_in_ram(tx); // AVANT l'envoi
+    match node_call("POST", "/send_tx", Some(tx_bytes)).await {
+        Ok(_) => Ok(()),
+        // Rejet explicite et définitif : on libère les UTXO
+        Err(e) if e.starts_with("❌ Rejeté") && !e.contains("déjà") => { unmark_pending(tx); Err(e) }
+        // Timeout ou erreur réseau : la TX a peut-être été acceptée, on garde le verrou
+        Err(e) => Err(format!("{} — la TX a peut-être été acceptée, attends le prochain bloc avant de réessayer.", e)),
     }
 }
 
@@ -833,8 +852,8 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     amt_to_add = amt as f64 / 1_000_000_000.0;
                     if out.stealth_address.starts_with("JACKPOT") { label = "Jackpot gagné ! 🎰".to_string(); } 
-                    else if out.kyber_capsule == "HTLC_CLAIM" { label = "Swap Atomique Réclamé ⚡".to_string(); } 
-                    else if out.kyber_capsule == "HTLC_REFUND" { label = "Remboursement HTLC 🔙".to_string(); } 
+                    else if out.kyber_capsule.starts_with("HTLC_CLAIM") { label = "Swap Atomique Réclamé ⚡".to_string(); }
+                    else if out.kyber_capsule.starts_with("HTLC_REFUND") { label = "Remboursement HTLC 🔙".to_string(); }
                     else if out.kyber_capsule.starts_with("SHARE_") { label = "Part de minage (P2Pool) ⛏".to_string(); } 
                     else { label = "Récompense bloc + Frais ⛏".to_string(); }
                 }
@@ -1002,7 +1021,7 @@ pub async fn send_wattcoin(
     let schedule = get_fee_schedule().await?; 
     let is_pure_l2 = spend_from_l2 && send_to_l2;
 
-    let amount_in_flames = (amount * 1_000_000_000.0) as u64; 
+    let amount_in_flames = (amount * 1_000_000_000.0).round() as u64;
     let tip_flames = (tip_watt * 1_000_000_000.0) as u64; 
     
     let max_send = 50_000 * FLAME;
@@ -1204,10 +1223,7 @@ pub async fn send_wattcoin(
     }).await.map_err(|e| format!("Erreur du thread CPU : {}", e))?;
 
     let tx_pq = tx_pq_result?;
-    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-
-    crate::mark_tx_as_pending_in_ram(&tx_pq); // MÉMOIRE IMMÉDIATE
+    crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
 
     Ok("✅ Succès".to_string())
 }
@@ -1412,10 +1428,7 @@ pub async fn send_data_internal(
     tx_pq.public_key = hex::encode(&wots_sig.public_key);
     tx_pq.wots_signature = Some(wots_sig);
 
-    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-
-    crate::mark_tx_as_pending_in_ram(&tx_pq);
+    crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
 
     Ok("✅ Succès".to_string())
 }
@@ -1588,10 +1601,7 @@ pub async fn buy_lottery_ticket(
     tx_pq.public_key = hex::encode(&wots_sig.public_key);
     tx_pq.wots_signature = Some(wots_sig);
 
-    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-
-    crate::mark_tx_as_pending_in_ram(&tx_pq); // MÉMOIRE IMMÉDIATE
+    crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
 
     Ok("✅ Ticket de loterie acheté !".to_string())
 }
@@ -1622,7 +1632,7 @@ pub async fn refund_wattcoin_swap(hash: String, keys: WalletKeys) -> Result<Stri
     // 2. Création de l'Output avec le drapeau de Refund
     let output = TransactionOutput {
         stealth_address: keys.watt_address.clone(), // Retour à nous-même
-        kyber_capsule: "HTLC_REFUND".to_string(),   // Le drapeau officiel !
+        kyber_capsule: format!("HTLC_REFUND_{}", hash),   // Le drapeau officiel unique
         aes_vault: locked_amount.to_string(),       // Montant en clair
         amount: locked_amount,
     };
@@ -1713,11 +1723,11 @@ pub async fn check_btc_contract_exists(htlc_hash: &str) -> Result<bool, String> 
 }
 
 
-pub async fn claim_wattcoin_swap(secret: String, _hash: String, amount_flames: u64, watt_address: String) -> Result<String, String> {
+pub async fn claim_wattcoin_swap(secret: String, hash: String, amount_flames: u64, watt_address: String) -> Result<String, String> {
     // PAS DE KYBER/AES ICI ! Le Tribunal L1 doit pouvoir lire le montant exact.
     let claim_output = TransactionOutput {
         stealth_address: watt_address.clone(),   // L'adresse publique brute
-        kyber_capsule: "HTLC_CLAIM".to_string(), // Un marqueur propre
+        kyber_capsule: format!("HTLC_CLAIM_{}", hash), // Un marqueur propre
         aes_vault: amount_flames.to_string(),    // Le montant en texte clair !
         amount: amount_flames,
     };
@@ -1914,39 +1924,31 @@ pub async fn get_btc_history(btc_address: &str) -> Result<Vec<HistoryItem>, Stri
     Ok(history)
 }
 
+fn build_htlc_script(swap: &SwapContract) -> Result<bitcoin::ScriptBuf, String> {
+    use bitcoin::blockdata::script::Builder;
+    use bitcoin::opcodes::all::*;
+    let buyer_pk = bitcoin::PublicKey::from_str(&swap.buyer_btc_pubkey).map_err(|_| "Buyer PK invalide")?;
+    let seller_pk = bitcoin::PublicKey::from_str(&swap.seller_btc_pubkey).map_err(|_| "Seller PK invalide")?;
+    let hash_bytes = hex::decode(&swap.htlc_hash).map_err(|_| "Hash invalide")?;
+    let push_hash = <&bitcoin::script::PushBytes>::try_from(hash_bytes.as_slice()).map_err(|_| "PushBytes")?;
+    Ok(Builder::new()
+        .push_opcode(OP_IF)
+            .push_opcode(OP_SHA256).push_slice(push_hash).push_opcode(OP_EQUALVERIFY)
+            .push_key(&seller_pk).push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_ELSE)
+            .push_int(HLTC_LOCK_BTC_TIME).push_opcode(OP_CSV).push_opcode(OP_DROP)
+            .push_key(&buyer_pk).push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_ENDIF)
+        .into_script())
+}
 
 pub async fn send_btc_to_htlc(
     swap: SwapContract,
     master_seed_hex: String
 ) -> Result<String, String> {
-    use bitcoin::blockdata::script::Builder;
-    use bitcoin::opcodes::all::*;
-    use bitcoin::{Network, Address, PublicKey};
-    use std::str::FromStr;
+    use bitcoin::{Network, Address};
 
-    let buyer_pk = PublicKey::from_str(&swap.buyer_btc_pubkey).map_err(|_| "Buyer PK invalide")?;
-    let seller_pk = PublicKey::from_str(&swap.seller_btc_pubkey).map_err(|_| "Seller PK invalide")?;
-    let hash_bytes = hex::decode(&swap.htlc_hash).map_err(|_| "Hash invalide")?;
-
-    // Conversion PushBytes pour bitcoin 0.32[cite: 12]
-    let push_hash = <&bitcoin::script::PushBytes>::try_from(hash_bytes.as_slice())
-        .map_err(|_| "Erreur de conversion PushBytes")?;
-
-    let witness_script = Builder::new()
-        .push_opcode(OP_IF)
-        .push_opcode(OP_SHA256)
-        .push_slice(push_hash)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_key(&seller_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ELSE)
-        .push_int(HLTC_LOCK_BTC_TIME)
-        .push_opcode(OP_CLTV)
-        .push_opcode(OP_DROP)
-        .push_key(&buyer_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ENDIF)
-        .into_script();
+    let witness_script = build_htlc_script(&swap)?;
 
     let htlc_addr = Address::p2wsh(&witness_script, Network::Testnet).to_string();
     // L'acheteur ajoute 500 sats au contrat pour couvrir les frais de Claim du vendeur !
@@ -1972,8 +1974,6 @@ pub async fn auto_claim_btc_swap(
     use bitcoin::transaction::{Transaction as BtcTransaction, Version};
     use bitcoin::absolute::LockTime;
     use bitcoin::sighash::{SighashCache, EcdsaSighashType};
-    use bitcoin::blockdata::script::Builder;
-    use bitcoin::opcodes::all::*;
     use std::str::FromStr;
     use bitcoin::bip32::{Xpriv, DerivationPath};
     use bitcoin::secp256k1::Secp256k1;
@@ -1989,30 +1989,7 @@ pub async fn auto_claim_btc_swap(
     let my_address = Address::p2wpkh(&compressed_pubkey, Network::Testnet).to_string();
     let my_addr_obj = Address::from_str(&my_address).unwrap().require_network(Network::Testnet).unwrap();
 
-    let buyer_pk = bitcoin::PublicKey::from_str(&swap.buyer_btc_pubkey).map_err(|_| "Buyer PK invalide")?;
-    let seller_pk = bitcoin::PublicKey::from_str(&swap.seller_btc_pubkey).map_err(|_| "Seller PK invalide")?;
-    let hash_bytes = hex::decode(&swap.htlc_hash).map_err(|_| "Hash invalide")?;
-    let locktime = 144i64;
-
-    // Conversion PushBytes pour bitcoin 0.32[cite: 12]
-    let push_hash = <&bitcoin::script::PushBytes>::try_from(hash_bytes.as_slice())
-        .map_err(|_| "Erreur de conversion PushBytes")?;
-
-    let witness_script = Builder::new()
-        .push_opcode(OP_IF)
-        .push_opcode(OP_SHA256)
-        .push_slice(push_hash)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_key(&seller_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ELSE)
-        .push_int(locktime)
-        .push_opcode(OP_CLTV)
-        .push_opcode(OP_DROP)
-        .push_key(&buyer_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ENDIF)
-        .into_script();
+    let witness_script = build_htlc_script(&swap)?;
 
     let htlc_addr = Address::p2wsh(&witness_script, Network::Testnet).to_string();
     let utxos_str = node_call("GET", &format!("/btc/utxos?address={}", htlc_addr), None).await?;
@@ -2107,8 +2084,6 @@ pub async fn refund_btc_swap(
     use bitcoin::transaction::{Transaction as BtcTransaction, Version};
     use bitcoin::absolute::LockTime;
     use bitcoin::sighash::{SighashCache, EcdsaSighashType};
-    use bitcoin::blockdata::script::Builder;
-    use bitcoin::opcodes::all::*;
     use std::str::FromStr;
     use bitcoin::bip32::{Xpriv, DerivationPath};
     use bitcoin::secp256k1::Secp256k1;
@@ -2124,31 +2099,7 @@ pub async fn refund_btc_swap(
     let my_address = Address::p2wpkh(&compressed_pubkey, Network::Testnet).to_string();
     let my_addr_obj = Address::from_str(&my_address).unwrap().require_network(Network::Testnet).unwrap();
 
-    let buyer_pk = bitcoin::PublicKey::from_str(&swap.buyer_btc_pubkey).map_err(|_| "Buyer PK invalide")?;
-    let seller_pk = bitcoin::PublicKey::from_str(&swap.seller_btc_pubkey).map_err(|_| "Seller PK invalide")?;
-    let hash_bytes = hex::decode(&swap.htlc_hash).map_err(|_| "Hash invalide")?;
-    
-    // Le même délai que pour la création
-    let locktime_val = crate::HLTC_LOCK_BTC_TIME;
-
-    let push_hash = <&bitcoin::script::PushBytes>::try_from(hash_bytes.as_slice())
-        .map_err(|_| "Erreur de conversion PushBytes")?;
-
-    let witness_script = Builder::new()
-        .push_opcode(OP_IF)
-        .push_opcode(OP_SHA256)
-        .push_slice(push_hash)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_key(&seller_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ELSE)
-        .push_int(locktime_val as i64)
-        .push_opcode(OP_CLTV)
-        .push_opcode(OP_DROP)
-        .push_key(&buyer_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ENDIF)
-        .into_script();
+    let witness_script = build_htlc_script(swap)?;
 
     let htlc_addr = Address::p2wsh(&witness_script, Network::Testnet).to_string();
     let utxos_str = node_call("GET", &format!("/btc/utxos?address={}", htlc_addr), None).await?;
@@ -2170,8 +2121,8 @@ pub async fn refund_btc_swap(
     let txin = TxIn {
         previous_output: OutPoint { txid, vout: utxo.vout },
         script_sig: bitcoin::ScriptBuf::new(),
-        // OBLIGATOIRE POUR OP_CLTV : Sequence doit être < 0xFFFFFFFF
-        sequence: Sequence::from_consensus(0xFFFFFFFE), 
+        // OP_CSV : la séquence porte le délai relatif (en blocs BTC)
+        sequence: Sequence::from_height(HLTC_LOCK_BTC_TIME as u16),
         witness: Witness::new(),
     };
 
@@ -2182,8 +2133,7 @@ pub async fn refund_btc_swap(
 
     let mut tx = BtcTransaction {
         version: Version::TWO,
-        // OBLIGATOIRE POUR OP_CLTV : LockTime de la TX >= locktime_val
-        lock_time: LockTime::from_height(locktime_val as u32).map_err(|_| "Locktime invalide")?,
+        lock_time: LockTime::ZERO,
         input: vec![txin],
         output: vec![txout],
     };
@@ -2494,10 +2444,11 @@ pub async fn stake_l2(
 
     let change_amount = collected_flames - required_total;
     let mut outputs = Vec::new();
+	let mut nonce = [0u8; 16]; rand::thread_rng().fill_bytes(&mut nonce);
 
     outputs.push(TransactionOutput {
         stealth_address: format!("L2_STAKE_{}", sender_kyber_public_hex),
-        kyber_capsule: "L2_STAKE_LOCK".to_string(),
+        kyber_capsule: format!("L2_STAKE_LOCK_{}", hex::encode(nonce)),
         aes_vault: amount_flames.to_string(), 
         amount: amount_flames,
     });
@@ -2555,10 +2506,7 @@ pub async fn stake_l2(
     tx_pq.public_key = hex::encode(&wots_sig.public_key);
     tx_pq.wots_signature = Some(wots_sig);
 
-    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-
-    crate::mark_tx_as_pending_in_ram(&tx_pq);
+    crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
 
     Ok(format!("🎉 Caution verrouillée avec succès ! La L2 '{}' est prête à être ancrée.", l2_name))
 }
@@ -2681,10 +2629,7 @@ pub async fn unstake_l2(
     tx_pq.public_key = hex::encode(&wots_sig.public_key);
     tx_pq.wots_signature = Some(wots_sig);
 
-    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-
-    crate::mark_tx_as_pending_in_ram(&tx_pq);
+    crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
 
     Ok(format!("🔓 Caution récupérée avec succès ! La L2 '{}' a été désactivée.", l2_name))
 }
@@ -2999,10 +2944,11 @@ pub async fn bridge_to_l2(
 
     let change_amount = collected_flames - required_total;
     let mut outputs = Vec::new();
+	let mut nonce = [0u8; 16]; rand::thread_rng().fill_bytes(&mut nonce);
 
     outputs.push(TransactionOutput {
         stealth_address: format!("BRIDGE_L2_{}", l2_target_name.to_uppercase()),
-        kyber_capsule: "L2_BRIDGE_LOCK".to_string(),
+        kyber_capsule: format!("L2_BRIDGE_LOCK_{}", hex::encode(nonce)),
         aes_vault: amount_flames.to_string(),
         amount: amount_flames,
     });
@@ -3076,10 +3022,7 @@ pub async fn bridge_to_l2(
     tx_pq.public_key = hex::encode(&wots_sig.public_key);
     tx_pq.wots_signature = Some(wots_sig);
 
-    let tx_bytes = bincode::serialize(&tx_pq).map_err(|e| e.to_string())?;
-    node_call("POST", "/send_tx", Some(tx_bytes)).await?;
-
-    crate::mark_tx_as_pending_in_ram(&tx_pq); // MÉMOIRE IMMÉDIATE
+    crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
 
     Ok("✅ Succès".to_string())
 }
@@ -3171,8 +3114,8 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
                     amt_to_add = amt as f64 / 1_000_000_000.0;
                     if out.stealth_address.starts_with("JACKPOT") { label = "Jackpot gagné ! 🎰".to_string(); } 
-                    else if out.kyber_capsule == "HTLC_CLAIM" { label = "Swap Atomique Réclamé ⚡".to_string(); } 
-                    else if out.kyber_capsule == "HTLC_REFUND" { label = "Remboursement HTLC 🔙".to_string(); } 
+                    else if out.kyber_capsule.starts_with("HTLC_CLAIM") { label = "Swap Atomique Réclamé ⚡".to_string(); }
+                    else if out.kyber_capsule.starts_with("HTLC_REFUND") { label = "Remboursement HTLC 🔙".to_string(); }
                     else if out.kyber_capsule.starts_with("SHARE_") { label = "Part de minage (P2Pool) ⛏".to_string(); } 
                     else { label = "Récompense bloc + Frais ⛏".to_string(); }
                 }

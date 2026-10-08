@@ -1,6 +1,6 @@
 [package]
 name = "wattcoin_name_service"
-version = "3.0.2"
+version = "3.0.8"
 edition = "2024"
 
 [dependencies]

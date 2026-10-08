@@ -95,7 +95,7 @@ impl Block {
 
         let header = BlockHeader {
             index: 0,
-            timestamp: 1790786400, 
+            timestamp: 1791472320, 
             previous_hash: String::from("0000000000000000000000000000000000000000000000000000000000000000"),
             hash: String::from("GENESIS_HASH_WATTCOIN_000000000000000000000000000000000000000000"),
             nonce: 0,

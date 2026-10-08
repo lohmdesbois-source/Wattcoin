@@ -29,6 +29,13 @@ pub struct Blockchain {
     pub spent_key_images: HashSet<String>, 
 }
 
+pub struct HtlcState {
+    pub swap: Option<crate::transaction::SwapContract>,
+    pub lock_timeout: Option<u64>,
+    pub locked_amount: u64,
+    pub settled: bool, // déjà claimé OU remboursé
+}
+
 impl Blockchain {
     pub fn new(db_path: &str) -> Result<Self, WattError> {
         let db = sled::open(db_path).map_err(|e| WattError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
@@ -73,6 +80,65 @@ impl Blockchain {
         }
         false
     }
+	
+	pub fn get_htlc_state(&self, hash: &str) -> HtlcState {
+		let mut st = HtlcState { swap: None, lock_timeout: None, locked_amount: 0, settled: false };
+		for i in 0..=self.current_height {
+			let Some(b) = self.get_block_by_height(i) else { continue };
+			for tx in &b.transactions {
+				match &tx.tx_type {
+					TransactionType::DexSettlement { swaps, .. } => {
+						for s in swaps { if s.htlc_hash == hash { st.swap = Some(s.clone()); } }
+					}
+					TransactionType::HTLCLock { hash: h, timeout_block } if h == hash => {
+						// Le lock réel est l'output 0 en htlc_watt_ 
+						if let Some(o) = tx.outputs.first() {
+							if o.stealth_address.starts_with("htlc_watt_") && o.amount > st.locked_amount {
+								st.locked_amount = o.amount;
+								st.lock_timeout = Some(*timeout_block);
+							}
+						}
+					}
+					TransactionType::HTLCClaim { secret } => {
+						let sb = hex::decode(secret).unwrap_or_default();
+						if hex::encode(sha2::Sha256::digest(&sb)) == hash { st.settled = true; }
+					}
+					TransactionType::HTLCRefund { hash: h } if h == hash => st.settled = true,
+					_ => {}
+				}
+			}
+		}
+		st
+	}
+	
+	// Règles HTLC uniques : utilisées par validate, prepare et l'API
+	pub fn check_htlc_tx(&self, tx: &Transaction, height: u64, settled_in_block: &mut HashSet<String>) -> Result<(), String> {
+		let (hash, is_claim) = match &tx.tx_type {
+			TransactionType::HTLCClaim { secret } => (hex::encode(sha2::Sha256::digest(&hex::decode(secret).unwrap_or_default())), true),
+			TransactionType::HTLCRefund { hash } => (hash.clone(), false),
+			_ => return Ok(()),
+		};
+		let st = self.get_htlc_state(&hash);
+		let swap = st.swap.ok_or("❌ HTLC : swap inexistant.")?;
+		let timeout = st.lock_timeout.ok_or("❌ HTLC : aucun HTLCLock valide.")?;
+		if st.locked_amount < swap.watt_amount_flames { return Err("❌ HTLC : lock sous-financé.".into()); }
+		if st.settled || settled_in_block.contains(&hash) { return Err("❌ HTLC : déjà réglé (rejeu).".into()); }
+		if tx.outputs.len() != 1 { return Err("❌ HTLC : exactement 1 output requis.".into()); }
+
+		let o = &tx.outputs[0];
+		if o.aes_vault.parse::<u64>().ok() != Some(o.amount) || o.amount != swap.watt_amount_flames {
+			return Err("❌ HTLC : montant incorrect.".into());
+		}
+		if is_claim {
+			if height >= timeout { return Err(format!("❌ HTLC : claim après expiration ({} >= {}).", height, timeout)); }
+			if o.stealth_address != swap.buyer_watt_address { return Err("❌ HTLC : claim vers le mauvais destinataire.".into()); }
+		} else {
+			if height < timeout { return Err(format!("⏳ HTLC : refund prématuré ({} < {}).", height, timeout)); }
+			if o.stealth_address != swap.seller_watt_address { return Err("❌ HTLC : refund vers le mauvais destinataire.".into()); }
+		}
+		settled_in_block.insert(hash); // seulement si tout est OK
+		Ok(())
+	}
 
     fn get_last_height(&self) -> u64 {
         if let Some(Ok((key, _))) = self.db.iter().rev().next() {
@@ -347,6 +413,8 @@ impl Blockchain {
                 }
             }
         }
+		
+		let mut block_htlc_settled = HashSet::new();
 
         for tx in &transactions {
 			// On ignore les parts ici, on les traitera proprement après
@@ -409,33 +477,10 @@ impl Blockchain {
                     valid_transactions.push(tx.clone()); continue;
                 }
 				
-                if let TransactionType::HTLCRefund { hash } = &tx.tx_type {
-                    let mut timeout = 0;
-                    let mut lock_found = false;
-                    
-                    for i in (0..=self.current_height).rev() {
-                        if let Some(b) = self.get_block_by_height(i) {
-                            for past_tx in &b.transactions {
-                                if let TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
-                                    if lock_hash == hash {
-                                        timeout = *timeout_block;
-                                        lock_found = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if lock_found { break; }
-                        }
-                    }
-                    
-                    if !lock_found {
-                        println!("⛔ HTLCRefund : Contrat d'origine introuvable !");
-                        continue; 
-                    }
-                    if current_height < timeout {
-                        println!("⛔ HTLCRefund : Délai temporel non expiré (Actuel: {} < Requis: {}).", current_height, timeout);
-                        continue; 
-                    }
+                // HTLC (claim + refund) : mêmes règles que le validateur
+                if let Err(e) = self.check_htlc_tx(tx, current_height, &mut block_htlc_settled) {
+                    println!("⛔ Rejet {}", e);
+                    continue;
                 }
 				
 				if let TransactionType::L2Stake { l2_name, .. } = &tx.tx_type {
@@ -499,9 +544,16 @@ impl Blockchain {
                             double_spend = true; break;
                         }
                         // VÉRIFICATION D'EXISTENCE (Le réseau fait confiance à la validité de la signature WOTS+)
-						if self.find_utxo(&input.utxo_id).is_none() {
-							println!("⛔ Rejet : UTXO fantôme ({})", input.utxo_id);
-							tx_inputs_valid = false; break;
+						match self.find_utxo(&input.utxo_id) {
+							None => {
+								println!("⛔ Rejet : UTXO fantôme ({})", input.utxo_id);
+								tx_inputs_valid = false; break;
+							}
+							Some(u) if u.amount != input.amount => {
+								println!("⛔ Rejet : montant d'input falsifié ({} déclaré, {} réel)", input.amount, u.amount);
+								tx_inputs_valid = false; break;
+							}
+							_ => {}
 						}
                     }
 					
@@ -1143,14 +1195,19 @@ impl Blockchain {
             let new_share_cache = randomx_rs::RandomXCache::new(flags, share_seed.as_bytes()).map_err(|_| "Erreur Cache Part")?;
             randomx_rs::RandomXVM::new(flags, Some(new_share_cache), None).map_err(|_| "Erreur VM Part")?
         };
+		
+		let mut block_htlc_settled = HashSet::new();
 
         for tx in &block.transactions {
 			if tx.tx_type == TransactionType::Coinbase {
 				coinbase_count += 1;
 				// On additionne ABSOLUMENT TOUS les outputs de la Coinbase !
                 for out in &tx.outputs {
-                    total_coinbase_output += out.aes_vault.parse::<u64>().unwrap_or(u64::MAX);
-                }
+					if out.aes_vault.parse::<u64>().ok() != Some(out.amount) {
+						return Err("❌ FRAUDE : aes_vault ≠ amount dans la Coinbase.".into());
+					}
+					total_coinbase_output = total_coinbase_output.checked_add(out.amount).ok_or("❌ FRAUDE : overflow Coinbase.")?;
+				}
 				continue;
 			}
 			
@@ -1169,7 +1226,10 @@ impl Blockchain {
                         return Err(format!("Double-dépense détectée sur l'UTXO : {}", input.utxo_id));
                     }
                     
-                    let _utxo = self.find_utxo(&input.utxo_id).ok_or(format!("UTXO fantôme inventé : {}", input.utxo_id))?;
+                    let utxo = self.find_utxo(&input.utxo_id).ok_or(format!("UTXO fantôme inventé : {}", input.utxo_id))?;
+					if utxo.amount != input.amount {
+						return Err(format!("❌ FRAUDE : montant d'input falsifié ({} déclaré, {} réel)", input.amount, utxo.amount));
+					}
                 }
             }
 
@@ -1245,39 +1305,8 @@ impl Blockchain {
 				}
 			}
 			
-			// RÈGLE STRICTE 2 : Vérification du HTLCClaim sur la chaîne
-            if let TransactionType::HTLCClaim { secret } = &tx.tx_type {
-                let secret_bytes = hex::decode(secret).unwrap_or_default();
-                let hash_to_find = hex::encode(sha2::Sha256::digest(&secret_bytes));
-
-                let mut buyer_addr = None;
-                let mut expected_amount = 0;
-                let mut lock_exists = false;
-
-                // On fouille l'historique pour retrouver le contrat original
-                for i in 0..=self.current_height {
-                    if let Some(b) = self.get_block_by_height(i) {
-                        for past_tx in &b.transactions {
-                            if let TransactionType::HTLCLock { hash: lock_hash, .. } = &past_tx.tx_type {
-                                if lock_hash == &hash_to_find { lock_exists = true; }
-                            }
-                            if let TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
-                                for swap in swaps {
-                                    if swap.htlc_hash == hash_to_find {
-                                        buyer_addr = Some(swap.buyer_watt_address.clone());
-                                        expected_amount = swap.watt_amount_flames;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !lock_exists || buyer_addr.is_none() { return Err("❌ FRAUDE : HTLCClaim sur un contrat inexistant.".to_string()); }
-                if tx.outputs.len() != 1 { return Err("❌ FRAUDE : HTLCClaim doit avoir exactement 1 output.".to_string()); }
-                if tx.outputs[0].aes_vault.parse::<u64>().unwrap_or(0) != expected_amount { return Err("❌ FRAUDE : HTLCClaim tente de voler un montant incorrect.".to_string()); }
-                if tx.outputs[0].stealth_address != buyer_addr.unwrap() { return Err("❌ FRAUDE : HTLCClaim redirige les fonds vers la mauvaise adresse.".to_string()); }
-            }
+			// RÈGLE STRICTE 2 : HTLC (claim + refund) — règles centralisées dans check_htlc_tx
+			self.check_htlc_tx(tx, current_height, &mut block_htlc_settled)?;
 
             // RÈGLE STRICTE 3 : Vérification mathématique de la Loterie
             if let TransactionType::LotteryPayout { target_block, winner_pubkey } = &tx.tx_type {
@@ -1286,48 +1315,8 @@ impl Blockchain {
                 let (expected_jackpot, _) = self.get_jackpot_info(current_height);
                 if tx.outputs.len() != 1 { return Err("❌ FRAUDE : LotteryPayout doit avoir 1 output.".to_string()); }
                 if tx.outputs[0].aes_vault.parse::<u64>().unwrap_or(0) != expected_jackpot { return Err(format!("❌ FRAUDE : Montant du Jackpot falsifié (Attendu: {}).", expected_jackpot)); }
-                if tx.outputs[0].stealth_address != format!("JACKPOT_{}", winner_pubkey) { return Err("❌ FRAUDE : Le Jackpot n'est pas envoyé au gagnant légitime.".to_string()); }
-            }
-
-            if let TransactionType::HTLCRefund { hash } = &tx.tx_type {
-                let mut timeout = 0;
-                let mut lock_found = false;
-                let mut seller_addr = None;
-                let mut expected_amount = 0;
-                
-                // On fouille l'historique pour retrouver l'accord du DEX et le verrouillage
-                for i in (0..=self.current_height).rev() {
-                    if let Some(b) = self.get_block_by_height(i) {
-                        for past_tx in &b.transactions {
-                            if let TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
-                                for swap in swaps {
-                                    if swap.htlc_hash == *hash {
-                                        seller_addr = Some(swap.seller_watt_address.clone());
-                                        expected_amount = swap.watt_amount_flames;
-                                    }
-                                }
-                            }
-                            if let TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
-                                if lock_hash == hash {
-                                    timeout = *timeout_block;
-                                    lock_found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if lock_found { break; }
-                    }
-                }
-                
-                if !lock_found || current_height < timeout {
-                    return Err(format!("❌ FRAUDE : HTLCRefund invalide ou délai non expiré ! (Actuel: {}, Timeout: {})", current_height, timeout));
-                }
-                
-                // VÉRIFICATIONS STRICTES DE L'OUTPUT DE REMBOURSEMENT
-                if seller_addr.is_none() { return Err("❌ FRAUDE : Swap d'origine introuvable pour ce Refund.".to_string()); }
-                if tx.outputs.len() != 1 { return Err("❌ FRAUDE : HTLCRefund doit avoir exactement 1 output.".to_string()); }
-                if tx.outputs[0].aes_vault.parse::<u64>().unwrap_or(0) != expected_amount { return Err("❌ FRAUDE : HTLCRefund tente de voler un montant incorrect.".to_string()); }
-                if tx.outputs[0].stealth_address != seller_addr.unwrap() { return Err("❌ FRAUDE : HTLCRefund redirige les fonds vers la mauvaise adresse.".to_string()); }
+                if tx.outputs[0].amount != expected_jackpot { return Err("❌ FRAUDE : amount du Jackpot ≠ montant attendu.".into()); }
+				if tx.outputs[0].stealth_address != format!("JACKPOT_{}", winner_pubkey) { return Err("❌ FRAUDE : Le Jackpot n'est pas envoyé au gagnant légitime.".to_string()); }
             }
 			
 			if let TransactionType::L2Stake { l2_name, .. } = &tx.tx_type {

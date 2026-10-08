@@ -5462,7 +5462,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_core"
-version = "3.0.2"
+version = "3.0.8"
 dependencies = [
  "aes-gcm",
  "arti-client",
@@ -5491,7 +5491,7 @@ dependencies = [
 
 [[package]]
 name = "wattcoin_name_service"
-version = "3.0.2"
+version = "3.0.8"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -5830,7 +5830,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wots"
-version = "3.0.2"
+version = "3.0.8"
 dependencies = [
  "hex",
  "hkdf",

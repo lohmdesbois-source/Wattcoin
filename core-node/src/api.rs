@@ -354,6 +354,12 @@ pub async fn start_api_server(
             if tx.tx_type != crate::transaction::TransactionType::Coinbase {
                 let chain_lock = chain_arc.lock().unwrap();
                 let pool_lock = mempool.lock().unwrap();
+				
+				// Une TX strictement identique déjà en mempool = succès (retry réseau), pas une erreur
+				let tx_hash = tx.hash_data();
+				if pool_lock.iter().any(|m| m.hash_data() == tx_hash) {
+					return warp::reply::with_status(warp::reply::json(&"✅ TX déjà en mempool"), warp::http::StatusCode::OK);
+				}
 
                 for input in &tx.inputs {
                     if chain_lock.spent_key_images.contains(&input.utxo_id) { 
@@ -390,40 +396,13 @@ pub async fn start_api_server(
 				}
             }
             
-            if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
-                let chain_lock = chain_arc.lock().unwrap();
-                let current_height = chain_lock.current_height;
-                let mut timeout_passed = false;
-                let mut seller_watt_address = None;
-                
-                for i in 0..=chain_lock.current_height {
-                    if let Some(block) = chain_lock.get_block_by_height(i) {
-                        for past_tx in &block.transactions {
-                            if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
-                                for swap in swaps {
-                                    if swap.htlc_hash == *hash {
-                                        seller_watt_address = Some(swap.seller_watt_address.clone());
-                                    }
-                                }
-                            }
-                            if let crate::transaction::TransactionType::HTLCLock { hash: lock_hash, timeout_block } = &past_tx.tx_type {
-                                if lock_hash == hash {
-                                    if current_height >= *timeout_block { timeout_passed = true; }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if !timeout_passed { return warp::reply::with_status(warp::reply::json(&"⏳ Délai non expiré"), warp::http::StatusCode::BAD_REQUEST); }
-                
-                // VÉRIFICATION STRICTE DU DESTINATAIRE
-                if let Some(seller_addr) = seller_watt_address {
-                    if tx.outputs.is_empty() || tx.outputs[0].stealth_address != seller_addr {
-                        return warp::reply::with_status(warp::reply::json(&"❌ HTLCRefund doit retourner les fonds au Vendeur d'origine !"), warp::http::StatusCode::BAD_REQUEST);
-                    }
-                }
-            }
+            if matches!(tx.tx_type, TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. }) {
+				let chain_lock = chain_arc.lock().unwrap();
+				let next_height = chain_lock.current_height + 1;
+				if let Err(e) = chain_lock.check_htlc_tx(&tx, next_height, &mut std::collections::HashSet::new()) {
+					return warp::reply::with_status(warp::reply::json(&e), warp::http::StatusCode::BAD_REQUEST);
+				}
+			}
 			
 			let mut pool = mempool.lock().unwrap();
             pool.push(tx.clone());
@@ -750,29 +729,6 @@ pub async fn start_api_server(
 			history.reverse();
 			warp::reply::json(&history)
 		});
-	
-    let htlc_lock = warp::post()
-        .and(warp::path!("htlc" / "lock"))
-        .and(warp::body::bytes()) 
-        .and(mempool_filter.clone())
-        .and(active_peers_filter.clone())
-        .map(|body_bytes: warp::hyper::body::Bytes, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
-            
-            let tx: Transaction = match bincode::deserialize(&body_bytes) {
-                Ok(t) => t,
-                Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format binaire invalide"), warp::http::StatusCode::BAD_REQUEST),
-            };
-
-            if !tx.is_valid() || !matches!(tx.tx_type, TransactionType::HTLCLock { .. }) {
-                return warp::reply::with_status(warp::reply::json(&"❌ HTLCLock invalide"), warp::http::StatusCode::BAD_REQUEST);
-            }
-            let mut pool = mempool.lock().unwrap();
-            pool.push(tx.clone());
-            let tx_clone = tx.clone();
-			println!("✅ Transaction acceptée et propagée (type: {:?})", tx_clone);
-            tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
-            warp::reply::with_status(warp::reply::json(&"✅ HTLCLock accepté"), warp::http::StatusCode::OK)
-        });
 
 	let htlc_claim = warp::post()
 		.and(warp::path!("htlc" / "claim"))
@@ -792,101 +748,17 @@ pub async fn start_api_server(
 				return warp::reply::with_status(warp::reply::json(&"❌ HTLCClaim invalide (structure interne rejetée)"), warp::http::StatusCode::BAD_REQUEST);
 			}
 
-			let secret = match &tx.tx_type {
-				TransactionType::HTLCClaim { secret } if !secret.is_empty() => secret.clone(),
-				_ => return warp::reply::with_status(
-					warp::reply::json(&"❌ Type ou secret invalide"),
-					warp::http::StatusCode::BAD_REQUEST
-				),
-			};
-
-			let secret_bytes = match hex::decode(&secret) {
-				Ok(b) => b,
-				Err(_) => return warp::reply::with_status(
-					warp::reply::json(&"❌ Secret hex invalide"),
-					warp::http::StatusCode::BAD_REQUEST
-				),
-			};
-
-			let hash_to_find = hex::encode(sha2::Sha256::digest(&secret_bytes));
-
-			let chain = match chain_arc.lock() {
-				Ok(c) => c,
-				Err(_) => return warp::reply::with_status(
-					warp::reply::json(&"❌ Erreur interne (mutex empoisonné)"),
-					warp::http::StatusCode::INTERNAL_SERVER_ERROR
-				),
-			};
-
-			let mut buyer_watt_address: Option<String> = None;
-			let mut watt_amount: u64 = 0;
-			let mut lock_exists = false;
-			let mut already_claimed_or_refunded = false;
-
-			for i in 0..=chain.current_height {
-                if let Some(block) = chain.get_block_by_height(i) {
-                    for past_tx in &block.transactions {
-                        if let TransactionType::DexSettlement { swaps, .. } = &past_tx.tx_type {
-                            for swap in swaps {
-                                if swap.htlc_hash == hash_to_find {
-                                    buyer_watt_address = Some(swap.buyer_watt_address.clone());
-                                    watt_amount = swap.watt_amount_flames;   
-                                }
-                            }
-                        }
-                        if let TransactionType::HTLCLock { hash: lock_hash, .. } = &past_tx.tx_type {
-                            if lock_hash == &hash_to_find { lock_exists = true; }
-                        }
-                        if let TransactionType::HTLCClaim { secret: claimed_secret } = &past_tx.tx_type {
-                            let claimed_bytes = hex::decode(claimed_secret).unwrap_or_default();
-                            let claimed_hash = hex::encode(sha2::Sha256::digest(&claimed_bytes));
-                            if claimed_hash == hash_to_find { already_claimed_or_refunded = true; }
-                        }
-                        if let TransactionType::HTLCRefund { hash: refunded_hash } = &past_tx.tx_type {
-                            if *refunded_hash == hash_to_find { already_claimed_or_refunded = true; }
-                        }
-                    }
-                }
+			if !matches!(tx.tx_type, TransactionType::HTLCClaim { .. }) {
+				return warp::reply::with_status(warp::reply::json(&"❌ Type invalide"), warp::http::StatusCode::BAD_REQUEST);
+			}
+			{
+				let chain = chain_arc.lock().unwrap();
+				if let Err(e) = chain.check_htlc_tx(&tx, chain.current_height + 1, &mut std::collections::HashSet::new()) {
+					return warp::reply::with_status(warp::reply::json(&e), warp::http::StatusCode::BAD_REQUEST);
+				}
 			}
 
-			if buyer_watt_address.is_none() || !lock_exists || already_claimed_or_refunded {
-				return warp::reply::with_status(
-					warp::reply::json(&"❌ [NODE TRIBUNAL] HTLC WATT lock introuvable, swap invalide, ou déjà claimé/remboursé"),
-					warp::http::StatusCode::BAD_REQUEST
-				);
-			}
-
-			let buyer_addr = buyer_watt_address.as_ref().unwrap();
-
-			if tx.outputs.len() != 1 {
-				return warp::reply::with_status(
-					warp::reply::json(&"❌ HTLCClaim doit contenir exactement 1 output"),
-					warp::http::StatusCode::BAD_REQUEST
-				);
-			}
-
-			let out_amount: u64 = match tx.outputs[0].aes_vault.parse::<u64>() {
-				Ok(v) => v,
-				Err(_) => return warp::reply::with_status(
-					warp::reply::json(&"❌ Montant output invalide"),
-					warp::http::StatusCode::BAD_REQUEST
-				),
-			};
-			
-			if out_amount != watt_amount {
-				return warp::reply::with_status(
-					warp::reply::json(&format!("❌ Montant dans l'output ({}) != montant du swap verrouillé ({})", out_amount, watt_amount)),
-					warp::http::StatusCode::BAD_REQUEST
-				);
-			}
-			if tx.outputs[0].stealth_address != *buyer_addr {
-				return warp::reply::with_status(
-					warp::reply::json(&"❌ stealth_address de l'output doit être exactement le buyer_watt_address du swap"),
-					warp::http::StatusCode::BAD_REQUEST
-				);
-			}
-
-			println!("✅ [NODE TRIBUNAL] HTLCClaim validé pour hash {} ({} WATT → {})", hash_to_find, watt_amount as f64 / 1_000_000_000.0, buyer_addr);
+			println!("✅ [NODE TRIBUNAL] HTLCClaim validé.");
 
 			let mut pool = mempool.lock().unwrap();
 			pool.push(tx.clone());
@@ -1417,7 +1289,6 @@ pub async fn start_api_server(
         .or(get_supply)
         .or(get_jackpot)
         .or(get_difficulty_history)
-        .or(htlc_lock)
         .or(htlc_claim)
 		.or(htlc_revealed_secret)
         .or(btc_create_htlc)
