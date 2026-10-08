@@ -1756,6 +1756,42 @@ pub async fn check_watt_lock_exists(hash: String) -> Result<bool, String> {
     Ok(exists)
 }
 
+// État d'un HTLC WATT lu sur la chaîne (le nœud est la source de vérité)
+pub struct HtlcStatus {
+    pub locked: bool,       // verrou WATT valide
+    pub lock_timeout: u64,
+    pub settled: bool,      // claimé OU remboursé
+    pub refunded: bool,     // remboursé au vendeur
+    pub height: u64,
+}
+
+pub async fn get_htlc_status(hash: &str) -> Result<HtlcStatus, String> {
+    let res_str = node_call("GET", &format!("/htlc/status/{}", hash), None).await?;
+    let json: serde_json::Value = serde_json::from_str(&res_str).map_err(|_| "Réponse /htlc/status illisible")?;
+    if json.get("height").is_none() { return Err("Nœud sans route /htlc/status".into()); }
+    Ok(HtlcStatus {
+        locked: json["locked"].as_bool().unwrap_or(false),
+        lock_timeout: json["lock_timeout"].as_u64().unwrap_or(0),
+        settled: json["settled"].as_bool().unwrap_or(false),
+        refunded: json["refunded"].as_bool().unwrap_or(false),
+        height: json["height"].as_u64().unwrap_or(0),
+    })
+}
+
+// Vrai si les BTC du HTLC ont été dépensés (claim vendeur OU refund acheteur), transaction confirmée
+pub async fn is_btc_htlc_spent(swap: &SwapContract) -> Result<bool, String> {
+    let script = build_htlc_script(swap)?;
+    let addr = bitcoin::Address::p2wsh(&script, bitcoin::Network::Testnet).to_string();
+    let res_str = node_call("GET", &format!("/btc/txs?address={}", addr), None).await?;
+    let txs: Vec<serde_json::Value> = serde_json::from_str(&res_str).unwrap_or_default();
+    Ok(txs.iter().any(|tx| {
+        tx["status"]["confirmed"].as_bool().unwrap_or(false)
+            && tx["vin"].as_array().map_or(false, |vin| {
+                vin.iter().any(|i| i["prevout"]["scriptpubkey_address"].as_str() == Some(addr.as_str()))
+            })
+    }))
+}
+
 
 pub async fn cancel_order(order_id: String) -> Result<String, String> {
     // On récupère le jeton d'annulation secret associé à cet ID

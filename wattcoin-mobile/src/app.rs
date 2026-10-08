@@ -436,68 +436,83 @@ impl WattcoinApp {
                 }
 				
 				let mut btc_locked_hashes = std::collections::HashSet::new();
+				let mut visible_swaps = Vec::new();
 
-                // LE WATCHTOWER BAVARD
+                // LE WATCHTOWER : c'est l'état on-chain (WATT + BTC) qui décide
                 for swap in &swaps {
-					// On vérifie systématiquement si le BTC est verrouillé pour l'UI
+                    let is_buyer = keys.watt_address == swap.buyer_watt_address;
+
+                    // 1. État du HTLC WATT. Nœud injoignable → on garde le swap et on ne fait rien.
+                    let st = match crate::get_htlc_status(&swap.htlc_hash).await {
+                        Ok(s) => s,
+                        Err(_) => { visible_swaps.push(swap.clone()); continue; }
+                    };
+                    // 2. État du HTLC BTC (dépensé = claim vendeur OU refund acheteur)
+                    let btc_spent = crate::is_btc_htlc_spent(swap).await.unwrap_or(false);
+
+                    // 3. Swap terminé pour MOI → effacé du cache disque et de l'écran, sans message
+                    let finished = if is_buyer {
+                        // Acheteur : WATT reçus, OU BTC repartis (mon refund ou claim du vendeur)
+                        (st.settled && !st.refunded) || btc_spent
+                    } else {
+                        // Vendeur : WATT remboursés, OU BTC encaissés, OU acheteur reparti avant mon verrou
+                        st.refunded || (st.settled && btc_spent) || (btc_spent && !st.locked)
+                    };
+                    if finished {
+                        crate::remove_swap_from_cache(&swap.htlc_hash);
+                        continue;
+                    }
+                    visible_swaps.push(swap.clone());
+
                     if let Ok(true) = crate::check_btc_contract_exists(&swap.htlc_hash).await {
                         btc_locked_hashes.insert(swap.htlc_hash.clone());
                     }
-					
+
                     if completed.contains(&swap.htlc_hash) { continue; }
 
-                    let is_buyer = keys.watt_address == swap.buyer_watt_address;
-                    
-					if is_buyer {
-                        // ACHETEUR
-                        if let Ok(true) = crate::check_watt_lock_exists(swap.htlc_hash.clone()).await {
-                            println!("🔍 [WATCHTOWER] Verrou WATT détecté sur la blockchain pour le hash {} !", &swap.htlc_hash[0..10]);
-                            
+                    if is_buyer {
+                        // ACHETEUR : claim seulement si verrou valide, non réglé et NON expiré
+                        if st.locked && !st.settled && st.height + 1 < st.lock_timeout {
                             if let Some(secret) = secrets.get(&swap.htlc_hash) {
-								println!("🔑 [WATCHTOWER] Secret trouvé ! Tir de la transaction Claim...");
-								let _ = tx.send(AppMessage::Info("👁️ Watchtower: Auto-Claim en cours...".to_string())).await;
-								
-								match crate::claim_wattcoin_swap(secret.clone(), swap.htlc_hash.clone(), swap.watt_amount_flames, swap.buyer_watt_address.clone()).await {
-									Ok(_) => {
-                                        // LE WATCHTOWER NETTOIE SON CACHE !
+                                println!("🔑 [WATCHTOWER] Verrou WATT actif, tir du Claim...");
+                                let _ = tx.send(AppMessage::Info("👁️ Watchtower: Auto-Claim en cours...".to_string())).await;
+                                match crate::claim_wattcoin_swap(secret.clone(), swap.htlc_hash.clone(), swap.watt_amount_flames, swap.buyer_watt_address.clone()).await {
+                                    Ok(_) => {
                                         crate::remove_swap_from_cache(&swap.htlc_hash);
-										let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
-									}
-									Err(e) => {
-										println!("🚨 [WATCHTOWER ERROR] Le nœud a rejeté le Claim : {}", e);
-										let _ = tx.send(AppMessage::Error(format!("Erreur Watchtower: {}", e))).await;
-									}
-								}
-							} else {
-								println!("🚨 [WATCHTOWER FATAL] Les WATT sont verrouillés, mais le secret est introuvable !");
-								let _ = tx.send(AppMessage::Error("Erreur Watchtower: Secret HTLC introuvable en local !".to_string())).await;
-							}
+                                        let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
+                                    }
+                                    Err(e) => {
+                                        println!("🚨 [WATCHTOWER ERROR] Le nœud a rejeté le Claim : {}", e);
+                                        let _ = tx.send(AppMessage::Error(format!("Erreur Watchtower: {}", e))).await;
+                                    }
+                                }
+                            } else {
+                                println!("🚨 [WATCHTOWER FATAL] Les WATT sont verrouillés, mais le secret est introuvable !");
+                                let _ = tx.send(AppMessage::Error("Erreur Watchtower: Secret HTLC introuvable en local !".to_string())).await;
+                            }
                         }
                     } else {
-                        // VENDEUR (Watchtower)
-						if let Ok(secret) = crate::get_revealed_secret(swap.htlc_hash.clone()).await {
-							println!("🔍 [WATCHTOWER] Secret de l'acheteur révélé sur le réseau : {} !", secret);
-							let _ = tx.send(AppMessage::Info("👁️ Watchtower: Secret révélé ! Auto-Claim BTC en cours...".to_string())).await;
-							
-							let swap_clone = swap.clone();
-							let master_seed = keys.master_seed_hex.clone();
-							
-							// ON GÈRE LE RÉSULTAT DU VRAI CLAIM BTC P2WSH
-							match crate::auto_claim_btc_swap(swap_clone, secret, master_seed).await {
-								Ok(msg) => {
-									crate::remove_swap_from_cache(&swap.htlc_hash);
-									let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
-									let _ = tx.send(AppMessage::Info(msg)).await;
-								}
-								Err(e) => {
-									let _ = tx.send(AppMessage::Error(format!("Erreur Watchtower BTC: {}", e))).await;
-								}
-							}
-						}
+                        // VENDEUR : le secret n'existe on-chain QUE si l'acheteur a claim → on ne le cherche qu'à ce moment
+                        if st.settled && !st.refunded && !btc_spent {
+                            if let Ok(secret) = crate::get_revealed_secret(swap.htlc_hash.clone()).await {
+                                println!("🔍 [WATCHTOWER] Secret de l'acheteur révélé : {} !", secret);
+                                let _ = tx.send(AppMessage::Info("👁️ Watchtower: Secret révélé ! Auto-Claim BTC en cours...".to_string())).await;
+                                match crate::auto_claim_btc_swap(swap.clone(), secret, keys.master_seed_hex.clone()).await {
+                                    Ok(msg) => {
+                                        crate::remove_swap_from_cache(&swap.htlc_hash);
+                                        let _ = tx.send(AppMessage::SwapCompleted(swap.htlc_hash.clone())).await;
+                                        let _ = tx.send(AppMessage::Info(msg)).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AppMessage::Error(format!("Erreur Watchtower BTC: {}", e))).await;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                
-                let _ = tx.send(AppMessage::DexData { pool, swaps, btc_locked_hashes }).await;
+
+                let _ = tx.send(AppMessage::DexData { pool, swaps: visible_swaps, btc_locked_hashes }).await;
 				crate::set_status("");
                 ctx.request_repaint();
             });

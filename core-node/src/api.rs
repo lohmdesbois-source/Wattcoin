@@ -965,6 +965,25 @@ pub async fn start_api_server(
 			}))
 		});
 		
+		// ÉTAT COMPLET D'UN HTLC WATT (lu par le watchtower des wallets)
+	let htlc_status = warp::path!("htlc" / "status" / String)
+		.and(warp::get())
+		.and(chain_filter.clone())
+		.map(|hash: String, chain_arc: Arc<Mutex<Blockchain>>| {
+			let chain = chain_arc.lock().unwrap();
+			let st = chain.get_htlc_state(&hash);
+			// "locked" = verrou VALIDE (suffisamment financé), comme l'exige check_htlc_tx
+			let locked = st.lock_timeout.is_some()
+				&& st.swap.as_ref().map_or(false, |s| st.locked_amount >= s.watt_amount_flames);
+			warp::reply::json(&serde_json::json!({
+				"locked": locked,
+				"lock_timeout": st.lock_timeout.unwrap_or(0),
+				"settled": st.settled,
+				"refunded": st.refunded,
+				"height": chain.current_height
+			}))
+		});
+		
 	let btc_utxos_route = warp::path!("btc" / "utxos")
 		.and(warp::get())
 		.and(warp::query::<std::collections::HashMap<String, String>>())
@@ -1295,6 +1314,7 @@ pub async fn start_api_server(
         .or(btc_send_to_htlc)
 		.or(btc_check_htlc_exists)
 		.or(watt_check_htlc_lock_exists)
+		.or(htlc_status)
 		.or(btc_utxos_route)
 		.or(btc_broadcast)
 		.or(get_btc_balance_route)

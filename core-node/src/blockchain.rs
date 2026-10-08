@@ -34,6 +34,7 @@ pub struct HtlcState {
     pub lock_timeout: Option<u64>,
     pub locked_amount: u64,
     pub settled: bool, // déjà claimé OU remboursé
+    pub refunded: bool, // remboursé au vendeurvv
 }
 
 impl Blockchain {
@@ -82,7 +83,7 @@ impl Blockchain {
     }
 	
 	pub fn get_htlc_state(&self, hash: &str) -> HtlcState {
-		let mut st = HtlcState { swap: None, lock_timeout: None, locked_amount: 0, settled: false };
+		let mut st = HtlcState { swap: None, lock_timeout: None, locked_amount: 0, settled: false, refunded: false };
 		for i in 0..=self.current_height {
 			let Some(b) = self.get_block_by_height(i) else { continue };
 			for tx in &b.transactions {
@@ -103,7 +104,7 @@ impl Blockchain {
 						let sb = hex::decode(secret).unwrap_or_default();
 						if hex::encode(sha2::Sha256::digest(&sb)) == hash { st.settled = true; }
 					}
-					TransactionType::HTLCRefund { hash: h } if h == hash => st.settled = true,
+					TransactionType::HTLCRefund { hash: h } if h == hash => { st.settled = true; st.refunded = true; }
 					_ => {}
 				}
 			}
