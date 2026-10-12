@@ -19,6 +19,16 @@ pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 pub static HIGHEST_KNOWN_BLOCK: AtomicU64 = AtomicU64::new(0);
 // BOUCLIER ANTI-DOS & BAN LIST
 pub static BANNED_PEERS: Lazy<Mutex<HashMap<String, i64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+// Ordres DEX clos (annulés OU entièrement exécutés) : id -> date d'oubli. Empêche leur résurrection via la synchro P2P
+pub static CLOSED_ORDERS: Lazy<Mutex<HashMap<String, i64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+// Parts de minage acceptées : hash de la part -> hauteur du tour vérifié (seuls le bloc en cours et le suivant sont gardés)
+pub static SHARE_ROUNDS: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+// Mempool
+pub const MAX_MEMPOOL_TXS: usize = 2000;
+pub const MAX_DEX_ORDERS: usize = 1000;
+// DEX
+pub const ORDER_LIFETIME_SECS: i64 = 7200; // Un ordre vit 2 h
+// Network
 const MAX_PEERS: usize = 50;
 const BAN_DURATION_SECS: i64 = 3600; // Banni pour 1 heure
 
@@ -46,6 +56,8 @@ pub enum P2PMessage {
         pow_hash: String,     // Le hash RandomX
         nonce: u64,           // Le sel pour trouver le PoW
     },
+    // Annulation d'un ordre DEX : on transmet le jeton, chaque nœud recalcule l'id
+    CancelOrder { token: String },
 }
 
 // Le profil enregistré dans la base de données Sled
@@ -61,6 +73,205 @@ pub struct DhtRecord {
 
 
 
+
+// ====================================================================
+// HYGIÈNE MEMPOOL & DEX : règles uniques (P2P, API, mineur)
+// ====================================================================
+
+// Clé HTLC d'un claim/refund (le hash du secret)
+fn htlc_key(tx: &Transaction) -> Option<String> {
+    use sha2::Digest;
+    match &tx.tx_type {
+        TransactionType::HTLCClaim { secret } => Some(hex::encode(sha2::Sha256::digest(&hex::decode(secret).unwrap_or_default()))),
+        TransactionType::HTLCRefund { hash } => Some(hash.clone()),
+        _ => None,
+    }
+}
+
+// Clés consommées par une TX : ses UTXO + sa clé WOTS+
+fn tx_spent_keys(tx: &Transaction) -> Vec<String> {
+    let mut keys: Vec<String> = tx.inputs.iter().map(|i| i.utxo_id.clone()).collect();
+    if let Some(sig) = &tx.wots_signature { keys.push(hex::encode(&sig.public_key)); }
+    keys
+}
+
+// PORTE D'ENTRÉE UNIQUE de la mempool (hors parts de minage, vérifiées par RandomX)
+pub fn check_tx_admission(chain: &Blockchain, pool: &[Transaction], tx: &Transaction) -> Result<(), String> {
+    // 1. Les transactions système ne circulent jamais
+    if matches!(tx.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase
+        | TransactionType::DexSettlement { .. } | TransactionType::LotteryPayout { .. }
+        | TransactionType::MiningShare { .. }) {
+        return Err("❌ Transaction système interdite en mempool".into());
+    }
+    // 2. Doublon exact
+    let h = tx.hash_data();
+    if pool.iter().any(|m| m.hash_data() == h) { return Err("✅ TX déjà en mempool".into()); }
+    // 3. Mempool pleine
+    if pool.len() >= MAX_MEMPOOL_TXS { return Err("❌ Réseau saturé".into()); }
+    // 4. Maths + signature
+    if !tx.is_valid() { return Err("❌ Math ou signature invalide".into()); }
+    // 5. Frais minimum (mêmes règles que prepare_block_template)
+    let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|o| o.stealth_address.starts_with("L2_WATT_"));
+    if !matches!(tx.tx_type, TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. }) {
+        let is_l1_interop = matches!(tx.tx_type, TransactionType::L2Anchor { .. } | TransactionType::L2BridgeLock { .. }
+            | TransactionType::L2Stake { .. } | TransactionType::L2Unstake { .. });
+        let weight_kb = (bincode::serialized_size(tx).unwrap_or(0) as f64 / 1024.0).ceil() as u64;
+        let min_fee = if is_pure_l2 && !is_l1_interop { std::cmp::max(100, weight_kb * 2) } else { std::cmp::max(1000, weight_kb * 20) };
+        if tx.fee < min_fee { return Err(format!("❌ Frais insuffisants ({} < {} Flames)", tx.fee, min_fee)); }
+    }
+    // 6. UTXO / clé WOTS+ : pas de doublon interne, pas dépensés on-chain, pas réservés en mempool
+    let keys = tx_spent_keys(tx);
+    let mut uniq: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !keys.iter().all(|k| uniq.insert(k.clone())) { return Err("❌ Input dupliqué dans la transaction".into()); }
+    if keys.iter().any(|k| chain.spent_key_images.contains(k)) { return Err("❌ UTXO ou clé WOTS+ déjà dépensé on-chain".into()); }
+    for m in pool {
+        if tx_spent_keys(m).iter().any(|k| uniq.contains(k)) { return Err("❌ UTXO déjà en cours de dépense dans la mempool".into()); }
+    }
+    // 7. Existence et montant réel des inputs L1 (le L2 est géré par le séquenceur)
+    if !is_pure_l2 {
+        for input in &tx.inputs {
+            match chain.find_utxo(&input.utxo_id) {
+                None => return Err(format!("❌ UTXO fantôme ({})", input.utxo_id)),
+                Some(u) if u.amount != input.amount => return Err("❌ Montant d'input falsifié".into()),
+                _ => {}
+            }
+        }
+    }
+    // 8. HTLC : règles du consensus + un seul règlement par hash en mempool
+    if let Some(k) = htlc_key(tx) {
+        chain.check_htlc_tx(tx, chain.current_height + 1, &mut std::collections::HashSet::new())?;
+        if pool.iter().any(|m| htlc_key(m).as_ref() == Some(&k)) { return Err("❌ HTLC : règlement déjà en mempool".into()); }
+    }
+    Ok(())
+}
+
+// PURGE UNIQUE : à appeler après chaque changement de la chaîne (bloc reçu, bloc miné, synchro, fork)
+pub fn purge_mempool(chain: &Blockchain, pool: &mut Vec<Transaction>) {
+    let tip = chain.current_height;
+    let before = pool.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut htlc_reserved = std::collections::HashSet::new();
+    let mut rounds = SHARE_ROUNDS.lock().unwrap();
+    // Parts : on ne garde que le tour du bloc en cours (tip, incluses dans tip+1) et le suivant (tip+1)
+    rounds.retain(|_, h| *h >= tip);
+
+    pool.retain(|tx| {
+        // 1. Doublon exact
+        if !seen.insert(tx.hash_data()) { return false; }
+        match &tx.tx_type {
+            // 2. Jamais de transaction système en mempool
+            TransactionType::Coinbase | TransactionType::MicroCoinbase
+            | TransactionType::DexSettlement { .. } | TransactionType::LotteryPayout { .. } => return false,
+            // 3. Parts de minage : uniquement les tours vérifiés et encore utiles
+            TransactionType::MiningShare { hash, .. } => return rounds.contains_key(hash),
+            // 4. HTLC : déjà réglé, expiré ou en double → dehors
+            TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. } => {
+                if chain.check_htlc_tx(tx, tip + 1, &mut std::collections::HashSet::new()).is_err() { return false; }
+                if let Some(k) = htlc_key(tx) { if !htlc_reserved.insert(k) { return false; } }
+            }
+            _ => {}
+        }
+        // 5. UTXO / clé WOTS+ : minée, en conflit avec le bloc, ou déjà réservée par une TX plus ancienne
+        let keys = tx_spent_keys(tx);
+        let mut uniq: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !keys.iter().all(|k| uniq.insert(k.clone())) { return false; }
+        if keys.iter().any(|k| chain.spent_key_images.contains(k) || reserved.contains(k)) { return false; }
+        reserved.extend(keys);
+        true
+    });
+
+    let removed = before - pool.len();
+    if removed > 0 {
+        println!("🧹 [MEMPOOL] {} transaction(s) purgée(s) (minées, conflits, périmées). Restantes : {}", removed, pool.len());
+    }
+}
+
+// Ordre clos (annulé ou exécuté) : mémorisé 2 h, puis oublié automatiquement
+pub fn close_order(id: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let mut closed = CLOSED_ORDERS.lock().unwrap();
+    closed.retain(|_, until| *until > now);
+    closed.insert(id.to_string(), now + ORDER_LIFETIME_SECS + 300).is_none()
+}
+
+pub fn is_order_closed(id: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    CLOSED_ORDERS.lock().unwrap().get(id).map_or(false, |until| *until > now)
+}
+
+// Contrôle d'un ordre DEX (API et P2P)
+pub fn check_order(o: &Order) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    if o.order_type != "buy" && o.order_type != "sell" { return Err("❌ Type d'ordre inconnu".into()); }
+    if o.amount_flames == 0 || o.price_sats == 0 { return Err("❌ Montant ou prix nul".into()); }
+    if o.expires_at <= now { return Err("❌ Ordre expiré".into()); }
+    if o.expires_at > now + ORDER_LIFETIME_SECS + 300 { return Err("❌ Durée de vie supérieure à 2 h".into()); }
+    if o.order_type == "buy" && o.htlc_hash.as_ref().map_or(true, |h| h.len() != 64) { return Err("❌ Achat sans HTLC hash valide".into()); }
+    if is_order_closed(&o.id) { return Err("❌ Ordre annulé ou déjà exécuté".into()); }
+    Ok(())
+}
+
+// Applique les swaps d'un bloc au Dark Pool (bloc reçu, bloc miné, synchro)
+pub fn apply_block_to_dex(dp: &mut Vec<Order>, block: &Block) {
+    for tx in &block.transactions {
+        if let TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
+            for swap in swaps {
+                // Achat : un hash HTLC ne sert qu'à UN swap → l'ordre d'achat est clos
+                if let Some(buy) = dp.iter_mut().find(|o| o.order_type == "buy" && o.htlc_hash.as_ref() == Some(&swap.htlc_hash)) {
+                    buy.amount_flames = 0;
+                }
+                // Vente : on déduit le volume exécuté
+                if let Some(sell) = dp.iter_mut().find(|o| o.order_type == "sell" && o.watt_address == swap.seller_watt_address && o.amount_flames >= swap.watt_amount_flames) {
+                    sell.amount_flames -= swap.watt_amount_flames;
+                }
+            }
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    dp.retain(|o| {
+        if o.amount_flames == 0 { close_order(&o.id); return false; } // exécuté → ne ressuscitera pas
+        o.expires_at > now
+    });
+}
+
+// Synchro L1 (rattrapage ou fork) + remise en ordre de la mempool et du Dark Pool
+fn sync_blocks_with_pools(chain: &mut Blockchain, blocks: &[Block], mempool: &Arc<Mutex<Vec<Transaction>>>, dex_pool: &SharedPool) -> bool {
+    // Avant la synchro : nos blocs déjà identiques (connus) et ceux qui vont être remplacés (orphelins)
+    let incoming: std::collections::HashSet<String> = blocks.iter().map(|b| b.header.hash.clone()).collect();
+    let mut known = std::collections::HashSet::new();
+    let mut orphans = Vec::new();
+    if let Some(first) = blocks.first() {
+        for i in first.header.index..=chain.current_height {
+            if let Some(b) = chain.get_block_by_height(i) {
+                if incoming.contains(&b.header.hash) { known.insert(b.header.hash.clone()); } else { orphans.push(b); }
+            }
+        }
+    }
+
+    if !chain.resolve_partial_fork(blocks.to_vec()) { return false; }
+
+    {
+        let mut mp = mempool.lock().unwrap();
+        // 1. Les TX des blocs orphelins retournent en mempool (si toujours valides sur la nouvelle chaîne)
+        let mut reinjected = 0;
+        for b in &orphans {
+            for t in &b.transactions {
+                if check_tx_admission(chain, &mp, t).is_ok() { mp.push(t.clone()); reinjected += 1; }
+            }
+        }
+        if reinjected > 0 { println!("♻️ [FORK] {} transaction(s) des blocs orphelins remises en mempool.", reinjected); }
+        // 2. Purge générale
+        purge_mempool(chain, &mut mp);
+    }
+
+    // 3. DEX : uniquement les blocs réellement nouveaux (pas de double déduction)
+    let mut dp = dex_pool.lock().unwrap();
+    for b in blocks.iter().filter(|b| !known.contains(&b.header.hash)) {
+        apply_block_to_dex(&mut dp, b);
+    }
+    true
+}
 
 // Lecture avec préfixe de taille (TCP Framing)
 async fn read_p2p_message<R: AsyncReadExt + std::marker::Unpin>(reader: &mut R, peer_ip: &str) -> Option<P2PMessage> {
@@ -318,20 +529,8 @@ pub fn start_peer_connection(
                             } else {
                                 // Cas de fork
                                 println!("📥 [SYNC] Bloc téléchargé ! (Index {})", incoming_last.header.index);
-                                if chain.resolve_partial_fork(blocks.clone()) {
+                                if sync_blocks_with_pools(&mut chain, &blocks, &mempool, &dex_pool) {
                                     println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
-                                    let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
-                                    { // SOUS-VERROU MEMPOOL
-                                        let mut mp = mempool.lock().unwrap();
-                                        mp.retain(|tx| { 
-                                            let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
-                                            let is_valid_share = match &tx.tx_type {
-                                                TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-                                                _ => true
-                                            };
-                                            not_in_block && is_valid_share
-                                        });
-                                    } // FIN VERROU MEMPOOL
                                     
                                     let now = chrono::Local::now().format("%d-%m-%Y %H:%M:%S");
                                     let tx_count = incoming_last.transactions.len();
@@ -372,22 +571,8 @@ pub fn start_peer_connection(
                         } else {
                             println!("📥 [SYNC] Bloc téléchargé ! (Index {})", incoming_last.header.index);
                             
-                            if chain.resolve_partial_fork(blocks.clone()) { 
+                            if sync_blocks_with_pools(&mut chain, &blocks, &mempool, &dex_pool) { 
                                 println!("✅ [SYNC] Rattrapage réussi ! La blockchain locale est à jour (Taille: {}).", chain.current_height + 1);
-                                
-                                let cutoff_time = if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 };
-
-                                { // SOUS-VERROU MEMPOOL (isolé dans ses propres accolades)
-                                    let mut mp = mempool.lock().unwrap();
-                                    mp.retain(|tx| { 
-                                        let not_in_block = !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.public_key == tx.public_key));
-                                        let is_valid_share = match &tx.tx_type {
-                                            TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-                                            _ => true
-                                        };
-                                        not_in_block && is_valid_share
-                                    });
-                                } // FIN VERROU MEMPOOL
 
                                 // On relaie la bonne nouvelle au reste du réseau !
                                 if let Some(last_block) = blocks.last() {
@@ -625,40 +810,16 @@ pub fn start_peer_connection(
                                 println!("====================================================================");
 								println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
                                 
-                                // LA RÈGLE D'OR : On récupère l'heure de l'avant-dernier bloc
-                                let cutoff_time = {
-                                    let chain = bc_clone.lock().unwrap(); 
-                                    if chain.current_height >= 1 { chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp } else { 0 }
-                                };
-
-                                let mined_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash_data()).collect();
-								mempool_clone.lock().unwrap().retain(|t| { 
-									let not_in_block = !mined_hashes.contains(&t.hash_data());
-                                    // PURGE KISS : On détruit les parts périmées
-                                    let is_valid_share = match &t.tx_type {
-                                        TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-                                        _ => true
-                                    };
-                                    not_in_block && is_valid_share
-                                });
+                                // PURGE UNIQUE : minées, conflits, HTLC réglés/expirés, parts périmées
+                                {
+                                    let chain = bc_clone.lock().unwrap();
+                                    let mut mp = mempool_clone.lock().unwrap();
+                                    crate::network::purge_mempool(&chain, &mut mp);
+                                }
                                 
                                 {
-									let now = chrono::Utc::now().timestamp();
 									let mut dp = dex_pool_clone.lock().unwrap();
-									
-									for tx in &block.transactions {
-										if let TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
-											for swap in swaps {
-												if let Some(buy) = dp.iter_mut().find(|o| o.order_type == "buy" && o.htlc_hash.as_ref() == Some(&swap.htlc_hash)) {
-													buy.amount_flames = buy.amount_flames.saturating_sub(swap.watt_amount_flames);
-												}
-												if let Some(sell) = dp.iter_mut().find(|o| o.order_type == "sell" && o.watt_address == swap.seller_watt_address && o.amount_flames >= swap.watt_amount_flames) {
-													sell.amount_flames = sell.amount_flames.saturating_sub(swap.watt_amount_flames);
-												}
-											}
-										}
-									}
-									dp.retain(|o| o.amount_flames > 0 && o.expires_at > now);
+									crate::network::apply_block_to_dex(&mut dp, &block);
 									println!("🧹 [DEX] Bloc reçu : Dark Pool synchronisé (ordres restants: {}).", dp.len());
 								}
                                 
@@ -690,8 +851,12 @@ pub fn start_peer_connection(
 					}
                     let mut rng = rand::thread_rng();
                     if rng.gen_range(1..=10) <= 2 {
-                        mempool.lock().unwrap().push(in_tx);
-                    } 
+                        let chain = blockchain.lock().unwrap();
+                        let mut pool = mempool.lock().unwrap();
+                        if check_tx_admission(&chain, &pool, &in_tx).is_ok() {
+                            pool.push(in_tx);
+                        }
+                    }
                 },
 
                 P2PMessage::BroadcastTransaction { tx: in_tx } => {
@@ -759,6 +924,8 @@ pub fn start_peer_connection(
 												println!("⛏️ [P2POOL] Nouvelle part de minage relayée !");
 												let tx_to_propagate = in_tx.clone();
 												pool.push(in_tx);
+												// On mémorise le tour vérifié : la purge ne garde que le bloc en cours et le suivant
+												crate::network::SHARE_ROUNDS.lock().unwrap().insert(hash.clone(), current_height);
 
 												let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
 												if let Ok(payload) = bincode::serialize(&envelope) {
@@ -785,26 +952,30 @@ pub fn start_peer_connection(
 					}
 
 					// 3. TRAITEMENT CLASSIQUE POUR LES AUTRES TRANSACTIONS (HTLC, Envoi Classique...)
-					if in_tx.is_valid() {
-						let mut pool = mempool.lock().unwrap(); 
-						if !pool.iter().any(|t| t.hash_data() == in_tx.hash_data()) {
-							println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !"); 
-							let tx_to_propagate = in_tx.clone();          
-							pool.push(in_tx);
+					let admitted = {
+						let chain = blockchain.lock().unwrap();
+						let mut pool = mempool.lock().unwrap();
+						match check_tx_admission(&chain, &pool, &in_tx) {
+							Ok(()) => { pool.push(in_tx.clone()); true }
+							Err(e) => {
+								if !e.starts_with("✅") { println!("⛔ [P2P] TX refusée : {}", e); }
+								false
+							}
+						}
+					};
+					if admitted {
+						println!("📥 [MEMPOOL] Nouvelle TX reçue via P2P !"); 
+						let envelope = P2PMessage::BroadcastTransaction { tx: in_tx };
+						if let Ok(payload) = bincode::serialize(&envelope) {
+							let length = (payload.len() as u32).to_be_bytes();
+							let mut framed = Vec::with_capacity(4 + payload.len());
+							framed.extend_from_slice(&length);
+							framed.extend_from_slice(&payload);
 
-							let envelope = P2PMessage::BroadcastTransaction { tx: tx_to_propagate };
-							if let Ok(payload) = bincode::serialize(&envelope) {
-								let length = (payload.len() as u32).to_be_bytes();
-								let mut framed = Vec::with_capacity(4 + payload.len());
-								framed.extend_from_slice(&length);
-								framed.extend_from_slice(&payload);
-
-								let ap = active_peers.lock().unwrap().clone();
-								for (peer_id, sender) in ap.iter() {
-									// On envoie 'framed'
-									if peer_id != &actual_peer_id {
-										let _ = sender.try_send(framed.clone());
-									}
+							let ap = active_peers.lock().unwrap().clone();
+							for (peer_id, sender) in ap.iter() {
+								if peer_id != &actual_peer_id {
+									let _ = sender.try_send(framed.clone());
 								}
 							}
 						}
@@ -812,8 +983,17 @@ pub fn start_peer_connection(
 				},
 
                 P2PMessage::GetMempool => {
-                    let pool = mempool.lock().unwrap().clone();
+                    // Les parts de minage ne sont pas envoyées : le receveur ne pourrait pas vérifier leur tour
+                    let pool: Vec<Transaction> = mempool.lock().unwrap().iter()
+                        .filter(|t| !matches!(t.tx_type, TransactionType::MiningShare { .. })).cloned().collect();
                     send_message_to_channel(&tx, P2PMessage::MempoolSync { txs: pool }).await;
+                    // DEX : on transmet aussi les ordres actifs (sinon un nœud qui arrive ne les voit jamais)
+                    let now = chrono::Utc::now().timestamp();
+                    let orders: Vec<Order> = dex_pool.lock().unwrap().iter()
+                        .filter(|o| o.expires_at > now).cloned().collect();
+                    for order in orders {
+                        send_message_to_channel(&tx, P2PMessage::BroadcastOrder { order }).await;
+                    }
                 },
 
                 P2PMessage::MempoolSync { txs } => {
@@ -822,16 +1002,8 @@ pub fn start_peer_connection(
                     let mut local_mp = mempool.lock().unwrap(); 
                     let mut added = 0;
                     for t in txs {
-                        let mut spent = false;
-                        if t.tx_type != TransactionType::Coinbase {
-                            if let Some(sig) = &t.wots_signature {
-								let ki = hex::encode(&sig.public_key);
-								if chain.spent_key_images.contains(&ki) {
-									spent = true;
-								}
-							}
-                        }
-                        if !local_mp.iter().any(|x| x.hash_data() == t.hash_data()) && !spent {
+                        // Même porte d'entrée que le reste (parts de minage refusées : tour invérifiable ici)
+                        if check_tx_admission(&chain, &local_mp, &t).is_ok() {
                             local_mp.push(t);
                             added += 1;
                         }
@@ -839,11 +1011,60 @@ pub fn start_peer_connection(
                     if added > 0 { println!("📥 [PULL] {} transaction(s) aspirée(s) !", added); }
                 },
 
+				P2PMessage::CancelOrder { token } => {
+                    use sha2::Digest;
+                    let id = hex::encode(sha2::Sha256::digest(&hex::decode(&token).unwrap_or_default()));
+                    // Déjà connue → on s'arrête (anti-boucle)
+                    if !close_order(&id) { continue; }
+                    dex_pool.lock().unwrap().retain(|o| o.id != id);
+                    println!("🗑️ [P2P DEX] Ordre annulé par le réseau : {}...", &id[..16]);
+                    let envelope = P2PMessage::CancelOrder { token };
+                    if let Ok(payload) = bincode::serialize(&envelope) {
+                        let length = (payload.len() as u32).to_be_bytes();
+                        let mut framed = Vec::with_capacity(4 + payload.len());
+                        framed.extend_from_slice(&length);
+                        framed.extend_from_slice(&payload);
+                        let ap = active_peers.lock().unwrap().clone();
+                        for (peer_id, sender) in ap.iter() {
+                            if peer_id != &actual_peer_id {
+                                let _ = sender.try_send(framed.clone());
+                            }
+                        }
+                    }
+                },
+
                 P2PMessage::BroadcastOrder { order } => {
-                    let mut pool = dex_pool.lock().unwrap();
-                    if !pool.iter().any(|o| o.id == order.id) {
-                        println!("🌊 [P2P DEX] Ordre reçu du réseau : {} {} WATT", order.order_type, order.amount_flames);
-                        pool.push(order);
+                    // Ordre invalide, expiré, > 2 h, annulé ou déjà exécuté → ignoré
+                    if check_order(&order).is_err() { continue; }
+                    // ANTI DOUBLE-MATCH : un achat dont le hash a déjà un swap on-chain est périmé
+                    if let Some(h) = &order.htlc_hash {
+                        if blockchain.lock().unwrap().get_htlc_state(h).swap.is_some() { continue; }
+                    }
+                    let is_new = {
+                        let mut pool = dex_pool.lock().unwrap();
+                        if pool.len() >= MAX_DEX_ORDERS || pool.iter().any(|o| o.id == order.id) {
+                            false
+                        } else {
+							println!("🌊 [P2P DEX] Ordre reçu du réseau : {} {} FLAME ( {} WATT)", order.order_type, order.amount_flames, order.amount_flames as f64 / 1_000_000_000.0);
+							pool.push(order.clone());
+                            true
+                        }
+                    };
+                    // RELAIS : on propage aux autres pairs (le dédoublonnage par id empêche les boucles)
+                    if is_new {
+                        let envelope = P2PMessage::BroadcastOrder { order };
+                        if let Ok(payload) = bincode::serialize(&envelope) {
+                            let length = (payload.len() as u32).to_be_bytes();
+                            let mut framed = Vec::with_capacity(4 + payload.len());
+                            framed.extend_from_slice(&length);
+                            framed.extend_from_slice(&payload);
+                            let ap = active_peers.lock().unwrap().clone();
+                            for (peer_id, sender) in ap.iter() {
+                                if peer_id != &actual_peer_id {
+                                    let _ = sender.try_send(framed.clone());
+                                }
+                            }
+                        }
                     }
                 },
 				
@@ -1064,6 +1285,21 @@ pub async fn broadcast_transaction(tx: Transaction, active_peers: ActivePeers) {
 
 pub async fn broadcast_order(order: Order, active_peers: ActivePeers) {
     let envelope = P2PMessage::BroadcastOrder { order };
+    if let Ok(payload) = bincode::serialize(&envelope) {
+        let length = (payload.len() as u32).to_be_bytes();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&length);
+        framed.extend_from_slice(&payload);
+
+        let peers = active_peers.lock().unwrap().clone();
+        for (_peer_id, sender) in peers.iter() {
+            let _ = sender.try_send(framed.clone());
+        }
+    }
+}
+
+pub async fn broadcast_cancel_order(token: String, active_peers: ActivePeers) {
+    let envelope = P2PMessage::CancelOrder { token };
     if let Ok(payload) = bincode::serialize(&envelope) {
         let length = (payload.len() as u32).to_be_bytes();
         let mut framed = Vec::with_capacity(4 + payload.len());

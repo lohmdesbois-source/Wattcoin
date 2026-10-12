@@ -153,22 +153,7 @@ pub async fn start_api_server(
 		.map(|chain_arc: Arc<Mutex<Blockchain>>| {
 			let chain_lock = chain_arc.lock().unwrap();
 			let mut active_swaps = Vec::new();
-			let mut claimed_hashes = std::collections::HashSet::new();
-
-			for i in 0..=chain_lock.current_height {
-                if let Some(block) = chain_lock.get_block_by_height(i) {
-                    for tx in &block.transactions {
-                        if let crate::transaction::TransactionType::HTLCClaim { secret } = &tx.tx_type {
-                            let secret_bytes = hex::decode(secret).unwrap_or_default();
-                            let hash = hex::encode(sha2::Sha256::digest(&secret_bytes));
-                            claimed_hashes.insert(hash);
-                        }
-                        if let crate::transaction::TransactionType::HTLCRefund { hash } = &tx.tx_type {
-                            claimed_hashes.insert(hash.clone());
-                        }
-                    }
-                }
-			}
+			// Plus de filtrage ici : le watchtower du wallet décide via /htlc/status + l'état BTC
 
             let start = chain_lock.current_height.saturating_sub(200);
 			for i in (start..=chain_lock.current_height).rev() {
@@ -176,9 +161,7 @@ pub async fn start_api_server(
                     for tx in &block.transactions {
                         if let crate::transaction::TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
                             for swap in swaps {
-                                if !claimed_hashes.contains(&swap.htlc_hash) {
-                                    active_swaps.push(swap.clone());
-                                }
+                                active_swaps.push(swap.clone());
                             }
                         }
                     }
@@ -404,8 +387,16 @@ pub async fn start_api_server(
 				}
 			}
 			
-			let mut pool = mempool.lock().unwrap();
-            pool.push(tx.clone());
+			{
+				// VERDICT FINAL : même porte d'entrée que le P2P, sous les deux verrous (Chain -> Mempool)
+				let chain_lock = chain_arc.lock().unwrap();
+				let mut pool = mempool.lock().unwrap();
+				if let Err(e) = crate::network::check_tx_admission(&chain_lock, &pool, &tx) {
+					let code = if e.starts_with("✅") { warp::http::StatusCode::OK } else { warp::http::StatusCode::BAD_REQUEST };
+					return warp::reply::with_status(warp::reply::json(&e), code);
+				}
+				pool.push(tx.clone());
+			}
 
             let tx_clone = tx.clone();
             tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
@@ -539,19 +530,30 @@ pub async fn start_api_server(
 		.and(warp::body::bytes()) 
 		.and(dex_pool_filter.clone())
 		.and(active_peers_filter.clone()) 
-		.map(|body_bytes: warp::hyper::body::Bytes, pool: SharedPool, active_peers: crate::network::ActivePeers| {
+		.and(chain_filter.clone())
+		.map(|body_bytes: warp::hyper::body::Bytes, pool: SharedPool, active_peers: crate::network::ActivePeers, chain_arc: Arc<Mutex<Blockchain>>| {
             let order: Order = match serde_json::from_slice(&body_bytes) {
                 Ok(o) => o,
                 Err(_) => return warp::reply::with_status(warp::reply::json(&"❌ Format JSON invalide"), warp::http::StatusCode::BAD_REQUEST),
             };
 
-			if order.order_type == "buy" && order.htlc_hash.is_none() {
-				return warp::reply::with_status(warp::reply::json(&"❌ Achat impossible : HTLC Hash manquant"), warp::http::StatusCode::BAD_REQUEST);
+			// Mêmes règles que le P2P : type, montant, prix, durée ≤ 2 h, hash HTLC, pas annulé/exécuté
+			if let Err(e) = crate::network::check_order(&order) {
+				return warp::reply::with_status(warp::reply::json(&e), warp::http::StatusCode::BAD_REQUEST);
+			}
+			// Un hash HTLC déjà utilisé on-chain ne peut pas resservir
+			if let Some(h) = &order.htlc_hash {
+				if chain_arc.lock().unwrap().get_htlc_state(h).swap.is_some() {
+					return warp::reply::with_status(warp::reply::json(&"❌ Ce hash HTLC a déjà servi à un swap"), warp::http::StatusCode::BAD_REQUEST);
+				}
 			}
 
 			let mut is_new = false;
 			{
 				let mut p = pool.lock().unwrap();
+				if p.len() >= crate::network::MAX_DEX_ORDERS {
+					return warp::reply::with_status(warp::reply::json(&"❌ Carnet d'ordres saturé"), warp::http::StatusCode::SERVICE_UNAVAILABLE);
+				}
 				if !p.iter().any(|o| o.id == order.id) { 
 					p.push(order.clone()); 
 					is_new = true; 
@@ -567,16 +569,23 @@ pub async fn start_api_server(
 	let cancel_order = warp::delete()
         .and(warp::path!("order" / String))
         .and(dex_pool_filter.clone())
-        .map(|token_hex: String, pool: SharedPool| {
+        .and(active_peers_filter.clone())
+        .map(|token_hex: String, pool: SharedPool, active_peers: crate::network::ActivePeers| {
             // ANTI IDOR DEX : Le client envoie son jeton secret. On le hache pour retrouver l'ID public !
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
             let expected_id = hex::encode(sha2::Sha256::digest(&token_bytes));
+            
+            // Mémorisé : la synchro P2P ne pourra plus le ressusciter
+            crate::network::close_order(&expected_id);
+            // Propagation : tous les nœuds suppriment l'ordre
+            let token_clone = token_hex.clone();
+            tokio::spawn(async move { crate::network::broadcast_cancel_order(token_clone, active_peers).await; });
             
             let mut p = pool.lock().unwrap();
             let initial_len = p.len();
             p.retain(|o| o.id != expected_id);
             
-            if p.len() < initial_len {
+            if p.len() < initial_len {  
                 warp::reply::json(&"✅ Ordre supprimé")
             } else {
                 warp::reply::json(&"❌ Échec : Ordre introuvable ou jeton d'annulation invalide")
@@ -758,10 +767,18 @@ pub async fn start_api_server(
 				}
 			}
 
-			println!("✅ [NODE TRIBUNAL] HTLCClaim validé.");
+			{
+				// Même porte d'entrée que le reste (doublon, claim déjà en mempool, etc.)
+				let chain = chain_arc.lock().unwrap();
+				let mut pool = mempool.lock().unwrap();
+				if let Err(e) = crate::network::check_tx_admission(&chain, &pool, &tx) {
+					let code = if e.starts_with("✅") { warp::http::StatusCode::OK } else { warp::http::StatusCode::BAD_REQUEST };
+					return warp::reply::with_status(warp::reply::json(&e), code);
+				}
+				pool.push(tx.clone());
+			}
 
-			let mut pool = mempool.lock().unwrap();
-			pool.push(tx.clone());
+			println!("✅ [NODE TRIBUNAL] HTLCClaim validé.");
 			let tx_clone = tx.clone();
 			tokio::spawn(async move { crate::network::broadcast_transaction(tx_clone, active_peers).await; });
 
@@ -998,6 +1015,40 @@ pub async fn start_api_server(
 				Err(e) => {
 					println!("❌ [NODE BTC UTXOS] Erreur proxy : {}", e);
 					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!([])))
+				}
+			}
+		});
+		
+	// HAUTEUR ACTUELLE DE LA CHAÎNE BITCOIN (compteur du refund BTC)
+	let btc_tip = warp::path!("btc" / "tip")
+		.and(warp::get())
+		.and_then(|| async move {
+			match btc_proxy("GET", "/blocks/tip/height", None).await {
+				Ok(text) => {
+					let height = text.trim().parse::<u64>().unwrap_or(0);
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "height": height })))
+				}
+				Err(e) => {
+					println!("❌ [NODE BTC TIP] Erreur proxy : {}", e);
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "height": 0 })))
+				}
+			}
+		});
+
+	// FRAIS BTC DYNAMIQUES en sat/vB (cible : confirmation prochain bloc)
+	let btc_fees = warp::path!("btc" / "fees")
+		.and(warp::get())
+		.and_then(|| async move {
+			match btc_proxy("GET", "/fee-estimates", None).await {
+				Ok(text) => {
+					let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+					// Cible : le PROCHAIN bloc (un swap HTLC a des délais, on ne lésine pas)
+					let rate = json["1"].as_f64().or(json["2"].as_f64()).or(json["3"].as_f64()).unwrap_or(0.0);
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "sat_per_vb": rate })))
+				}
+				Err(e) => {
+					println!("❌ [NODE BTC FEES] Erreur proxy : {}", e);
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "sat_per_vb": 0.0 })))
 				}
 			}
 		});
@@ -1316,6 +1367,8 @@ pub async fn start_api_server(
 		.or(watt_check_htlc_lock_exists)
 		.or(htlc_status)
 		.or(btc_utxos_route)
+		.or(btc_tip)
+		.or(btc_fees)
 		.or(btc_broadcast)
 		.or(get_btc_balance_route)
 		.or(get_btc_txs_route)

@@ -62,7 +62,7 @@ enum AppMessage {
 		current_block_height: u64
     },
 	HistoryData(Vec<crate::HistoryItem>),
-	DexData { pool: Vec<crate::Order>, swaps: Vec<crate::SwapContract>, btc_locked_hashes: std::collections::HashSet<String> }, 
+	DexData { pool: Vec<crate::Order>, swaps: Vec<crate::SwapContract>, btc_locked_hashes: std::collections::HashSet<String>, swap_timers: std::collections::HashMap<String, String> }, 
 	SwapCompleted(String),
 	DataFetched(Vec<crate::DataItem>), // Pour recevoir l'historique messages
     FileHashed(String, String),
@@ -124,6 +124,7 @@ struct WattcoinApp {
     swap_secrets: std::collections::HashMap<String, String>, // Stocke temporairement les secrets générés
 	completed_swaps: std::collections::HashSet<String>, // Historique des swaps finis
 	btc_locked_hashes: std::collections::HashSet<String>,
+	swap_timers: std::collections::HashMap<String, String>, // Compteurs WATT/BTC par swap
     last_watchtower_tick: Option<std::time::Instant>,   // Chronomètre
 	in_flight_locks: std::collections::HashSet<String>,
 	
@@ -253,6 +254,7 @@ impl WattcoinApp {
             swap_secrets: std::collections::HashMap::new(),
 			completed_swaps: std::collections::HashSet::new(),
 			btc_locked_hashes: std::collections::HashSet::new(),
+			swap_timers: std::collections::HashMap::new(),
             last_watchtower_tick: None,
 			in_flight_locks: std::collections::HashSet::new(),
 			
@@ -437,6 +439,8 @@ impl WattcoinApp {
 				
 				let mut btc_locked_hashes = std::collections::HashSet::new();
 				let mut visible_swaps = Vec::new();
+				let mut swap_timers = std::collections::HashMap::new();
+				let btc_tip = crate::get_btc_tip_height().await; // une seule fois par tour
 
                 // LE WATCHTOWER : c'est l'état on-chain (WATT + BTC) qui décide
                 for swap in &swaps {
@@ -464,9 +468,39 @@ impl WattcoinApp {
                     }
                     visible_swaps.push(swap.clone());
 
-                    if let Ok(true) = crate::check_btc_contract_exists(&swap.htlc_hash).await {
+                    // Le vendeur ne verrouille ses WATT que sur un dépôt BTC CONFIRMÉ et SUFFISANT (lu sur la chaîne BTC)
+                    let deposit = crate::get_btc_deposit(swap).await;
+                    if let Ok(crate::BtcDeposit::Confirmed { .. }) = &deposit {
                         btc_locked_hashes.insert(swap.htlc_hash.clone());
                     }
+
+                    // 4. Compteurs affichés sur la carte du swap
+                    let watt_txt = if !st.locked {
+                        "⏳ WATT : pas encore verrouillés".to_string()
+                    } else {
+                        let left = st.lock_timeout.saturating_sub(st.height + 1);
+                        if left > 0 {
+                            format!("🔒 WATT : claim possible encore {} bloc(s) — refund vendeur au bloc {} (actuel : {})", left, st.lock_timeout, st.height)
+                        } else {
+                            format!("🔓 WATT : délai expiré (bloc {}) — refund vendeur possible", st.lock_timeout)
+                        }
+                    };
+                    let btc_txt = match deposit {
+                        Ok(crate::BtcDeposit::Absent) => "⏳ BTC : aucun dépôt dans le HTLC".to_string(),
+                        Ok(crate::BtcDeposit::Underfunded { got }) => format!("⚠️ BTC : dépôt insuffisant ({} / {} sats) — ne PAS verrouiller", got, swap.btc_amount_sats),
+                        Ok(crate::BtcDeposit::Pending) => "⏳ BTC : dépôt en attente de confirmation".to_string(),
+                        Ok(crate::BtcDeposit::Confirmed { refund_height }) if btc_tip > 0 => {
+                            let left = refund_height.saturating_sub(btc_tip + 1);
+                            if left > 0 {
+                                format!("🔒 BTC : refund acheteur dans {} bloc(s) BTC — bloc {} (actuel : {})", left, refund_height, btc_tip)
+                            } else {
+                                format!("🔓 BTC : délai expiré (bloc {}) — refund acheteur possible", refund_height)
+                            }
+                        }
+                        Ok(crate::BtcDeposit::Confirmed { refund_height }) => format!("🔒 BTC : refund acheteur au bloc {} (hauteur actuelle inconnue)", refund_height),
+                        Err(_) => "❔ BTC : état indisponible".to_string(),
+                    };
+                    swap_timers.insert(swap.htlc_hash.clone(), format!("{}\n{}", watt_txt, btc_txt));
 
                     if completed.contains(&swap.htlc_hash) { continue; }
 
@@ -512,7 +546,7 @@ impl WattcoinApp {
                     }
                 }
 
-                let _ = tx.send(AppMessage::DexData { pool, swaps: visible_swaps, btc_locked_hashes }).await;
+                let _ = tx.send(AppMessage::DexData { pool, swaps: visible_swaps, btc_locked_hashes, swap_timers }).await;
 				crate::set_status("");
                 ctx.request_repaint();
             });
@@ -687,10 +721,11 @@ impl eframe::App for WattcoinApp {
 					self.history_items = items;
 					self.is_loading_history = false;
 				},
-				AppMessage::DexData { pool, swaps, btc_locked_hashes } => { 
+				AppMessage::DexData { pool, swaps, btc_locked_hashes, swap_timers } => { 
                     self.dark_pool = pool;
                     self.active_swaps = swaps;
                     self.btc_locked_hashes = btc_locked_hashes; 
+                    self.swap_timers = swap_timers;
                     self.is_loading_dex = false;
                 },
 				AppMessage::SwapCompleted(hash) => {
@@ -1739,6 +1774,9 @@ impl eframe::App for WattcoinApp {
 											ui.label(egui::RichText::new(format!("(≈ $ {:.2})", btc_usd)).color(egui::Color32::GRAY));
 										});
 										ui.label(egui::RichText::new(format!("Hash HTLC : {}...", &swap.htlc_hash[0..15])).size(10.0).color(egui::Color32::GRAY));
+										if let Some(timers) = self.swap_timers.get(&swap.htlc_hash) {
+											ui.label(egui::RichText::new(timers).size(11.0).color(egui::Color32::GRAY));
+										}
 										
 										ui.add_space(5.0);
 										ui.vertical(|ui| {
@@ -1806,10 +1844,16 @@ impl eframe::App for WattcoinApp {
 													let recipient = swap.buyer_watt_address.clone();
 													let htlc_hash = swap.htlc_hash.clone();
 													
-													// on extrait la valeur AVANT de lancer la tâche asynchrone
-													let target_timeout = self.current_block_height + HLTC_LOCK_TIME; 
-													
 													tokio::spawn(async move {
+														// Hauteur FRAÎCHE lue au nœud au moment du lock (pas celle, peut-être périmée, du dashboard)
+														let height = crate::get_network_info().await.ok()
+															.and_then(|i| i["blocks"].as_u64()).unwrap_or(0);
+														if height == 0 {
+															let _ = tx.send(AppMessage::Error("❌ Hauteur du réseau inconnue, réessaie.".to_string())).await;
+															return;
+														}
+														// +1 : le lock entre au mieux dans le prochain bloc → HLTC_LOCK_TIME blocs pleins pour claim
+														let target_timeout = height + 1 + HLTC_LOCK_TIME;
 														match crate::send_wattcoin(
 															recipient, amount_watt, 0.0, keys_clone.kyber_secret_hex, 
 															keys_clone.watt_address, keys_clone.master_seed_hex, 

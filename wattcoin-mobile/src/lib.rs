@@ -37,8 +37,10 @@ pub static SYNC_STATUS: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(Stri
 
 const MATURITY_BLOCKS: u64 = 1; 
 const FLAME: u64 = 1_000_000_000;
-const HLTC_LOCK_TIME : u64 = 5; // 7200 Pour la prod (24H / 1 jours)
-const HLTC_LOCK_BTC_TIME : i64 = 1; // CSV relatif, en blocs BTC. Prod : 288 (~48H). DOIT rester > délai WATT (HLTC_LOCK_TIME)
+const HLTC_LOCK_TIME : u64 = 5; // 720 pour la prod (24H : 720 blocs de 2 min)
+const HLTC_LOCK_BTC_TIME : i64 = 1; // 288 pour la prod (~48H). DOIT rester > délai WATT (HLTC_LOCK_TIME)
+// Taille d'une dépense du HTLC (claim ≈ 138 vB, refund ≈ 130 vB) + marge
+const HTLC_SPEND_VBYTES: u64 = 150;
 
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
@@ -54,6 +56,14 @@ pub enum WattError {
     Io(std::io::Error),
     Vault(String),
     Json(serde_json::Error),
+}
+
+// État du dépôt BTC dans le HTLC
+pub enum BtcDeposit {
+    Absent,                           // rien sur l'adresse du HTLC
+    Underfunded { got: u64 },         // dépôt inférieur au prix du swap → le vendeur ne doit PAS verrouiller
+    Pending,                          // dépôt en mempool, pas encore confirmé
+    Confirmed { refund_height: u64 }, // le refund peut être miné à partir de ce bloc
 }
 
 impl From<std::io::Error> for WattError {
@@ -1653,11 +1663,17 @@ pub async fn refund_wattcoin_swap(hash: String, keys: WalletKeys) -> Result<Stri
     Ok("🔙 REMBOURSEMENT WATT ENVOYÉ AU RÉSEAU !".to_string())
 }
 
+// Cache des swaps PROPRE à chaque wallet (sinon les wallets du même PC s'effacent mutuellement)
+fn get_active_swaps_cache_path() -> Result<PathBuf, String> {
+    let mut path = get_swap_secrets_path()?;
+    let name = CURRENT_WALLET.lock().unwrap().clone();
+    path.set_file_name(format!("{}_active_swaps_cache.json", name));
+    Ok(path)
+}
 
 // Permet au Watchtower de nettoyer son cache une fois le travail fini
 pub fn remove_swap_from_cache(hash: &str) {
-    if let Ok(mut path) = get_swap_secrets_path() {
-        path.set_file_name("active_swaps_cache.json");
+    if let Ok(path) = get_active_swaps_cache_path() {
         if let Ok(cached) = std::fs::read_to_string(&path) {
             if let Ok(mut parsed) = serde_json::from_str::<Vec<SwapContract>>(&cached) {
                 parsed.retain(|s| s.htlc_hash != hash);
@@ -1686,8 +1702,7 @@ pub async fn get_active_swaps(btc_address: String, watt_address: String) -> Resu
     }
 
     // ANTI-AMNÉSIE : On sauvegarde dans le VRAI dossier sécurisé de l'OS (pas /tmp/)
-    let mut cache_path = get_swap_secrets_path().unwrap_or_else(|_| PathBuf::from("swaps.json"));
-    cache_path.set_file_name("active_swaps_cache.json");
+    let cache_path = get_active_swaps_cache_path().unwrap_or_else(|_| PathBuf::from("swaps.json"));
 
     let mut final_swaps = std::collections::HashMap::new();
 
@@ -1792,6 +1807,29 @@ pub async fn is_btc_htlc_spent(swap: &SwapContract) -> Result<bool, String> {
     }))
 }
 
+// Hauteur actuelle de la chaîne Bitcoin (0 = inconnue)
+pub async fn get_btc_tip_height() -> u64 {
+    match node_call("GET", "/btc/tip", None).await {
+        Ok(s) => serde_json::from_str::<serde_json::Value>(&s).ok()
+            .and_then(|j| j["height"].as_u64()).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+pub async fn get_btc_deposit(swap: &SwapContract) -> Result<BtcDeposit, String> {
+    let script = build_htlc_script(swap)?;
+    let addr = bitcoin::Address::p2wsh(&script, bitcoin::Network::Testnet).to_string();
+    let res_str = node_call("GET", &format!("/btc/utxos?address={}", addr), None).await?;
+    let utxos: Vec<serde_json::Value> = serde_json::from_str(&res_str).unwrap_or_default();
+    if utxos.is_empty() { return Ok(BtcDeposit::Absent); }
+    // claim et refund dépensent utxos[0] : c'est SON montant et SON délai CSV qui comptent
+    let value = utxos[0]["value"].as_u64().unwrap_or(0);
+    if value < swap.btc_amount_sats { return Ok(BtcDeposit::Underfunded { got: value }); }
+    match utxos[0]["status"]["block_height"].as_u64() {
+        Some(h) => Ok(BtcDeposit::Confirmed { refund_height: h + HLTC_LOCK_BTC_TIME as u64 }),
+        None => Ok(BtcDeposit::Pending),
+    }
+}
 
 pub async fn cancel_order(order_id: String) -> Result<String, String> {
     // On récupère le jeton d'annulation secret associé à cet ID
@@ -1978,6 +2016,18 @@ fn build_htlc_script(swap: &SwapContract) -> Result<bitcoin::ScriptBuf, String> 
         .into_script())
 }
 
+// Tarif BTC en sat/vB lu au nœud, +25 % de marge, borné : plancher 2, plafond 200. Secours : 3 si le nœud ne répond pas.
+// (1 sat/vB = minimum de relais : la TX passe en mempool mais peut y rester des heures si le réseau est chargé)
+async fn get_btc_fee_rate() -> u64 {
+    let rate = match node_call("GET", "/btc/fees", None).await {
+        Ok(s) => serde_json::from_str::<serde_json::Value>(&s).ok()
+            .and_then(|j| j["sat_per_vb"].as_f64()).unwrap_or(0.0),
+        Err(_) => 0.0,
+    };
+    if rate <= 0.0 { return 3; }
+    ((rate * 1.25).ceil() as u64).clamp(2, 200)
+}
+
 pub async fn send_btc_to_htlc(
     swap: SwapContract,
     master_seed_hex: String
@@ -1987,8 +2037,8 @@ pub async fn send_btc_to_htlc(
     let witness_script = build_htlc_script(&swap)?;
 
     let htlc_addr = Address::p2wsh(&witness_script, Network::Testnet).to_string();
-    // L'acheteur ajoute 500 sats au contrat pour couvrir les frais de Claim du vendeur !
-	let amount_btc = (swap.btc_amount_sats as f64 + 500.0) / 100_000_000.0;
+    // Le contrat contient EXACTEMENT le prix : les frais du claim sont payés par le vendeur
+	let amount_btc = swap.btc_amount_sats as f64 / 100_000_000.0;
 
     let tx_result = send_btc_direct(htlc_addr, amount_btc, master_seed_hex).await?;
 
@@ -2038,10 +2088,10 @@ pub async fn auto_claim_btc_swap(
     let utxo = &utxos[0]; 
     let txid = Txid::from_str(&utxo.txid).unwrap();
     let value = utxo.value;
-    let fee_sats = 500u64;
+    let fee_sats = get_btc_fee_rate().await * HTLC_SPEND_VBYTES;
     
-    if value <= fee_sats {
-        return Err("❌ Montant HTLC trop faible pour payer les frais.".to_string());
+    if value <= fee_sats + 546 { // la sortie doit rester au-dessus de la limite anti-poussière
+        return Err(format!("❌ Montant HTLC ({} sats) trop faible pour payer les frais ({} sats).", value, fee_sats));
     }
 
     let txin = TxIn {
@@ -2103,7 +2153,7 @@ pub async fn auto_claim_btc_swap(
             }
 
             if json["success"].as_bool().unwrap_or(false) {
-                Ok(format!("🎉 CLAIM BTC RÉUSSI ! TXID : {}...", &json["txid"].as_str().unwrap_or("")[0..10]))
+                Ok(format!("📡 CLAIM BTC DIFFUSÉ (en attente de confirmation) ! TXID : {}...", json["txid"].as_str().unwrap_or("").get(0..10).unwrap_or("?")))
             } else {
                 Err(format!("❌ Erreur Nœud : {}", json["error"].as_str().unwrap_or("Rejeté")))
             }
@@ -2148,10 +2198,10 @@ pub async fn refund_btc_swap(
     let utxo = &utxos[0]; 
     let txid = Txid::from_str(&utxo.txid).unwrap();
     let value = utxo.value;
-    let fee_sats = 500u64;
+    let fee_sats = get_btc_fee_rate().await * HTLC_SPEND_VBYTES;
     
-    if value <= fee_sats {
-        return Err("❌ Montant HTLC trop faible pour payer les frais.".to_string());
+    if value <= fee_sats + 546 { // la sortie doit rester au-dessus de la limite anti-poussière
+        return Err(format!("❌ Montant HTLC ({} sats) trop faible pour payer les frais ({} sats).", value, fee_sats));
     }
 
     let txin = TxIn {
@@ -2209,9 +2259,14 @@ pub async fn refund_btc_swap(
             }
 
             if json["success"].as_bool().unwrap_or(false) {
-                Ok(format!("🎉 REFUND BTC RÉUSSI ! TXID : {}...", &json["txid"].as_str().unwrap_or("")[0..10]))
+                Ok(format!("📡 REFUND BTC DIFFUSÉ (en attente de confirmation) ! TXID : {}...", json["txid"].as_str().unwrap_or("").get(0..10).unwrap_or("?")))
             } else {
-                Err(format!("❌ Erreur Nœud BTC (délai non expiré ?) : {}", json["error"].as_str().unwrap_or("Rejeté")))
+                let err = json["error"].as_str().unwrap_or("Rejeté");
+                if err.contains("non-BIP68-final") {
+                    Err(format!("⏳ Délai BTC pas encore écoulé : le dépôt doit avoir {} confirmation(s). Réessaie après le prochain bloc BTC.", HLTC_LOCK_BTC_TIME))
+                } else {
+                    Err(format!("❌ Erreur Nœud BTC : {}", err))
+                }
             }
         },
         Err(e) => Err(e),
@@ -2230,8 +2285,11 @@ pub async fn send_btc_direct(
     use bitcoin::sighash::{SighashCache, EcdsaSighashType};
     use std::str::FromStr;
 
-    let amount_sats = (amount_btc * 100_000_000.0) as u64;
-    let fee_sats = 500u64; // Frais fixe sécurisé (500 sats)
+    let amount_sats = (amount_btc * 100_000_000.0).round() as u64; // round : pas de sat perdu par l'arrondi f64
+    let fee_rate = get_btc_fee_rate().await;
+    // Taille P2WPKH : 11 vB fixes + 68 vB par input + 31 vB par output (destinataire + monnaie)
+    let fee_for = |n_inputs: u64| fee_rate * (11 + 68 * n_inputs + 31 * 2);
+    let mut fee_sats = fee_for(1);
 
     // 1. DÉRIVATION DES CLÉS
     let seed = hex::decode(&master_seed_hex).map_err(|_| "Seed invalide")?;
@@ -2256,6 +2314,7 @@ pub async fn send_btc_direct(
     for utxo in utxos {
         total_in += utxo.value; // On lit la valeur AVANT de déplacer l'objet
         selected_utxos.push(utxo); // Le "move" se fait ici en toute sécurité
+        fee_sats = fee_for(selected_utxos.len() as u64); // chaque input ajouté alourdit la TX
         if total_in >= amount_sats + fee_sats { break; }
     }
 

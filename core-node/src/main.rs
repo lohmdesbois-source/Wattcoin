@@ -515,8 +515,13 @@ async fn main() {
 
                     let mut buy_idx = 0;
                     let mut sell_idx = 0;
+                    let mut used_hashes = HashSet::new();
 
                     while buy_idx < buys.len() && sell_idx < sells.len() {
+                        // UN hash HTLC = UN swap : un achat sans hash, ou dont le hash est déjà pris, est sauté
+                        let hash_ok = buys[buy_idx].htlc_hash.as_ref().map_or(false, |h| used_hashes.insert(h.clone()));
+                        if !hash_ok { buy_idx += 1; continue; }
+
                         let buy = &mut buys[buy_idx];
                         let sell = &mut sells[sell_idx];
 
@@ -539,9 +544,9 @@ async fn main() {
                                 htlc_hash: real_htlc_hash,
                             });
 
-                            buy.amount_flames -= matched_volume;
+                            // L'achat est consommé par CE swap (même partiel) : son hash ne resservira jamais
                             sell.amount_flames -= matched_volume;
-                            if buy.amount_flames == 0 { buy_idx += 1; }
+                            buy_idx += 1;
                             if sell.amount_flames == 0 { sell_idx += 1; }
                         } else {
                             break;
@@ -696,6 +701,8 @@ async fn main() {
                             };
                             let mut pool = miner_mempool.lock().unwrap();
                             pool.push(share_tx.clone());
+                            // Tour vérifié = le bloc qu'on mine (la purge ne garde que le bloc en cours et le suivant)
+                            wattcoin_core::network::SHARE_ROUNDS.lock().unwrap().insert(candidate_block.header.hash.clone(), candidate_block.header.index);
                             let tx_clone = share_tx.clone();
                             let peers_clone = Arc::clone(&miner_active_peers);
                             // On peut toujours appeler tokio::spawn depuis un spawn_blocking !
@@ -747,6 +754,10 @@ async fn main() {
 							if tx.tx_type != TransactionType::Coinbase {
 								if let Some(sig) = &tx.wots_signature {
 									chain.spent_key_images.insert(hex::encode(&sig.public_key));
+								}
+								// Les UTXO dépensés aussi (sinon ils ne sont marqués qu'au redémarrage)
+								for input in &tx.inputs {
+									chain.spent_key_images.insert(input.utxo_id.clone());
 								}
 							}
 						}
@@ -801,7 +812,11 @@ async fn main() {
                                 let mut current_mb_size = 1024; 
 
                                 {
-                                    let mp = mempool_seq.lock().unwrap();
+                                    // Mempool propre AVANT de séquencer : une seule TX en conflit ferait échouer le MicroBloc
+                                    let chain = chain_seq.lock().unwrap();
+                                    let mut mp = mempool_seq.lock().unwrap();
+                                    wattcoin_core::network::purge_mempool(&chain, &mut mp);
+                                    drop(chain);
                                     for tx in mp.iter() {
                                         let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
                                         let tx_hash_hex = hex::encode(tx.hash_data());
@@ -961,53 +976,18 @@ async fn main() {
                         });
                     }
                     
-                    let mut mp = miner_mempool.lock().unwrap();
-                    
-                    let cutoff_time = {
-                        if chain.current_height >= 1 {
-                            chain.get_block_by_height(chain.current_height - 1).unwrap().header.timestamp
-                        } else { 
-                            0 
-                        }
-                    };
+                    // PURGE UNIQUE : minées, conflits, HTLC réglés/expirés, parts périmées
+                    {
+                        let mut mp = miner_mempool.lock().unwrap();
+                        wattcoin_core::network::purge_mempool(&chain, &mut mp);
+                    }
 
-                    // on liste les HASHES des transactions fraîchement minées
-					let mined_hashes: Vec<_> = candidate_block.transactions.iter().map(|tx| tx.hash_data()).collect();
-					
-					mp.retain(|tx| {
-						// On compare les HASHES uniques
-						let not_in_block = !mined_hashes.contains(&tx.hash_data());
-						
-						let is_valid_share = match &tx.tx_type {
-							TransactionType::MiningShare { timestamp, .. } => *timestamp >= cutoff_time,
-							_ => true
-						};
-						not_in_block && is_valid_share
-					});
-					
-					{
-						let now = chrono::Utc::now().timestamp();
-						let mut dp = miner_dex_pool.lock().unwrap();
-						
-						// On déduit les montants qui ont été validés dans ce bloc
-						for tx in &candidate_block.transactions {
-							if let TransactionType::DexSettlement { swaps, .. } = &tx.tx_type {
-								for swap in swaps {
-									// Déduction côté Acheteur
-									if let Some(buy) = dp.iter_mut().find(|o| o.order_type == "buy" && o.htlc_hash.as_ref() == Some(&swap.htlc_hash)) {
-										buy.amount_flames = buy.amount_flames.saturating_sub(swap.watt_amount_flames);
-									}
-									// Déduction côté Vendeur
-									if let Some(sell) = dp.iter_mut().find(|o| o.order_type == "sell" && o.watt_address == swap.seller_watt_address && o.amount_flames >= swap.watt_amount_flames) {
-										sell.amount_flames = sell.amount_flames.saturating_sub(swap.watt_amount_flames);
-									}
-								}
-							}
-						}
-						// On purge UNIQUEMENT les ordres vidés ou expirés !
-						dp.retain(|o| o.amount_flames > 0 && o.expires_at > now);
-						println!("🧹 [DEX] Bloc forgé : Dark Pool mis à jour (ordres restants: {}).", dp.len());
-					}
+                    // DEX : seulement si NOTRE bloc est entré dans la chaîne (sinon ses swaps n'existent pas)
+                    if chain.get_block_by_height(candidate_block.header.index).map_or(false, |b| b.header.hash == candidate_block.header.hash) {
+                        let mut dp = miner_dex_pool.lock().unwrap();
+                        wattcoin_core::network::apply_block_to_dex(&mut dp, &candidate_block);
+                        println!("🧹 [DEX] Bloc forgé : Dark Pool mis à jour (ordres restants: {}).", dp.len());
+                    }
 					
                 } // Le verrou `chain` est enfin relâché proprement ici !
             }
