@@ -51,10 +51,10 @@ enum AppMessage {
     Info(String),
     QrScanned(String),
     DashboardData { 
-        balance_l1: f64, 
-        balance_l2: f64, 
-        balance_btc: f64,   
-		balance_wns: f64,
+        balance_l1: u64, // flames
+        balance_l2: u64, // flames
+        balance_btc: u64, // sats
+		balance_wns: u64, // flames
         price_usd: f64, 
         btc_price_usd: f64,
 		total_supply: u64, 
@@ -68,7 +68,7 @@ enum AppMessage {
     FileHashed(String, String),
 	L2StatusFetched(String),
 	DomainStatus(String),
-	TxWeightEstimated(usize, f64, f64),
+	TxWeightEstimated(usize, f64, u64), // (UTXOs, taille Mo, frais en flames)
 }
 
 struct WattcoinApp {
@@ -78,10 +78,10 @@ struct WattcoinApp {
     
     // STOCKAGE DES DONNÉES DU WALLET
     wallet_keys: Option<crate::WalletKeys>,
-    balance_l1: f64,
-	balance_l2: f64,
-    balance_btc: f64,     
-	balance_wns: f64,	
+    balance_l1: u64, // flames
+	balance_l2: u64, // flames
+    balance_btc: u64, // sats
+	balance_wns: u64, // flames
     watt_price_usd: f64,
     btc_price_usd: f64,
 	total_supply: u64,
@@ -109,7 +109,7 @@ struct WattcoinApp {
     transfer_from_l2: bool,
     transfer_to_l2: bool,
 	transfer_asset: String, // "WATT" ou "BTC"
-	tx_weight_estimate: Option<(usize, f64, f64)>,
+	tx_weight_estimate: Option<(usize, f64, u64)>,
 	
 	history_items: Vec<crate::HistoryItem>,
     history_tab: String, // "L1" ou "L2"
@@ -208,10 +208,10 @@ impl WattcoinApp {
             onboarding_step: OnboardingStep::Selection,
             
             wallet_keys: None,
-            balance_l1: 0.0,
-			balance_l2: 0.0,
-            balance_btc: 0.0,    
-			balance_wns: 0.0,
+            balance_l1: 0,
+			balance_l2: 0,
+            balance_btc: 0,
+			balance_wns: 0,
             watt_price_usd: 0.0,
             btc_price_usd: 0.0,
 			total_supply: 0, 
@@ -328,10 +328,10 @@ impl WattcoinApp {
                     let wns_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
                     if let Ok(res) = wns_client.get(&wns_url).send().await {
                         if let Ok(json) = res.json::<serde_json::Value>().await {
-                            return json["balance"].as_u64().unwrap_or(0) as f64 / 1_000_000_000.0;
+                            return json["balance"].as_u64().unwrap_or(0); // flames
                         }
                     }
-                    0.0
+                    0u64
                 });
 
                 let f_info = tokio::spawn(async move { crate::get_network_info().await });
@@ -343,8 +343,8 @@ impl WattcoinApp {
                 let (r_bal, r_btc_usd, r_btc_bal, r_wns, r_info, r_supply, r_jackpot) = 
                     tokio::join!(f_bal, f_btc_usd, f_btc_bal, f_wns, f_info, f_supply, f_jackpot);
 
-                let mut l1_balance = 0.0;
-                let mut l2_balance = 0.0;
+                let mut l1_balance = 0u64;
+                let mut l2_balance = 0u64;
                 if let Ok(Ok(balances)) = r_bal {
                     l1_balance = balances.l1;
                     l2_balance = balances.l2;
@@ -352,7 +352,7 @@ impl WattcoinApp {
                 
                 let btc_usd = r_btc_usd.unwrap_or(60_000.0);
                 let btc_balance = r_btc_bal.unwrap_or_else(|_| Ok(old_btc_balance)).unwrap_or(old_btc_balance);
-                let wns_balance = r_wns.unwrap_or(0.0);
+                let wns_balance = r_wns.unwrap_or(0);
 
                 let mut price_sats = 0;
                 let mut current_block_height = 0; 
@@ -1129,9 +1129,9 @@ impl eframe::App for WattcoinApp {
                                 ui.vertical_centered(|ui| {
                                     ui.label(egui::RichText::new("VALEUR TOTALE DU COFFRE").color(egui::Color32::GRAY).size(12.0));
                                     
-                                    let total_usd = (self.balance_l1 * self.watt_price_usd) + 
-                                                    (self.balance_l2 * self.watt_price_usd) + 
-                                                    (self.balance_btc * self.btc_price_usd);
+                                    // USD = estimation d'affichage : seul endroit où le f64 est légitime
+                                    let total_usd = ((self.balance_l1 + self.balance_l2) as f64 / 1_000_000_000.0 * self.watt_price_usd) + 
+										(self.balance_btc as f64 / 100_000_000.0 * self.btc_price_usd);
                                                     
                                     ui.heading(egui::RichText::new(format!("$ {:.2} USD", total_usd)).size(32.0).color(text_color));
                                     
@@ -1147,11 +1147,8 @@ impl eframe::App for WattcoinApp {
                                 // STATISTIQUES RÉSEAU
                                 ui.add_space(15.0);
                                 ui.vertical(|ui| {
-                                    let supply_watts = self.total_supply as f64 / 1_000_000_000.0;
-                                    let jackpot_watts = self.jackpot as f64 / 1_000_000_000.0;
-
-                                    ui.label(egui::RichText::new(format!("🌍 Supply : {:.9} WATT", supply_watts)).color(text_muted));
-                                    ui.label(egui::RichText::new(format!("🎰 Jackpot : {:.9} WATT", jackpot_watts)).color(egui::Color32::GOLD));
+                                    ui.label(egui::RichText::new(format!("🌍 Supply : {} WATT", crate::format_flames(self.total_supply))).color(text_muted));
+                                    ui.label(egui::RichText::new(format!("🎰 Jackpot : {} WATT", crate::format_flames(self.jackpot))).color(egui::Color32::GOLD));
                                 });
 
                                 ui.add_space(25.0);
@@ -1206,8 +1203,8 @@ impl eframe::App for WattcoinApp {
                                 ui.add_space(15.0);
                                 
                                 ui.vertical_centered(|ui| {
-                                    ui.heading(egui::RichText::new(format!("{:.9} WATT", self.balance_l1)).size(24.0).color(text_color));
-                                    let l1_usd = self.balance_l1 * self.watt_price_usd;
+                                    ui.heading(egui::RichText::new(format!("{} WATT", crate::format_flames(self.balance_l1))).size(24.0).color(text_color));
+                                    let l1_usd = self.balance_l1 as f64 / 1_000_000_000.0 * self.watt_price_usd;
                                     ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", l1_usd)).color(egui::Color32::GRAY));
                                 });
                                 
@@ -1250,8 +1247,8 @@ impl eframe::App for WattcoinApp {
                                 ui.add_space(15.0);
 								
                                 ui.vertical_centered(|ui| {
-                                    ui.heading(egui::RichText::new(format!("{:.9} WATT", self.balance_l2)).size(24.0).color(text_color));
-                                    let l2_usd = self.balance_l2 * self.watt_price_usd;
+                                    ui.heading(egui::RichText::new(format!("{} WATT", crate::format_flames(self.balance_l2))).size(24.0).color(text_color));
+                                    let l2_usd = self.balance_l2 as f64 / 1_000_000_000.0 * self.watt_price_usd;
                                     ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", l2_usd)).color(egui::Color32::GRAY));
                                 });
                                 
@@ -1270,8 +1267,8 @@ impl eframe::App for WattcoinApp {
                                 ui.add_space(10.0);
 
                                 ui.vertical_centered(|ui| {
-                                    ui.heading(egui::RichText::new(format!("{:.9} WATT", self.balance_wns)).size(24.0).color(text_color));
-                                    let wns_usd = self.balance_wns * self.watt_price_usd;
+                                    ui.heading(egui::RichText::new(format!("{} WATT", crate::format_flames(self.balance_wns))).size(24.0).color(text_color));
+                                    let wns_usd = self.balance_wns as f64 / 1_000_000_000.0 * self.watt_price_usd;
                                     ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", wns_usd)).color(egui::Color32::GRAY));
                                 });
                                 
@@ -1314,8 +1311,8 @@ impl eframe::App for WattcoinApp {
                                 ui.add_space(15.0);
 
                                 ui.vertical_centered(|ui| {
-                                    ui.heading(egui::RichText::new(format!("{:.8} BTC", self.balance_btc)).size(24.0).color(text_color));
-                                    let btc_usd = self.balance_btc * self.btc_price_usd;
+                                    ui.heading(egui::RichText::new(format!("{} BTC", crate::format_sats(self.balance_btc))).size(24.0).color(text_color));
+                                    let btc_usd = self.balance_btc as f64 / 100_000_000.0 * self.btc_price_usd;
                                     ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", btc_usd)).color(egui::Color32::GRAY));
                                 });
                                 
@@ -1434,13 +1431,12 @@ impl eframe::App for WattcoinApp {
                             }
 
                             if (response_amt.changed() || tip_changed) && self.transfer_asset == "WATT" {
-                                let safe_amt = self.amount_input.trim().replace(",", ".");
-                                let safe_tip = self.transfer_tip.trim().replace(",", ".");
-                                let amt_val = safe_amt.parse::<f64>().unwrap_or(0.0);
-                                let tip_val = safe_tip.parse::<f64>().unwrap_or(0.0);
+                                // Montant et pourboire en flames ENTIERS
+                                let amt_val = crate::parse_watt_to_flames(&self.amount_input).unwrap_or(0);
+                                let tip_val = crate::parse_watt_to_flames(&self.transfer_tip).unwrap_or(0);
                                 
                                 if let Some(keys) = &self.wallet_keys {
-                                    if amt_val > 0.0 {
+                                    if amt_val > 0 {
                                         let tx = self.tx.clone();
                                         let keys = keys.clone();
                                         let from_l2 = self.transfer_from_l2;
@@ -1458,13 +1454,13 @@ impl eframe::App for WattcoinApp {
                         });
                         
                         // L'AFFICHAGE DU POIDS ESTIMÉ
-                        if let Some((utxos, size_mb, fee_watt)) = self.tx_weight_estimate { 
+                        if let Some((utxos, size_mb, fee_flames)) = self.tx_weight_estimate {
                             ui.add_space(10.0);
                             let color = if size_mb > 16.0 { egui::Color32::RED } else if size_mb > 8.0 { egui::Color32::from_rgb(255, 165, 0) } else { egui::Color32::GREEN };
                             egui::Frame::none().fill(item_bg).inner_margin(8.0).rounding(4.0).show(ui, |ui| {
                                 ui.label(egui::RichText::new(format!("⚖ Poids estimé : {:.2} Mo ({} UTXOs utilisés)", size_mb, utxos)).color(color));
                                 // Affichage clair des frais de réseau pour l'utilisateur !
-                                ui.label(egui::RichText::new(format!("💸 Frais de réseau (Taxes + Pourboire) : {:.6} WATT", fee_watt)).color(egui::Color32::from_rgb(0, 240, 255)));
+                                ui.label(egui::RichText::new(format!("💸 Frais de réseau (Taxes + Pourboire) : {} WATT", crate::format_flames(fee_flames))).color(egui::Color32::from_rgb(0, 240, 255)));
                                 
                                 if size_mb > 16.0 {
                                     ui.label(egui::RichText::new("⚠ Transaction trop lourde ! Réduisez le montant pour utiliser moins d'UTXOs.").size(10.0).color(egui::Color32::RED));
@@ -1496,39 +1492,46 @@ impl eframe::App for WattcoinApp {
 							} else {
 								// 2. TOUT EST BON, ON RÉCUPÈRE LES VARIABLES PROPRES
 								let amount = self.amount_input.trim().replace(",", ".").parse::<f64>().unwrap();
-                                let tip = self.transfer_tip.trim().replace(",", ".").parse::<f64>().unwrap_or(0.0); // On capte le pourboire
 								let keys = self.wallet_keys.as_ref().unwrap().clone();
 								let recipient = self.recipient_input.trim().to_string();
 								let tx = self.tx.clone();
 								
 								if self.transfer_asset == "WATT" {
-									self.sync_message = "Création de la transaction quantique...".to_string();
-									let from_l2 = self.transfer_from_l2;
-									let to_l2 = self.transfer_to_l2;
+									// Montant et pourboire en flames ENTIERS (pourboire vide = 0)
+									let amount_flames = crate::parse_watt_to_flames(&self.amount_input).filter(|a| *a > 0);
+									let tip_flames = if self.transfer_tip.trim().is_empty() { Some(0) } else { crate::parse_watt_to_flames(&self.transfer_tip) };
 
-									tokio::spawn(async move {
-										let mut final_recipient = recipient.clone();
+									if let (Some(amount_flames), Some(tip_flames)) = (amount_flames, tip_flames) {
+										self.sync_message = "Création de la transaction quantique...".to_string();
+										let from_l2 = self.transfer_from_l2;
+										let to_l2 = self.transfer_to_l2;
 
-										// LA MAGIE WNS OPSEC : Traduction automatique de l'alias en RAM !
-										if final_recipient.ends_with(".watt") || final_recipient.ends_with(".chain") {
-											let _ = tx.send(AppMessage::Info("🔍 Recherche locale (OpSec) dans l'annuaire...".to_string())).await;
-											match crate::resolve_wns_domain_opsec(&final_recipient).await {
-												Ok(pubkey) => {
-													final_recipient = pubkey; // On remplace le nom par la vraie clé Kyber
-												},
-												Err(e) => {
-													let _ = tx.send(AppMessage::Error(e)).await;
-													return; // On annule l'envoi
+										tokio::spawn(async move {
+											let mut final_recipient = recipient.clone();
+
+											// LA MAGIE WNS OPSEC : Traduction automatique de l'alias en RAM !
+											if final_recipient.ends_with(".watt") || final_recipient.ends_with(".chain") {
+												let _ = tx.send(AppMessage::Info("🔍 Recherche locale (OpSec) dans l'annuaire...".to_string())).await;
+												match crate::resolve_wns_domain_opsec(&final_recipient).await {
+													Ok(pubkey) => {
+														final_recipient = pubkey; // On remplace le nom par la vraie clé Kyber
+													},
+													Err(e) => {
+														let _ = tx.send(AppMessage::Error(e)).await;
+														return; // On annule l'envoi
+													}
 												}
 											}
-										}
 
-										// On envoie à la vraie adresse finale (avec le tip !)
-										match crate::send_wattcoin(final_recipient, amount, tip, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, None, None, from_l2, to_l2).await {
-											Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
-											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
-										}
-									});
+											// On envoie à la vraie adresse finale (avec le tip !)
+											match crate::send_wattcoin(final_recipient, amount_flames, tip_flames, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex, None, None, from_l2, to_l2).await {
+												Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; },
+												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+											}
+										});
+									} else {
+										self.sync_message = "❌ Montant ou pourboire invalide (9 décimales max).".to_string();
+									}
 								} else if self.transfer_asset == "BTC" {
 									self.sync_message = "Création de la transaction Bitcoin via Tor...".to_string();
 									
@@ -1620,7 +1623,9 @@ impl eframe::App for WattcoinApp {
 												let sign = if item.tx_type == "send" { "-" } else { "+" };
 												let amount_color = if item.tx_type == "send" { egui::Color32::from_rgb(255, 80, 80) } else { text_color };
 												
-												ui.label(egui::RichText::new(format!("{}{} {}", sign, item.amount, item.coin))
+												// Unité de base → virgule posée selon la monnaie (9 décimales WATT, 8 décimales BTC)
+												let amount_txt = if item.coin == "BTC" { crate::format_sats(item.amount) } else { crate::format_flames(item.amount) };
+												ui.label(egui::RichText::new(format!("{}{} {}", sign, amount_txt, item.coin))
 													.strong()
 													.size(18.0)
 													.color(amount_color));
@@ -1686,19 +1691,20 @@ impl eframe::App for WattcoinApp {
 							if ui.add_enabled(!is_submitting_order, egui::Button::new("🚀 Soumettre l'ordre au réseau")).clicked() {
 								
 								// Nettoyage des virgules et des espaces
-								let safe_amt = self.dex_amount_input.trim().replace(",", ".");
-								let safe_price = self.dex_price_input.trim().replace(",", ".");
+								// Montant : décimal → flames en ENTIER (aucun f64). Prix : sats ENTIERS uniquement (le sat est indivisible).
+								let amt_flames = crate::parse_watt_to_flames(&self.dex_amount_input).filter(|a| *a > 0);
+								let price_sats = self.dex_price_input.trim().parse::<u64>().ok().filter(|p| *p > 0);
 
-								if let (Some(keys), Ok(amt), Ok(price)) = (&self.wallet_keys, safe_amt.parse::<f64>(), safe_price.parse::<f64>()) {
+								if let (Some(keys), Some(amt_flames), Some(price_sats)) = (&self.wallet_keys, amt_flames, price_sats) {
 									
 									let o_type = self.dex_order_type.clone();
 									let mut can_proceed = true;
 
 									// VÉRIFICATION DES SOLDES AVANT ENVOI
 									if o_type == "sell" {
-										let total_watt_needed = amt;
-										if (self.balance_l1 + self.balance_l2) < total_watt_needed {
-											self.sync_message = format!("❌ Solde WATT insuffisant. Requis : {:.9} WATT", total_watt_needed);
+										// Comparaison en flames, entier contre entier
+										if self.balance_l1 + self.balance_l2 < amt_flames {
+											self.sync_message = format!("❌ Solde WATT insuffisant. Requis : {} WATT", crate::format_flames(amt_flames));
 											can_proceed = false;
 										}
 									}
@@ -1730,14 +1736,14 @@ impl eframe::App for WattcoinApp {
                                         }
 
                                         tokio::spawn(async move {
-                                            match crate::submit_order(o_type, amt, price, keys.btc_address, keys.btc_pubkey_hex, keys.watt_address, hash_to_send).await {
+                                            match crate::submit_order(o_type, amt_flames, price_sats, keys.btc_address, keys.btc_pubkey_hex, keys.watt_address, hash_to_send).await {
                                                 Ok(_) => { let _ = tx.send(AppMessage::Info("✅ Ordre placé dans le Dark Pool !".to_string())).await; },
                                                 Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
                                             }
                                         });
                                     }
                                 } else {
-                                    self.sync_message = "❌ Champs invalides ou montants incorrects.".to_string();
+                                    self.sync_message = "❌ Montant invalide (9 décimales max) ou prix non entier (sats > 0).".to_string();
                                 }
                             }
 
@@ -1840,7 +1846,7 @@ impl eframe::App for WattcoinApp {
 													self.sync_message = "Vérification du verrou Bitcoin en cours...".to_string();
 													let tx = self.tx.clone();
 													let keys_clone = keys.clone();
-													let amount_watt = swap.watt_amount_flames as f64 / 1_000_000_000.0;
+													let amount_flames = swap.watt_amount_flames; // déjà en flames : aucune conversion
 													let recipient = swap.buyer_watt_address.clone();
 													let htlc_hash = swap.htlc_hash.clone();
 													
@@ -1855,7 +1861,7 @@ impl eframe::App for WattcoinApp {
 														// +1 : le lock entre au mieux dans le prochain bloc → HLTC_LOCK_TIME blocs pleins pour claim
 														let target_timeout = height + 1 + HLTC_LOCK_TIME;
 														match crate::send_wattcoin(
-															recipient, amount_watt, 0.0, keys_clone.kyber_secret_hex, 
+															recipient, amount_flames, 0, keys_clone.kyber_secret_hex,
 															keys_clone.watt_address, keys_clone.master_seed_hex, 
 															Some(htlc_hash), Some(target_timeout), // On utilise la copie !
 															false, false
@@ -1954,15 +1960,16 @@ impl eframe::App for WattcoinApp {
 						// LOGIQUE DU PRIX DYNAMIQUE
 						// Si le WATT a un prix (via le DEX), on calcule l'équivalent de 0.10 $ USD.
 						// S'il n'y a pas encore eu d'échange (0.0), on force un prix fixe de 10 WATT.
-						let ticket_price_watt = if self.watt_price_usd > 0.0000001 {
-							0.10 / self.watt_price_usd
+						// SEULE conversion USD → flames (le cours USD est par nature décimal), ensuite tout est entier
+						let ticket_price_flames: u64 = if self.watt_price_usd > 0.0000001 {
+							(0.10 / self.watt_price_usd * 1_000_000_000.0) as u64
 						} else {
-							10.0 
+							10 * 1_000_000_000
 						};
 
 						ui.vertical_centered(|ui| {
 							ui.label(egui::RichText::new("JACKPOT ACTUEL").color(egui::Color32::GRAY).size(14.0));
-							ui.heading(egui::RichText::new(format!("{:.9} WATT", self.jackpot as f64 / 1_000_000_000.0)).size(32.0).color(egui::Color32::GOLD));
+							ui.heading(egui::RichText::new(format!("{} WATT", crate::format_flames(self.jackpot))).size(32.0).color(egui::Color32::GOLD));
 							
 							let jackpot_usd = (self.jackpot as f64 / 1_000_000_000.0) * self.watt_price_usd;
 							ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", jackpot_usd)).color(egui::Color32::GRAY));
@@ -1980,17 +1987,15 @@ impl eframe::App for WattcoinApp {
 							ui.add_space(20.0);
 
 							ui.label(egui::RichText::new("Prix d'un ticket (Fixé à 0.10$) :").color(text_muted));
-							ui.heading(egui::RichText::new(format!("{:.9} WATT", ticket_price_watt)).size(24.0).color(egui::Color32::from_rgb(0, 240, 255)));
+							ui.heading(egui::RichText::new(format!("{} WATT", crate::format_flames(ticket_price_flames))).size(24.0).color(egui::Color32::from_rgb(0, 240, 255)));
 
 							ui.add_space(30.0);
 
 							if ui.add_sized([250.0, 50.0], egui::Button::new("🎟 Acheter un Ticket")).clicked() {
 								if let Some(keys) = &self.wallet_keys {
-									let ticket_price_flames = (ticket_price_watt * 1_000_000_000.0) as u64;
-									
 									// Vérification préalable du solde L1 de l'utilisateur
-									if self.balance_l1 < ticket_price_watt {
-										self.sync_message = format!("❌ Solde L1 insuffisant. Requis : {:.3} WATT", ticket_price_watt);
+									if self.balance_l1 < ticket_price_flames {
+										self.sync_message = format!("❌ Solde L1 insuffisant. Requis : {} WATT", crate::format_flames(ticket_price_flames));
 									} else {
 										self.sync_message = "Création du ticket quantique en cours...".to_string();
 										let tx = self.tx.clone();
@@ -2282,7 +2287,7 @@ impl eframe::App for WattcoinApp {
 
 						ui.horizontal(|ui| {
 							if ui.add_sized([180.0, 40.0], egui::Button::new("🔒 Staker & Rejoindre L2")).clicked() {
-								if let (Some(keys), Ok(amt)) = (&self.wallet_keys, self.l2_stake_amount.parse::<f64>()) {
+								if let (Some(keys), Some(amt)) = (&self.wallet_keys, crate::parse_watt_to_flames(&self.l2_stake_amount).filter(|a| *a > 0)) {
 									if self.l2_target_name.is_empty() || self.l2_sequencer_pubkey.is_empty() {
 										self.sync_message = "❌ Tous les champs sont requis.".to_string();
 									} else {
@@ -2381,7 +2386,7 @@ impl eframe::App for WattcoinApp {
 						ui.add_space(20.0);
 
 						if ui.add_sized([250.0, 40.0], egui::Button::new("🔒 Verrouiller et Transférer")).clicked() {
-							if let (Some(keys), Ok(amt)) = (&self.wallet_keys, self.bridge_amount.parse::<f64>()) {
+							if let (Some(keys), Some(amt)) = (&self.wallet_keys, crate::parse_watt_to_flames(&self.bridge_amount).filter(|a| *a > 0)) {
 								if self.bridge_l2_name.is_empty() || self.bridge_receiver_pubkey.is_empty() {
 									self.sync_message = "❌ Tous les champs sont requis.".to_string();
 								} else {
@@ -2492,7 +2497,7 @@ impl eframe::App for WattcoinApp {
 
 						if is_available {
 							if ui.add_sized([250.0, 40.0], egui::Button::new("🔥 Enregistrer le Domaine")).clicked() {
-								if let (Some(keys), Ok(fee_watt)) = (&self.wallet_keys, self.wns_bid_amount.parse::<f64>()) {
+								if let (Some(keys), Some(fee_flames)) = (&self.wallet_keys, crate::parse_watt_to_flames(&self.wns_bid_amount).filter(|a| *a > 0)) {
 									
 									let is_valid_watt = self.wns_domain_input.ends_with(".watt") && self.wns_domain_input.len() > 5;
 									let is_valid_chain = self.wns_domain_input.ends_with(".chain") && self.wns_domain_input.len() > 6;
@@ -2504,7 +2509,6 @@ impl eframe::App for WattcoinApp {
 										let tx = self.tx.clone();
 										let keys = keys.clone();
 										let domain = self.wns_domain_input.clone();
-										let fee_flames = (fee_watt * 1_000_000_000.0) as u64;
 										
 										tokio::spawn(async move {
 											// Plus besoin de passer l'action en paramètre !

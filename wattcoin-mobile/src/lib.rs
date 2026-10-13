@@ -102,7 +102,7 @@ pub struct WalletKeys {
 pub struct HistoryItem {
     pub id: String,
     pub tx_type: String,
-    pub amount: f64,
+    pub amount: u64, // unité de base : flames si coin = "WATT", sats si coin = "BTC"
     pub coin: String,
     pub date: String,
     pub status: String,
@@ -125,8 +125,8 @@ pub struct Order {
 	
 #[derive(Serialize)]
 pub struct Balances {
-    pub l1: f64,
-    pub l2: f64,
+    pub l1: u64, // en flames
+    pub l2: u64, // en flames
 }
 
 #[derive(Deserialize)]
@@ -457,9 +457,34 @@ pub async fn get_current_jackpot() -> Result<u64, String> {
     Ok(pot)
 }
 
+// "12.5" → 12_500_000_000 flames, en ENTIERS purs (aucun f64 : 0.3 WATT = 300 000 000 flames exactement)
+// Refuse : texte non numérique, plus de 9 décimales, dépassement u64.
+pub fn parse_watt_to_flames(input: &str) -> Option<u64> {
+    let s = input.trim().replace(',', ".");
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s.as_str(), ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() { return None; }
+    if frac_part.len() > 9 { return None; }
+    if !int_part.chars().all(|c| c.is_ascii_digit()) || !frac_part.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let int_val: u64 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
+    let frac_val: u64 = if frac_part.is_empty() { 0 } else { format!("{:0<9}", frac_part).parse().ok()? };
+    int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)
+}
+
+// 12_500_000_000 flames → "12.500000000" : division et reste ENTIERS, on pose juste la virgule après 9 chiffres
+pub fn format_flames(flames: u64) -> String {
+    format!("{}.{:09}", flames / 1_000_000_000, flames % 1_000_000_000)
+}
+
+// 150_000 sats → "0.00150000" : même principe, 8 chiffres pour le BTC
+pub fn format_sats(sats: u64) -> String {
+    format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000)
+}
 
 pub async fn submit_order(
-    order_type: String, amount: f64, price: f64, btc_address: String, 
+    order_type: String, amount_flames: u64, price_sats: u64, btc_address: String,
     btc_pubkey: String, watt_address: String, htlc_hash: Option<String> 
 ) -> Result<(), String> {
     // ANTI IDOR DEX : Création du Jeton d'annulation
@@ -470,9 +495,7 @@ pub async fn submit_order(
     // L'ID public est l'empreinte mathématique (SHA256) du jeton secret
     let id_hash = sha2::Sha256::digest(&cancel_token);
     let order_id = hex::encode(id_hash);
-
-    let amount_flames = (amount * 1_000_000_000.0) as u64; 
-	let price_sats = price as u64;
+	
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let expires_at = now + 7200; 
 
@@ -776,8 +799,8 @@ pub async fn get_balances(keys: WalletKeys) -> Result<Balances, String> {
     if cache_updated { save_cache(&cache); }
 
     Ok(Balances {
-        l1: l1_flames as f64 / 1_000_000_000.0,
-        l2: l2_flames as f64 / 1_000_000_000.0,
+        l1: l1_flames,
+        l2: l2_flames,
     })
 }
 
@@ -848,7 +871,7 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                 "En attente".to_string()
             };
 
-            let mut amt_to_add = 0f64;
+            let mut amt_to_add = 0u64;
             let mut label = String::new();
 
             // Détection des montants en clair
@@ -860,7 +883,7 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
                 || out.stealth_address == keys.watt_address 
             {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
-                    amt_to_add = amt as f64 / 1_000_000_000.0;
+                    amt_to_add = amt;
                     if out.stealth_address.starts_with("JACKPOT") { label = "Jackpot gagné ! 🎰".to_string(); } 
                     else if out.kyber_capsule.starts_with("HTLC_CLAIM") { label = "Swap Atomique Réclamé ⚡".to_string(); }
                     else if out.kyber_capsule.starts_with("HTLC_REFUND") { label = "Remboursement HTLC 🔙".to_string(); }
@@ -870,7 +893,7 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             }
             else if out.stealth_address.starts_with("pq_watt_") || out.stealth_address.starts_with("L2_WATT_") {
                 if try_decrypt_output(out, &sk_bytes, height, is_l2, micro_index, &mut cache, &mut cache_updated).is_some() {
-                    amt_to_add = out.amount as f64 / 1_000_000_000.0;
+                    amt_to_add = out.amount;
                     
                     if matches!(tx.tx_type, TransactionType::MicroCoinbase) {
                         label = "Frais Séquenceur ⚡".to_string();
@@ -883,7 +906,7 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             }
 
             // Si cet UTXO nous appartient, on l'ajoute individuellement !
-            if amt_to_add > 0.0 {
+            if amt_to_add > 0 {
                 let current_layer = if out.stealth_address.starts_with("L2_WATT_") { "L2".to_string() } else { "L1".to_string() };
                 let display_id = if is_l2 && micro_index > 0 { format!("MicroBloc #{}", micro_index) } else { format!("Bloc #{}", height) };
                 let status_full = format!("{} ({})", label, status_text);
@@ -1012,8 +1035,8 @@ pub async fn get_messages(keys: WalletKeys) -> Result<Vec<DataItem>, String> {
 
 pub async fn send_wattcoin(
     recipient_kyber_hex: String,
-    amount: f64,
-    tip_watt: f64, 
+    amount_in_flames: u64,
+    tip_flames: u64,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
     master_seed_hex: String,       
@@ -1030,9 +1053,6 @@ pub async fn send_wattcoin(
 
     let schedule = get_fee_schedule().await?; 
     let is_pure_l2 = spend_from_l2 && send_to_l2;
-
-    let amount_in_flames = (amount * 1_000_000_000.0).round() as u64;
-    let tip_flames = (tip_watt * 1_000_000_000.0) as u64; 
     
     let max_send = 50_000 * FLAME;
     if amount_in_flames > max_send {
@@ -1134,7 +1154,7 @@ pub async fn send_wattcoin(
     if cache_updated { save_cache(&cache); }
 
     if collected_flames < required_total {
-        return Err(format!("❌ Fonds insuffisants ! Besoin de {} WATT.", required_total as f64 / 1_000_000_000.0));
+        return Err(format!("❌ Fonds insuffisants ! Besoin de {} WATT.", format_flames(required_total)));
     }
 
     let selected_utxos_clone = selected_utxos.clone();
@@ -1539,7 +1559,7 @@ pub async fn buy_lottery_ticket(
 	if current_max_l2 > cache.last_scanned_micro_index { cache.last_scanned_micro_index = current_max_l2; cache_updated = true; }
 	if cache_updated { save_cache(&cache); }
 
-    if collected_flames < required_total { return Err(format!("❌ Fonds insuffisants. Besoin : {:.9} WATT", required_total as f64 / 1_000_000_000.0)); }
+    if collected_flames < required_total { return Err(format!("❌ Fonds insuffisants. Besoin : {} WATT", format_flames(required_total))); }
 
     let change_amount = collected_flames - required_total;
     let mut outputs = Vec::new();
@@ -1728,16 +1748,6 @@ pub async fn get_active_swaps(btc_address: String, watt_address: String) -> Resu
     Ok(merged_list)
 }
 
-
-pub async fn check_btc_contract_exists(htlc_hash: &str) -> Result<bool, String> {
-    let res_str = node_call("GET", &format!("/btc/htlc/exists/{}", htlc_hash), None).await
-        .unwrap_or_else(|_| r#"{"exists": false}"#.to_string()); 
-    let json: serde_json::Value = serde_json::from_str(&res_str).unwrap_or_default();
-    let exists = json["exists"].as_bool().unwrap_or(false); 
-    Ok(exists)
-}
-
-
 pub async fn claim_wattcoin_swap(secret: String, hash: String, amount_flames: u64, watt_address: String) -> Result<String, String> {
     // PAS DE KYBER/AES ICI ! Le Tribunal L1 doit pouvoir lire le montant exact.
     let claim_output = TransactionOutput {
@@ -1904,7 +1914,7 @@ pub fn save_miner_script(os: String, address: String) -> Result<String, String> 
 }
 
 
-pub async fn get_btc_balance(master_seed_hex: String, btc_address: Option<String>) -> Result<f64, String> {
+pub async fn get_btc_balance(master_seed_hex: String, btc_address: Option<String>) -> Result<u64, String> { // en sats
     use bitcoin::bip32::{Xpriv, DerivationPath};
     use bitcoin::{Network, Address, PrivateKey};
     use bitcoin::secp256k1::Secp256k1;
@@ -1924,7 +1934,7 @@ pub async fn get_btc_balance(master_seed_hex: String, btc_address: Option<String
     let res_str = node_call("GET", &format!("/btc/balance?address={}", address), None).await?;
 
     let json: serde_json::Value = serde_json::from_str(&res_str).map_err(|e| e.to_string())?;
-    Ok(json["balance"].as_f64().unwrap_or(0.0))
+    Ok(json["sats"].as_u64().unwrap_or(0))
 }
 
 pub async fn get_btc_history(btc_address: &str) -> Result<Vec<HistoryItem>, String> {
@@ -1979,14 +1989,13 @@ pub async fn get_btc_history(btc_address: &str) -> Result<Vec<HistoryItem>, Stri
             ("send".to_string(), (-diff) as u64)
         };
         
-        let amount_btc = amount_sats as f64 / 100_000_000.0;
         let display_status = if confirmed { "Confirmé" } else { "En attente" };
         let prefix = if diff > 0 { "Reçu" } else { "Envoyé" };
 
         history.push(HistoryItem {
             id: format!("{}...", &txid[0..15]),
             tx_type,
-            amount: amount_btc,
+            amount: amount_sats,
             coin: "BTC".to_string(),
             date: date_str,
             status: format!("{} ({})", prefix, display_status),
@@ -2437,7 +2446,7 @@ pub fn get_version() -> String {
 
 pub async fn stake_l2(
     l2_name: String,
-    stake_amount: f64,
+    amount_flames: u64,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
     sequencer_pubkey_hex: String,
@@ -2445,7 +2454,6 @@ pub async fn stake_l2(
 ) -> Result<String, String> {
     
     let schedule = get_fee_schedule().await?; 
-    let amount_flames = (stake_amount * 1_000_000_000.0) as u64;
     let mut num_inputs = 0;
     let mut fee = calculate_dynamic_fee(1, 2, false, &schedule);
     let mut required_total = amount_flames + fee;
@@ -2939,7 +2947,7 @@ pub fn try_decrypt_output(
 pub async fn bridge_to_l2(
     l2_target_name: String,
     receiver_pubkey: String,
-    amount_watt: f64,
+    amount_flames: u64,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
     master_seed_hex: String,
@@ -2951,7 +2959,6 @@ pub async fn bridge_to_l2(
     }
 
     let schedule = get_fee_schedule().await?; 
-    let amount_flames = (amount_watt * 1_000_000_000.0) as u64;
     let mut num_inputs = 0;
     let mut fee = calculate_dynamic_fee(1, 2, false, &schedule);
     let mut required_total = amount_flames + fee;
@@ -3197,7 +3204,7 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
                 "En attente".to_string()
             };
 
-            let mut amt_to_add = 0f64;
+            let mut amt_to_add = 0u64;
             let mut label = String::new();
 
             if out.stealth_address == format!("COINBASE_{}", keys.watt_address) 
@@ -3207,7 +3214,7 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
                 || out.stealth_address == keys.watt_address 
             {
                 if let Ok(amt) = out.aes_vault.parse::<u64>() {
-                    amt_to_add = amt as f64 / 1_000_000_000.0;
+                    amt_to_add = amt;
                     if out.stealth_address.starts_with("JACKPOT") { label = "Jackpot gagné ! 🎰".to_string(); } 
                     else if out.kyber_capsule.starts_with("HTLC_CLAIM") { label = "Swap Atomique Réclamé ⚡".to_string(); }
                     else if out.kyber_capsule.starts_with("HTLC_REFUND") { label = "Remboursement HTLC 🔙".to_string(); }
@@ -3220,7 +3227,7 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
                     let parts: Vec<&str> = payload_str.split('|').collect();
                     if parts.len() >= 2 {
                         if let Ok(amt) = parts[0].parse::<u64>() {
-                            amt_to_add = amt as f64 / 1_000_000_000.0;
+                            amt_to_add = amt;
                             if matches!(tx.tx_type, TransactionType::MicroCoinbase) { label = "Frais Séquenceur ⚡".to_string(); } 
                             else if out.stealth_address.starts_with("L2_WATT_") && !is_l2 { label = "Dépôt (Bridge L1 ➡ L2) 🌉".to_string(); } 
                             else { label = "Transfert".to_string(); }
@@ -3229,7 +3236,7 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
                 }
             }
 
-            if amt_to_add > 0.0 {
+            if amt_to_add > 0 {
                 let current_layer = if out.stealth_address.starts_with("L2_WATT_") { "L2".to_string() } else { "L1".to_string() };
                 let display_id = if is_l2 && micro_index > 0 { format!("MicroBloc #{}", micro_index) } else { format!("Bloc #{}", height) };
                 let status_full = format!("{} ({})", label, status_text);
@@ -3388,19 +3395,16 @@ pub async fn resolve_wns_domain_opsec(domain: &str) -> Result<String, String> {
 }
 
 pub async fn estimate_tx_weight(
-    amount: f64,
-    tip_watt: f64, 
+    amount_in_flames: u64,
+    tip_flames: u64, 
     sender_kyber_secret_hex: &str,
     sender_kyber_public_hex: &str, 
     spend_from_l2: bool,
     send_to_l2: bool
-) -> Result<(usize, f64, f64), String> { 
+) -> Result<(usize, f64, u64), String> { // (UTXOs, taille en Mo, frais en flames)
 
     let schedule = get_fee_schedule().await?; 
     let is_pure_l2 = spend_from_l2 && send_to_l2;
-
-    let amount_in_flames = (amount * 1_000_000_000.0) as u64;
-    let tip_flames = (tip_watt * 1_000_000_000.0) as u64; 
     
     let mut fee = calculate_dynamic_fee(1, 2, is_pure_l2, &schedule) + tip_flames; 
     let mut required_total = amount_in_flames + fee;
@@ -3487,9 +3491,7 @@ pub async fn estimate_tx_weight(
     let wots_signature_size = 90_000.0; 
     let exact_bytes = (num_inputs as f64 * 8_200.0) + (2.0 * 8_250.0) + wots_signature_size + 500.0; 
     let exact_size_mb = exact_bytes / (1024.0 * 1024.0);
-    let fee_watt = fee as f64 / 1_000_000_000.0;
-
-    Ok((num_inputs, exact_size_mb, fee_watt))
+    Ok((num_inputs, exact_size_mb, fee))
 }
 
 

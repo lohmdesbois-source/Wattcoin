@@ -1091,12 +1091,12 @@ pub async fn start_api_server(
 					let chain = &json["chain_stats"];
 					let funded = chain["funded_txo_sum"].as_u64().unwrap_or(0);
 					let spent = chain["spent_txo_sum"].as_u64().unwrap_or(0);
-					let balance_btc = (funded.saturating_sub(spent) as f64) / 100_000_000.0;
-					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": balance_btc})))
+					// En SATS entiers : Esplora compte déjà en sats, aucune raison de passer par un flottant
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"sats": funded.saturating_sub(spent)})))
 				}
 				Err(e) => {
 					println!("❌ [NODE BTC BALANCE] Erreur proxy : {}", e);
-					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"balance": 0.0})))
+					Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"sats": 0})))
 				}
 			}
 		});
