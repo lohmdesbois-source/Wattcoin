@@ -473,6 +473,21 @@ pub fn parse_watt_to_flames(input: &str) -> Option<u64> {
     int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)
 }
 
+// "0.0015" -> 150_000 sats, en ENTIERS purs (même principe que les flames, 8 décimales pour le BTC)
+pub fn parse_btc_to_sats(input: &str) -> Option<u64> {
+    let s = input.trim().replace(',', ".");
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s.as_str(), ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() { return None; }
+    if frac_part.len() > 8 { return None; }
+    if !int_part.chars().all(|c| c.is_ascii_digit()) || !frac_part.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let int_val: u64 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
+    let frac_val: u64 = if frac_part.is_empty() { 0 } else { format!("{:0<8}", frac_part).parse().ok()? };
+    int_val.checked_mul(100_000_000)?.checked_add(frac_val)
+}
+
 // 12_500_000_000 flames → "12.500000000" : division et reste ENTIERS, on pose juste la virgule après 9 chiffres
 pub fn format_flames(flames: u64) -> String {
     format!("{}.{:09}", flames / 1_000_000_000, flames % 1_000_000_000)
@@ -2046,14 +2061,12 @@ pub async fn send_btc_to_htlc(
     let witness_script = build_htlc_script(&swap)?;
 
     let htlc_addr = Address::p2wsh(&witness_script, Network::Testnet).to_string();
-    // Le contrat contient EXACTEMENT le prix : les frais du claim sont payés par le vendeur
-	let amount_btc = swap.btc_amount_sats as f64 / 100_000_000.0;
-
-    let tx_result = send_btc_direct(htlc_addr, amount_btc, master_seed_hex).await?;
+    // Le contrat contient EXACTEMENT le prix, en sats : aucun aller-retour par un flottant
+    let tx_result = send_btc_direct(htlc_addr, swap.btc_amount_sats, master_seed_hex).await?;
 
     let payload = serde_json::json!({
         "htlc_address": swap.htlc_hash,
-        "amount_btc": amount_btc,
+        "amount_sats": swap.btc_amount_sats,
     });
     let _ = node_call("POST", "/btc/send/to_htlc", Some(serde_json::to_string(&payload).unwrap().into_bytes())).await;
 
@@ -2284,7 +2297,7 @@ pub async fn refund_btc_swap(
 
 pub async fn send_btc_direct(
     recipient_address: String, 
-    amount_btc: f64,
+    amount_sats: u64,
     master_seed_hex: String // On a besoin de la seed pour signer !
 ) -> Result<String, String> {
     
@@ -2293,8 +2306,7 @@ pub async fn send_btc_direct(
     use bitcoin::absolute::LockTime;
     use bitcoin::sighash::{SighashCache, EcdsaSighashType};
     use std::str::FromStr;
-
-    let amount_sats = (amount_btc * 100_000_000.0).round() as u64; // round : pas de sat perdu par l'arrondi f64
+	
     let fee_rate = get_btc_fee_rate().await;
     // Taille P2WPKH : 11 vB fixes + 68 vB par input + 31 vB par output (destinataire + monnaie)
     let fee_for = |n_inputs: u64| fee_rate * (11 + 68 * n_inputs + 31 * 2);

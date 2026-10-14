@@ -1166,19 +1166,8 @@ impl eframe::App for WattcoinApp {
                                 ui.add_space(10.0);
 
                                 if let Some(keys) = &self.wallet_keys {
-									// 1. L'Adresse Courte (Pour le minage et l'identification)
-									ui.label(egui::RichText::new("⛏ Adresse de Minage (Légère) :").color(egui::Color32::from_rgb(255, 165, 0)));
-									ui.horizontal(|ui| {
-										ui.label(egui::RichText::new(&keys.watt_short_address).monospace().color(egui::Color32::DARK_GRAY));
-										if ui.button("📋 Copier").clicked() {
-											set_clipboard_text(ui.ctx(), &keys.watt_short_address);
-										}
-									});
-									
-									ui.add_space(8.0);
-									
-									// 2. La Longue Clé Kyber (Pour les transferts chiffrés)
-									ui.label(egui::RichText::new("🔒 Clé de Réception (Chiffrement Kyber) :").color(egui::Color32::GRAY));
+									// Adresse de réception unique : la clé Kyber (l'adresse courte est dans Paramètres)
+									ui.label(egui::RichText::new("🔒 Adresse de Réception (Kyber) :").color(egui::Color32::GRAY));
                                     let addr = &keys.watt_address;
                                     let display_addr = if addr.len() > 16 { format!("{}...", &addr[0..16]) } else { addr.clone() };
                                     
@@ -1486,12 +1475,8 @@ impl eframe::App for WattcoinApp {
 								self.sync_message = "❌ Erreur : L'adresse de destination est vide.".to_string();
 							} else if self.amount_input.trim().is_empty() {
 								self.sync_message = "❌ Erreur : Le montant est vide.".to_string();
-							} else if let Err(_) = self.amount_input.trim().replace(",", ".").parse::<f64>() {
-								// Le .trim() nettoie les espaces invisibles, le replace() gère les virgules accidentelles
-								self.sync_message = "❌ Erreur : Format du montant invalide (ex: 10.5).".to_string();
 							} else {
-								// 2. TOUT EST BON, ON RÉCUPÈRE LES VARIABLES PROPRES
-								let amount = self.amount_input.trim().replace(",", ".").parse::<f64>().unwrap();
+								// 2. ON RÉCUPÈRE LES VARIABLES PROPRES (chaque branche valide son montant en ENTIER)
 								let keys = self.wallet_keys.as_ref().unwrap().clone();
 								let recipient = self.recipient_input.trim().to_string();
 								let tx = self.tx.clone();
@@ -1533,16 +1518,21 @@ impl eframe::App for WattcoinApp {
 										self.sync_message = "❌ Montant ou pourboire invalide (9 décimales max).".to_string();
 									}
 								} else if self.transfer_asset == "BTC" {
-									self.sync_message = "Création de la transaction Bitcoin via Tor...".to_string();
-									
-									tokio::spawn(async move {
-										match crate::send_btc_direct(recipient, amount, keys.master_seed_hex).await {
-											Ok(msg) => {
-												let _ = tx.send(AppMessage::Info(msg)).await;
-											},
-											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
-										}
-									});
+									// Montant en sats ENTIERS (8 décimales max)
+									if let Some(amount_sats) = crate::parse_btc_to_sats(&self.amount_input).filter(|a| *a > 0) {
+										self.sync_message = "Création de la transaction Bitcoin via Tor...".to_string();
+										
+										tokio::spawn(async move {
+											match crate::send_btc_direct(recipient, amount_sats, keys.master_seed_hex).await {
+												Ok(msg) => {
+													let _ = tx.send(AppMessage::Info(msg)).await;
+												},
+												Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+											}
+										});
+									} else {
+										self.sync_message = "❌ Montant BTC invalide (8 décimales max).".to_string();
+									}
 								}
 							}
 						}
@@ -1767,13 +1757,12 @@ impl eframe::App for WattcoinApp {
 										
 										let role = if is_buyer { "🔴 ACHETEUR (Vous payez BTC, recevez WATT)" } else { "🔴 VENDEUR (Vous payez WATT, recevez BTC)" };
 										ui.label(egui::RichText::new(role).strong());
-										let watt_amt = swap.watt_amount_flames as f64 / 1_000_000_000.0;
-										let btc_amt = swap.btc_amount_sats as f64 / 100_000_000.0;
-										let watt_usd = watt_amt * self.watt_price_usd;
-										let btc_usd = btc_amt * self.btc_price_usd;
+										// USD = affichage seulement
+										let watt_usd = swap.watt_amount_flames as f64 / 1_000_000_000.0 * self.watt_price_usd;
+										let btc_usd = swap.btc_amount_sats as f64 / 100_000_000.0 * self.btc_price_usd;
 
 										ui.horizontal(|ui| {
-											ui.label(format!("Montant : {:.9} WATT", watt_amt));
+											ui.label(format!("Montant : {} WATT", crate::format_flames(swap.watt_amount_flames)));
 											ui.label(egui::RichText::new(format!("(≈ $ {:.2})", watt_usd)).color(egui::Color32::GRAY));
 											ui.label("↔");
 											ui.label(format!("{} Sats", swap.btc_amount_sats));
@@ -1914,9 +1903,8 @@ impl eframe::App for WattcoinApp {
 									let color = if order.order_type == "buy" { egui::Color32::GREEN } else { egui::Color32::RED };
 									ui.horizontal(|ui| {
 										ui.label(egui::RichText::new(&order.order_type.to_uppercase()).color(color).strong());
-										let watt_amt = order.amount_flames as f64 / 1_000_000_000.0;
-										let watt_usd = watt_amt * self.watt_price_usd;
-										ui.label(format!("{:.9} WATT", watt_amt));
+										let watt_usd = order.amount_flames as f64 / 1_000_000_000.0 * self.watt_price_usd;
+										ui.label(format!("{} WATT", crate::format_flames(order.amount_flames)));
 										ui.label(egui::RichText::new(format!("(≈ $ {:.2})", watt_usd)).color(egui::Color32::GRAY));
 										ui.label(format!("@ {} Sats", order.price_sats));
 										
@@ -2554,6 +2542,18 @@ impl eframe::App for WattcoinApp {
                                 ui.label(egui::RichText::new(&self.decrypted_seed).monospace().color(text_color));
                             });
                             
+                            // Adresse courte (minage uniquement) : visible seulement après déverrouillage
+                            if let Some(keys) = &self.wallet_keys {
+                                ui.add_space(15.0);
+                                ui.label(egui::RichText::new("⛏ Adresse de Minage (courte — ne pas utiliser pour recevoir) :").color(egui::Color32::from_rgb(255, 165, 0)));
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&keys.watt_short_address).monospace().color(egui::Color32::DARK_GRAY));
+                                    if ui.button("📋 Copier").clicked() {
+                                        set_clipboard_text(ui.ctx(), &keys.watt_short_address);
+                                    }
+                                });
+                            }
+                            
                             ui.add_space(15.0);
                             if ui.add_sized([300.0, 40.0], egui::Button::new("🖼 Afficher le QR Code")).clicked() { self.show_seed_qr = true; }
                             ui.add_space(5.0);
@@ -2682,10 +2682,14 @@ impl eframe::App for WattcoinApp {
                             
                             // 1. Calcul de l'URI complète avec le montant optionnel
                             let mut full_uri = self.payment_qr_data.clone();
-                            if let Ok(amt) = self.payment_qr_amount.parse::<f64>() {
-                                if amt > 0.0 {
-                                    full_uri = format!("{}?amount={}", self.payment_qr_data, self.payment_qr_amount);
-                                }
+                            // Montant validé en ENTIER puis réécrit proprement (ex: "0,5" → "0.50000000")
+                            let amount_txt = if is_btc {
+                                crate::parse_btc_to_sats(&self.payment_qr_amount).filter(|a| *a > 0).map(crate::format_sats)
+                            } else {
+                                crate::parse_watt_to_flames(&self.payment_qr_amount).filter(|a| *a > 0).map(crate::format_flames)
+                            };
+                            if let Some(txt) = amount_txt {
+                                full_uri = format!("{}?amount={}", self.payment_qr_data, txt);
                             }
 
                             // 2. Affichage du QR Code BEAUCOUP PLUS GROS (350.0)

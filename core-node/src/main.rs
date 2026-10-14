@@ -540,7 +540,8 @@ async fn main() {
                                 seller_btc_address: sell.btc_address.clone(),
                                 seller_btc_pubkey: sell.btc_pubkey.clone(),
                                 watt_amount_flames: matched_volume,
-                                btc_amount_sats: (matched_volume as f64 / 1_000_000_000.0 * clearing_price_sats as f64) as u64,
+                                // Calcul ENTIER : flames × sats/WATT ÷ 10^9 (u128 pour que la multiplication ne déborde jamais)
+                                btc_amount_sats: (matched_volume as u128 * clearing_price_sats as u128 / 1_000_000_000) as u64,
                                 htlc_hash: real_htlc_hash,
                             });
 
@@ -554,8 +555,8 @@ async fn main() {
                     }
 
                     if total_volume_flames > 0 {
-                        println!("\n⚖️ [DEX] Matching réussi → {} WATT à {} Sats", 
-                                 total_volume_flames as f64 / 1_000_000_000.0, clearing_price_sats);
+                        println!("\n⚖️ [DEX] Matching réussi → {}.{:09} WATT à {} Sats", 
+                                 total_volume_flames / 1_000_000_000, total_volume_flames % 1_000_000_000, clearing_price_sats);
 
                         dex_settlement_tx = Some(Transaction {
                             tx_type: TransactionType::DexSettlement { 
