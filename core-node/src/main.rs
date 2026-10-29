@@ -51,6 +51,11 @@ async fn main() {
     let is_relay_mode = arg2 == "--relay";
     let miner_address = if is_relay_mode { String::from("RELAY_NODE_NO_MINING") } else { arg2 };
     let peer_target = clean_args.get(3).cloned();
+	
+    if !is_relay_mode && !wattcoin_core::transaction::is_owner_address(&miner_address) {
+        eprintln!("🛑 Adresse de minage invalide : attendu <kyber>.<R_hex> (copiée depuis le wallet) ou <R_hex> (64 caractères hex).");
+        return;
+    }
 
     println!("🔥 DÉMARRAGE DU NŒUD CYPHERPUNK (v{}) ...", env!("CARGO_PKG_VERSION"));
 	
@@ -483,7 +488,7 @@ async fn main() {
                             
                             // Génération WOTS+ (master_seed aléatoire, index 0)
                             let master_seed: [u8; 32] = rand::random();
-                            chunk_keys.push(wots::Wots::generate_keypair(&master_seed, 0));
+                            chunk_keys.push(wots::OneTimeKey::generate(&master_seed, 0));
                         }
                         chunk_keys
                     }));
@@ -568,7 +573,7 @@ async fn main() {
                             outputs: vec![],
                             fee: 0,
                             public_key: "DEX_SETTLEMENT_ON_CHAIN".to_string(), 
-							wots_signature: None,
+							wots_signature: None, owners: vec![],
                         });
                     }
                 }
@@ -698,7 +703,7 @@ async fn main() {
                                 inputs: vec![], outputs: vec![], fee: 0,
                                 // On sépare par des |
 								public_key: format!("{}|{}|{}", candidate_block.header.l2_root, candidate_block.header.tx_root, candidate_block.header.nonce), 
-								wots_signature: None,
+								wots_signature: None, owners: vec![],
                             };
                             let mut pool = miner_mempool.lock().unwrap();
                             pool.push(share_tx.clone());
@@ -752,14 +757,12 @@ async fn main() {
 								wattcoin_core::api::LAST_PRICE_SATS.store(*clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
 							}
 
-							if tx.tx_type != TransactionType::Coinbase {
-								if let Some(sig) = &tx.wots_signature {
-									chain.spent_key_images.insert(hex::encode(&sig.public_key));
-								}
-								// Les UTXO dépensés aussi (sinon ils ne sont marqués qu'au redémarrage)
-								for input in &tx.inputs {
-									chain.spent_key_images.insert(input.utxo_id.clone());
-								}
+							for k in tx.one_time_keys() {
+								chain.spent_key_images.insert(k);
+							}
+							// Les UTXO dépensés aussi (sinon ils ne sont marqués qu'au redémarrage)
+							for input in &tx.inputs {
+								chain.spent_key_images.insert(input.utxo_id.clone());
 							}
 						}
 
@@ -767,11 +770,11 @@ async fn main() {
                         chain.update_target(); 
                         
                         let l1_parent_hash = candidate_block.header.hash.clone();
-                        let sequencer_keys = l2_keys.clone();
+                        let sequencer_keys = l2_keys; // déplacées, jamais copiées : une clé = une signature
                         let mempool_seq = Arc::clone(&miner_mempool);
                         let active_peers_seq = Arc::clone(&miner_active_peers);
 						
-						let l2_pubkeys: Vec<String> = sequencer_keys.iter().map(|k| hex::encode(&k.1)).collect();
+						let l2_pubkeys: Vec<String> = sequencer_keys.iter().map(|k| hex::encode(k.public_key())).collect();
                         
                         // On prépare la blockchain et le fichier L2 pour l'état local
                         let chain_seq = Arc::clone(&miner_chain);
@@ -781,6 +784,8 @@ async fn main() {
                             println!("🛑 [L2 SEQUENCER] Fin de règne prématurée (Nouveau bloc L1 miné).");
                             task.abort(); // Coupe instantanément le thread asynchrone
                         }
+						
+                        let seq_reward_addr = format!("L2_WATT_PUB_{}", miner_address_clone);
 
                         // COURONNEMENT : On lance le nouveau et on garde son contrôle (JoinHandle)
                         let sequencer_handle = tokio::spawn(async move {
@@ -803,6 +808,7 @@ async fn main() {
 
                             // COMPTEUR DE CLÉS INDÉPENDANT DU CHRONOMÈTRE
                             let mut current_key_index = 0;
+                            let mut sequencer_keys = sequencer_keys.into_iter(); // consommées dans l'ordre 0..127
 
                             // 128 représente le budget de clés dispo, on boucle 128 secondes max
                             for _ in 0..128 {
@@ -844,14 +850,15 @@ async fn main() {
                                 let true_tx_count = txs_to_sequence.len(); 
                                 
                                 // ON UTILISE LE BON INDEX DE CLÉ
-                                let keypair = &sequencer_keys[current_key_index];
+                                let Some(keypair) = sequencer_keys.next() else { break };
+                                let seq_pk_hex = hex::encode(keypair.public_key());
 
                                 let lottery_tax = expected_fees / 100;
                                 let sequencer_reward = expected_fees - lottery_tax;
 
                                 let mut coinbase_outputs = vec![
                                     wattcoin_core::transaction::TransactionOutput {
-                                        stealth_address: format!("L2_WATT_{}", hex::encode(&keypair.1)),
+                                        stealth_address: seq_reward_addr.clone(),
                                         kyber_capsule: format!("MICRO_COINBASE_{}", global_l2_index), 
                                         aes_vault: sequencer_reward.to_string(),
                                         amount: sequencer_reward,
@@ -873,7 +880,7 @@ async fn main() {
                                     outputs: coinbase_outputs,
                                     fee: 0,
                                     public_key: "MICRO_COINBASE".to_string(),
-									wots_signature: None,
+									wots_signature: None, owners: vec![],
                                 };
 
                                 txs_to_sequence.insert(0, micro_coinbase);
@@ -887,7 +894,7 @@ async fn main() {
                                     key_index: current_key_index as u32, // ON GRAVE LE BON INDEX
                                     timestamp: chrono::Utc::now().timestamp(),
                                     transactions: txs_to_sequence,
-                                    sequencer_pubkey: hex::encode(&keypair.1),
+                                    sequencer_pubkey: seq_pk_hex.clone(),
                                     sequencer_reward_address: "FEE_GOES_TO_NEXT_L1_MINER".to_string(), 
                                     sequencer_sig: wots::WotsSignature { index: 0, public_key: vec![], signature_bytes: vec![] },
                                     merkle_proof: l2_pubkeys.clone(), 
@@ -912,12 +919,7 @@ async fn main() {
 								let mut hash_arr = [0u8; 64];
 								hash_arr.copy_from_slice(&hasher.finalize());
 
-								micro_block.sequencer_sig = wots::Wots::sign(
-									&keypair.0, 
-									micro_block.micro_index,
-									&hash_arr, 
-									&keypair.1 
-								);
+								micro_block.sequencer_sig = keypair.sign(&hash_arr); // la clé est consommée ici
 
                                 // On valide LOCALEMENT via le Tribunal L2 avant de diffuser !
                                 let is_valid_locally = {

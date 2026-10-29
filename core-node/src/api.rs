@@ -333,51 +333,6 @@ pub async fn start_api_server(
             if !tx.is_valid() {
                 return warp::reply::with_status(warp::reply::json(&"❌ Math ou signature invalide"), warp::http::StatusCode::BAD_REQUEST);
             }
-
-            if tx.tx_type != crate::transaction::TransactionType::Coinbase {
-                let chain_lock = chain_arc.lock().unwrap();
-                let pool_lock = mempool.lock().unwrap();
-				
-				// Une TX strictement identique déjà en mempool = succès (retry réseau), pas une erreur
-				let tx_hash = tx.hash_data();
-				if pool_lock.iter().any(|m| m.hash_data() == tx_hash) {
-					return warp::reply::with_status(warp::reply::json(&"✅ TX déjà en mempool"), warp::http::StatusCode::OK);
-				}
-
-                for input in &tx.inputs {
-                    if chain_lock.spent_key_images.contains(&input.utxo_id) { 
-                        return warp::reply::with_status(warp::reply::json(&"❌ UTXO déjà dépensé on-chain"), warp::http::StatusCode::BAD_REQUEST); 
-                    }
-                    if pool_lock.iter().any(|m_tx| m_tx.inputs.iter().any(|i| i.utxo_id == input.utxo_id)) { 
-                        return warp::reply::with_status(warp::reply::json(&"❌ UTXO déjà en cours de dépense dans la mempool"), warp::http::StatusCode::BAD_REQUEST); 
-                    }
-                }
-				
-				// VERROU API WOTS+
-				if let Some(sig) = &tx.wots_signature {
-					let ki = hex::encode(&sig.public_key);
-					
-					// 1. Vérification on-chain
-					if chain_lock.spent_key_images.contains(&ki) {
-						return warp::reply::with_status(warp::reply::json(&"❌ Clé WOTS+ déjà cramée on-chain"), warp::http::StatusCode::BAD_REQUEST); 
-					}
-					
-					// 2. Vérification mempool simplifiée
-					let mut in_mempool = false;
-					for m_tx in pool_lock.iter() {
-						if let Some(m_sig) = &m_tx.wots_signature {
-							if hex::encode(&m_sig.public_key) == ki {
-								in_mempool = true;
-								break;
-							}
-						}
-					}
-					
-					if in_mempool {
-						return warp::reply::with_status(warp::reply::json(&"❌ Clé WOTS+ déjà utilisée dans la mempool"), warp::http::StatusCode::BAD_REQUEST); 
-					}
-				}
-            }
             
             if matches!(tx.tx_type, TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. }) {
 				let chain_lock = chain_arc.lock().unwrap();

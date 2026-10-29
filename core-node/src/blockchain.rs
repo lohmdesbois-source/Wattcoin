@@ -141,6 +141,68 @@ impl Blockchain {
 		Ok(())
 	}
 
+	// Règle UNSTAKE unique : utilisée par validate, prepare et la mempool
+	// La caution désigne elle-même la clé qui peut la retirer : sortie "L2_STAKE_<clé WOTS+ de retrait>"
+	pub fn check_unstake_tx(&self, tx: &Transaction) -> Result<(), String> {
+		let l2_name = match &tx.tx_type {
+			TransactionType::L2Unstake { l2_name } => l2_name,
+			_ => return Ok(()),
+		};
+		if tx.inputs.len() != 1 { return Err("❌ UNSTAKE : exactement 1 input (la caution) requis.".into()); }
+		// La VRAIE clé qui signe (tx.public_key n'est pas couvert par la signature)
+		let signer = match &tx.wots_signature {
+			Some(sig) => hex::encode(&sig.public_key),
+			None => return Err("❌ UNSTAKE : transaction non signée.".into()),
+		};
+		let lock_id = &tx.inputs[0].utxo_id;
+		let expected_addr = format!("L2_STAKE_{}", signer);
+		for i in 0..=self.current_height {
+			if let Some(b) = self.get_block_by_height(i) {
+				for past_tx in &b.transactions {
+					if let TransactionType::L2Stake { l2_name: staked_name, .. } = &past_tx.tx_type {
+						if staked_name == l2_name
+							&& past_tx.outputs.iter().any(|o| &o.kyber_capsule == lock_id && o.stealth_address == expected_addr) {
+							return Ok(());
+						}
+					}
+				}
+			}
+		}
+		Err(format!("❌ UNSTAKE : aucune caution '{}' verrouillée pour la clé {}…", l2_name, signer.get(0..16).unwrap_or(&signer)))
+	}
+	
+	// Règle PROPRIÉTÉ unique : utilisée par validate (L1 + L2), prepare et la mempool
+	// Chaque input doit appartenir à la racine de SA preuve (tx.owners[input.owner]).
+	// Les signatures des preuves sont déjà vérifiées par is_valid() (hash complet, racines et feuilles distinctes).
+	pub fn check_ownership(&self, tx: &Transaction) -> Result<(), String> {
+		if tx.inputs.is_empty() || matches!(tx.tx_type, TransactionType::L2Unstake { .. }) { return Ok(()); }
+		for input in &tx.inputs {
+			let proof = tx.owners.get(input.owner as usize).ok_or("❌ PROPRIÉTÉ : input sans preuve de propriété.")?;
+			let utxo = self.find_utxo(&input.utxo_id).ok_or(format!("❌ PROPRIÉTÉ : UTXO introuvable ({})", input.utxo_id))?;
+			if !crate::transaction::can_spend(&utxo, &proof.root, &input.owner_otp) {
+				return Err(format!("❌ PROPRIÉTÉ : l'input {}… n'appartient pas au signataire.", input.utxo_id.get(0..16).unwrap_or(&input.utxo_id)));
+			}
+		}
+		Ok(())
+	}
+
+	// Récompenses système (coinbase, jackpot) encore immatures, identifiées par leur UTXO
+	fn immature_utxos(&self, height: u64) -> HashSet<String> {
+		let mut set = HashSet::new();
+		let scan_limit = height.saturating_sub(MATURITY_BLOCKS);
+		for i in (0..=self.current_height).rev() {
+			if i <= scan_limit { break; }
+			if let Some(b) = self.get_block_by_height(i) {
+				for past_tx in &b.transactions {
+					if matches!(past_tx.tx_type, TransactionType::Coinbase | TransactionType::LotteryPayout { .. }) {
+						for out in &past_tx.outputs { set.insert(out.kyber_capsule.clone()); }
+					}
+				}
+			}
+		}
+		set
+	}
+
     fn get_last_height(&self) -> u64 {
         if let Some(Ok((key, _))) = self.db.iter().rev().next() {
             let mut bytes = [0u8; 8];
@@ -200,10 +262,8 @@ impl Blockchain {
                         for input in &tx.inputs {
                             self.spent_key_images.insert(input.utxo_id.clone()); 
                         }
-                        if tx.tx_type != TransactionType::Coinbase {
-                            if let Some(sig) = &tx.wots_signature {
-                                self.spent_key_images.insert(hex::encode(&sig.public_key));
-                            }
+                        for k in tx.one_time_keys() {
+                            self.spent_key_images.insert(k);
                         }
                     }
                 }
@@ -219,10 +279,8 @@ impl Blockchain {
                             for input in &tx.inputs {
                                 self.spent_key_images.insert(input.utxo_id.clone());
                             }
-                            if tx.tx_type != TransactionType::MicroCoinbase {
-                                if let Some(sig) = &tx.wots_signature {
-                                    self.spent_key_images.insert(hex::encode(&sig.public_key));
-                                }
+                            for k in tx.one_time_keys() {
+                                self.spent_key_images.insert(k);
                             }
                         }
                     }
@@ -357,7 +415,7 @@ impl Blockchain {
 		self.get_jackpot_info(next_draw)
 	}
 
-    pub fn prepare_block_template(&mut self, mut transactions: Vec<Transaction>, miner_address: &str, l2_keys: Vec<(Vec<[u8; 32]>, Vec<u8>)>) -> (Block, BigUint, Vec<(Vec<[u8; 32]>, Vec<u8>)>) {
+    pub fn prepare_block_template(&mut self, mut transactions: Vec<Transaction>, miner_address: &str, l2_keys: Vec<wots::OneTimeKey>) -> (Block, BigUint, Vec<wots::OneTimeKey>) {
         let current_height = self.current_height + 1; 
         println!("\n⏳ Préparation du Bloc {}...", current_height);
 
@@ -395,25 +453,7 @@ impl Blockchain {
         // On garde 1 Mo de marge pour la Coinbase et les en-têtes
         let mut current_block_size = 1024 * 1024; 
 		
-        let mut immature_pubkeys = std::collections::HashSet::new();
-        let scan_limit = current_height.saturating_sub(MATURITY_BLOCKS);
-        
-        for i in (0..=self.current_height).rev() {
-            if i <= scan_limit { break; }
-            if let Some(block) = self.get_block_by_height(i) {
-                for past_tx in &block.transactions {
-                    if matches!(past_tx.tx_type, TransactionType::Coinbase | TransactionType::LotteryPayout { .. }) {
-                        for out in &past_tx.outputs {
-                            if out.stealth_address.starts_with("COINBASE_") {
-                                immature_pubkeys.insert(out.stealth_address.replace("COINBASE_", ""));
-                            } else if out.stealth_address.starts_with("JACKPOT_") {
-                                immature_pubkeys.insert(out.stealth_address.replace("JACKPOT_", ""));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let immature_utxos = self.immature_utxos(current_height);
 		
 		let mut block_htlc_settled = HashSet::new();
 
@@ -460,16 +500,8 @@ impl Blockchain {
                 }
                 // ====================================================================
 				
-                let mut immature = false;
-                if tx.tx_type != TransactionType::Coinbase {
-                    if let Some(sig) = &tx.wots_signature {
-						let pubkey_hex = hex::encode(&sig.public_key);
-						if immature_pubkeys.contains(&pubkey_hex) {
-							immature = true;
-						}
-					}
-                }
-                if immature { 
+                let immature = tx.inputs.iter().any(|i| immature_utxos.contains(&i.utxo_id));
+                if immature {
                     println!("⛔ Rejet : Tentative de dépense d'une récompense immature (Coinbase/Loto < {} blocs) !", MATURITY_BLOCKS);
                     continue; 
                 }
@@ -506,6 +538,18 @@ impl Blockchain {
 						continue; 
 					}
 					
+				}
+				
+				// Unstake - Même règle que le validateur (fonction unique)
+				if let Err(e) = self.check_unstake_tx(tx) {
+					println!("⛔ Rejet {}", e);
+					continue;
+				}
+				
+				// Propriété : chaque input appartient à la racine de sa preuve (tx.owners)
+				if let Err(e) = self.check_ownership(tx) {
+					println!("⛔ Rejet {}", e);
+					continue;
 				}
 				
 				if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
@@ -559,8 +603,8 @@ impl Blockchain {
                     }
 					
 					// LE BOUCLIER WOTS+ DU MINEUR
-                    if let Some(sig) = &tx.wots_signature {
-                        if temp_spent_images.contains(&hex::encode(&sig.public_key)) {
+                    for k in tx.one_time_keys() {
+                        if temp_spent_images.contains(&k) {
                             println!("⛔ Rejet : Clé WOTS+ déjà utilisée dans ce bloc !");
                             double_spend = true;
                         }
@@ -579,8 +623,8 @@ impl Blockchain {
 					//println!("⚠️ [POIDS] Le poids du bloc est de {} Ko.", current_block_size/1_024);
                     l1_total_fees += tx.fee; 
                     valid_transactions.push(tx.clone()); 
-                    if let Some(sig) = &tx.wots_signature {
-						temp_spent_images.insert(hex::encode(&sig.public_key));
+                    for k in tx.one_time_keys() {
+						temp_spent_images.insert(k);
 					}
 					// Enregistrement des UTXOs dépensés
                     for input in &tx.inputs {
@@ -815,7 +859,7 @@ impl Blockchain {
                     inputs: vec![],
                     outputs: vec![payout_output],
                     fee: 0,
-                    public_key: "LOTTERY_PAYOUT".to_string(), wots_signature: None,
+                    public_key: "LOTTERY_PAYOUT".to_string(), wots_signature: None, owners: vec![],
                 };
 
                 valid_transactions.push(lottery_payout_tx);
@@ -829,13 +873,13 @@ impl Blockchain {
             outputs: coinbase_outputs,
             fee: 0,
             public_key: "COINBASE_SIG".to_string(), 
-			wots_signature: None,
+			wots_signature: None, owners: vec![],
         };
         valid_transactions.insert(0, coinbase_tx);
 		
         let mut l2_pubkeys = Vec::with_capacity(128);
         for k in &l2_keys {
-            l2_pubkeys.push(hex::encode(&k.1)); 
+            l2_pubkeys.push(hex::encode(k.public_key())); 
         }
 
         let l2_root = if l2_pubkeys.is_empty() {
@@ -1156,27 +1200,7 @@ impl Blockchain {
 		// Accumulateur global pour TOUTE l'impression monétaire du bloc
         let mut total_coinbase_output = 0u64;
 		
-		let mut immature_pubkeys = std::collections::HashSet::new();
-		let scan_limit = current_height.saturating_sub(MATURITY_BLOCKS);
-		
-		for i in (0..=self.current_height).rev() {
-			if i <= scan_limit { break; }
-            if let Some(b) = self.get_block_by_height(i) {
-                for past_tx in &b.transactions {
-                    if matches!(past_tx.tx_type, TransactionType::Coinbase | TransactionType::MicroCoinbase | TransactionType::LotteryPayout { .. }) {
-                        for out in &past_tx.outputs {
-                            if out.stealth_address.starts_with("COINBASE_") {
-                                immature_pubkeys.insert(out.stealth_address.replace("COINBASE_", ""));
-                            } else if out.stealth_address.starts_with("JACKPOT_") {
-                                immature_pubkeys.insert(out.stealth_address.replace("JACKPOT_", ""));
-                            } else if out.kyber_capsule.starts_with("MICRO_COINBASE_") && out.stealth_address.starts_with("L2_WATT_") {
-                                immature_pubkeys.insert(out.stealth_address.replace("L2_WATT_", ""));
-                            }
-                        }
-                    }
-                }
-            }
-		}
+		let immature_utxos = self.immature_utxos(current_height);
 		
         let mut expected_subsidy = INITIAL_REWARD;
         for _ in 0..current_height {
@@ -1215,6 +1239,11 @@ impl Blockchain {
 			if tx.tx_type == TransactionType::MicroCoinbase {
 				return Err("❌ FRAUDE : Présence d'une MicroCoinbase L2 dans un bloc L1 !".to_string());
 			}
+			
+			// Signatures + maths, y compris pour les blocs reçus par synchro/fork
+			if !tx.is_valid() {
+				return Err("❌ FRAUDE : transaction invalide (maths ou signature).".into());
+			}
 
 			if let TransactionType::DexSettlement { clearing_price_sats, .. } = &tx.tx_type {
                 crate::api::LAST_PRICE_SATS.store(*clearing_price_sats, std::sync::atomic::Ordering::Relaxed);
@@ -1231,7 +1260,11 @@ impl Blockchain {
 					if utxo.amount != input.amount {
 						return Err(format!("❌ FRAUDE : montant d'input falsifié ({} déclaré, {} réel)", input.amount, utxo.amount));
 					}
+					if immature_utxos.contains(&input.utxo_id) {
+						return Err("❌ FRAUDE : dépense d'une récompense immature.".into());
+					}
                 }
+                self.check_ownership(tx)?;
             }
 
             // ====================================================================
@@ -1299,8 +1332,7 @@ impl Blockchain {
 				}
 			}
 
-			if let Some(sig) = &tx.wots_signature {
-				let ki = hex::encode(&sig.public_key);
+			for ki in tx.one_time_keys() {
 				if self.spent_key_images.contains(&ki) || !block_key_images.insert(ki) {
 					return Err("Tentative de double-dépense détectée !".to_string());
 				}
@@ -1340,27 +1372,8 @@ impl Blockchain {
 				
 			}
 			
-			if let TransactionType::L2Unstake { l2_name } = &tx.tx_type {
-				let mut is_legit_staker = false;
-				
-				// On fouille l'historique pour vérifier que ce signataire a bien misé des fonds sur ce L2
-				for i in 0..=self.current_height {
-					if let Some(b) = self.get_block_by_height(i) {
-						for past_tx in &b.transactions {
-							if let TransactionType::L2Stake { l2_name: staked_name, sequencer_pubkey } = &past_tx.tx_type {
-								// On vérifie que la clé publique de la transaction correspond à celle d'un vrai Séquenceur
-								if staked_name == l2_name && sequencer_pubkey == &tx.public_key {
-									is_legit_staker = true;
-								}
-							}
-						}
-					}
-				}
-				
-				if !is_legit_staker {
-					return Err(format!("❌ FRAUDE L2 : La clé {} n'a pas l'autorité pour Unstake le réseau {} (Aucun stake trouvé) !", tx.public_key, l2_name));
-				}
-			}
+			// Même règle que prepare_block_template (fonction unique)
+			self.check_unstake_tx(&tx)?;
 			
 			if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
 				if tx.outputs.is_empty() {
@@ -1609,8 +1622,15 @@ impl Blockchain {
                 if self.spent_key_images.contains(&input.utxo_id) || temp_spent.contains(&input.utxo_id) {
                     return Err("❌ FRAUDE L2 : Double dépense UTXO détectée dans le MicroBloc !".into());
                 }
+                // EXISTENCE + MONTANT RÉEL (L1 ou L2) : pas de planche à billets via un input inventé
+                match self.find_utxo(&input.utxo_id) {
+                    None => return Err(format!("❌ FRAUDE L2 : UTXO fantôme ({})", input.utxo_id)),
+                    Some(u) if u.amount != input.amount => return Err(format!("❌ FRAUDE L2 : montant d'input falsifié ({} déclaré, {} réel)", input.amount, u.amount)),
+                    _ => {}
+                }
                 temp_spent.insert(input.utxo_id.clone());
             }
+            self.check_ownership(tx)?;
 
             let is_pure_l2 = !tx.outputs.is_empty() && tx.outputs.iter().all(|out| out.stealth_address.starts_with("L2_WATT_"));
             if !is_pure_l2 {
@@ -1627,8 +1647,7 @@ impl Blockchain {
 
             expected_fees += tx.fee;
 
-            if let Some(sig) = &tx.wots_signature {
-                let ki = hex::encode(&sig.public_key);
+            for ki in tx.one_time_keys() {
                 if self.spent_key_images.contains(&ki) || temp_spent.contains(&ki) {
                     return Err("❌ FRAUDE L2 : Double dépense UTXO détectée dans le MicroBloc !".into());
                 }
@@ -1636,15 +1655,26 @@ impl Blockchain {
             }
         }
 
-        // 8. VÉRIFICATION DE LA MICRO-COINBASE (Pas de planche à billets !)
-        // Vérifier que l'output existe avant de le lire !
-        if micro_block.transactions[0].outputs.is_empty() {
-            return Err("❌ FRAUDE L2 : La MicroCoinbase ne contient aucun output !".into());
+        // 8. MICRO-COINBASE : structure EXACTE, payée au mineur du bloc L1 parent (Pas de planche à billets !)
+        //    L'adresse du mineur est scellée dans le PoW du parent : impossible à usurper.
+        let miner_address = parent_block.transactions.get(0)
+            .and_then(|tx| tx.outputs.get(0))
+            .map(|out| out.stealth_address.replace("COINBASE_", ""))
+            .unwrap_or_default();
+        let lottery_tax = expected_fees / 100;
+        let mut expected_outputs = vec![(format!("L2_WATT_PUB_{}", miner_address), expected_fees - lottery_tax)];
+        if lottery_tax > 0 {
+            expected_outputs.push(("LOTTERY_RESERVE".to_string(), lottery_tax));
         }
 
-        let actual_fees: u64 = micro_block.transactions[0].outputs[0].aes_vault.parse().unwrap_or(u64::MAX);
-        if actual_fees > expected_fees {
-            return Err(format!("❌ FRAUDE L2 : Le Séquenceur a imprimé {} Flames au lieu des {} collectés !", actual_fees, expected_fees));
+        let mc_outputs = &micro_block.transactions[0].outputs;
+        if mc_outputs.len() != expected_outputs.len() {
+            return Err(format!("❌ FRAUDE L2 : MicroCoinbase avec {} outputs au lieu de {} !", mc_outputs.len(), expected_outputs.len()));
+        }
+        for (out, (addr, amount)) in mc_outputs.iter().zip(&expected_outputs) {
+            if &out.stealth_address != addr || out.amount != *amount || out.aes_vault != amount.to_string() {
+                return Err(format!("❌ FRAUDE L2 : MicroCoinbase falsifiée (attendu {} Flames vers {}…) !", amount, addr.get(0..24).unwrap_or(addr)));
+            }
         }
 
         // 9. SAUVEGARDE SLED DÉFINITIVE
@@ -1781,12 +1811,29 @@ impl Blockchain {
     }
 	
 	pub fn find_utxo(&self, utxo_id: &str) -> Option<TransactionOutput> {
+        // 1. L1 : les blocs (y compris les sorties L2_WATT_ créées par un passage L1 → L2)
         for i in (0..=self.current_height).rev() {
             if let Some(block) = self.get_block_by_height(i) {
                 for tx in &block.transactions {
                     for out in &tx.outputs {
                         if out.kyber_capsule == utxo_id {
                             return Some(out.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // 2. L2 interne : les MicroBlocs (sorties créées sur le L2, monnaie rendue, MicroCoinbase)
+        if let Ok(l2_tree) = self.db.open_tree("l2_blocks") {
+            for item in l2_tree.iter().rev() {
+                if let Ok((_, value)) = item {
+                    if let Ok(mb) = bincode::deserialize::<crate::block::MicroBlock>(&value) {
+                        for tx in &mb.transactions {
+                            for out in &tx.outputs {
+                                if out.kyber_capsule == utxo_id {
+                                    return Some(out.clone());
+                                }
+                            }
                         }
                     }
                 }

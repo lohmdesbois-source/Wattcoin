@@ -55,7 +55,8 @@ enum AppMessage {
         balance_l2: u64, // flames
         balance_btc: u64, // sats
 		balance_wns: u64, // flames
-        price_usd: f64, 
+		balance_staked: Vec<(String, u64)>, // (nom L2, flames en caution)
+        price_usd: f64,
         btc_price_usd: f64,
 		total_supply: u64, 
         jackpot: u64,
@@ -82,6 +83,7 @@ struct WattcoinApp {
 	balance_l2: u64, // flames
     balance_btc: u64, // sats
 	balance_wns: u64, // flames
+	balance_staked: Vec<(String, u64)>, // nom L2,  flames
     watt_price_usd: f64,
     btc_price_usd: f64,
 	total_supply: u64,
@@ -212,6 +214,7 @@ impl WattcoinApp {
 			balance_l2: 0,
             balance_btc: 0,
 			balance_wns: 0,
+			balance_staked: Vec::new(),
             watt_price_usd: 0.0,
             btc_price_usd: 0.0,
 			total_supply: 0, 
@@ -298,6 +301,7 @@ impl WattcoinApp {
         if let Some(keys) = self.wallet_keys.clone() {
             let tx = self.tx.clone();
             let old_btc_balance = self.balance_btc; 
+            let old_staked = self.balance_staked.clone();
             
             tokio::spawn(async move {
                 // On lance TOUTES les requêtes en même temps (Parallélisme massif)
@@ -334,14 +338,17 @@ impl WattcoinApp {
                     0u64
                 });
 
+                let keys_4 = keys.clone();
+                let f_stake = tokio::spawn(async move { crate::get_staked_flames(keys_4.master_seed_hex).await });
+
                 let f_info = tokio::spawn(async move { crate::get_network_info().await });
                 let f_supply = tokio::spawn(async move { crate::get_total_supply().await });
                 let f_jackpot = tokio::spawn(async move { crate::get_current_jackpot().await });
 
                 // On attend que TOUTES les requêtes terminent 
                 // Le temps total sera dicté par la requête la plus lente, au lieu de les additionner !
-                let (r_bal, r_btc_usd, r_btc_bal, r_wns, r_info, r_supply, r_jackpot) = 
-                    tokio::join!(f_bal, f_btc_usd, f_btc_bal, f_wns, f_info, f_supply, f_jackpot);
+                let (r_bal, r_btc_usd, r_btc_bal, r_wns, r_stake, r_info, r_supply, r_jackpot) = 
+                    tokio::join!(f_bal, f_btc_usd, f_btc_bal, f_wns, f_stake, f_info, f_supply, f_jackpot);
 
                 let mut l1_balance = 0u64;
                 let mut l2_balance = 0u64;
@@ -353,6 +360,7 @@ impl WattcoinApp {
                 let btc_usd = r_btc_usd.unwrap_or(60_000.0);
                 let btc_balance = r_btc_bal.unwrap_or_else(|_| Ok(old_btc_balance)).unwrap_or(old_btc_balance);
                 let wns_balance = r_wns.unwrap_or(0);
+                let staked_balance = r_stake.unwrap_or(Ok(old_staked.clone())).unwrap_or(old_staked);
 
                 let mut price_sats = 0;
                 let mut current_block_height = 0; 
@@ -370,7 +378,7 @@ impl WattcoinApp {
                 let jackpot = r_jackpot.unwrap_or(Ok(0)).unwrap_or(0);
                 
                 let _ = tx.send(AppMessage::DashboardData { 
-                    balance_l1: l1_balance, balance_l2: l2_balance, balance_btc: btc_balance, balance_wns: wns_balance,
+                    balance_l1: l1_balance, balance_l2: l2_balance, balance_btc: btc_balance, balance_wns: wns_balance, balance_staked: staked_balance,
                     price_usd: watt_price_usd, btc_price_usd: btc_usd, total_supply, jackpot, current_block_height
                 }).await;
                 
@@ -444,7 +452,7 @@ impl WattcoinApp {
 
                 // LE WATCHTOWER : c'est l'état on-chain (WATT + BTC) qui décide
                 for swap in &swaps {
-                    let is_buyer = keys.watt_address == swap.buyer_watt_address;
+                    let is_buyer = crate::is_my_watt_address(&keys, &swap.buyer_watt_address);
 
                     // 1. État du HTLC WATT. Nœud injoignable → on garde le swap et on ne fait rien.
                     let st = match crate::get_htlc_status(&swap.htlc_hash).await {
@@ -700,11 +708,12 @@ impl eframe::App for WattcoinApp {
 						self.sync_message = "❌ Scan refusé : Contexte inattendu.".to_string();
 					}
 				},
-                AppMessage::DashboardData { balance_l1, balance_l2, balance_btc, balance_wns, price_usd, btc_price_usd, total_supply, jackpot, current_block_height } => {
+                AppMessage::DashboardData { balance_l1, balance_l2, balance_btc, balance_wns, balance_staked, price_usd, btc_price_usd, total_supply, jackpot, current_block_height } => {
                     self.balance_l1 = balance_l1;
                     self.balance_l2 = balance_l2;
                     self.balance_btc = balance_btc; 
 					self.balance_wns = balance_wns;
+					self.balance_staked = balance_staked;
                     
                     // PRIX DEX : On ignore le prix s'il est négatif !
                     if price_usd >= 0.0 {
@@ -1175,16 +1184,27 @@ impl eframe::App for WattcoinApp {
                                         ui.label(egui::RichText::new(display_addr).monospace().color(egui::Color32::DARK_GRAY));
                                         
                                         if ui.button("📋 Copier").clicked() {
-                                            #[cfg(not(target_os = "android"))]
-                                            ui.output_mut(|o| o.copied_text = addr.clone());
-                                            #[cfg(target_os = "android")]
-                                            copy_to_android_clipboard(&addr);
-                                            self.sync_message = "Adresse copiée dans le presse-papier !".to_string();
+                                            // Adresse JETABLE : une sous-adresse neuve "<kyber>.<R_i>" à chaque clic
+                                            match crate::new_receive_address(keys) {
+                                                Ok(fresh) => {
+                                                    #[cfg(not(target_os = "android"))]
+                                                    ui.output_mut(|o| o.copied_text = fresh.clone());
+                                                    #[cfg(target_os = "android")]
+                                                    copy_to_android_clipboard(&fresh);
+                                                    self.sync_message = "Adresse de réception neuve copiée !".to_string();
+                                                }
+                                                Err(e) => self.sync_message = format!("❌ {}", e),
+                                            }
                                         }
                                         if ui.button("📱 QR").clicked() {
-                                            self.payment_qr_data = format!("watt://{}", addr);
-                                            self.payment_qr_amount.clear();
-                                            self.show_payment_qr = true;
+                                            match crate::new_receive_address(keys) {
+                                                Ok(fresh) => {
+                                                    self.payment_qr_data = format!("watt://{}", fresh);
+                                                    self.payment_qr_amount.clear();
+                                                    self.show_payment_qr = true;
+                                                }
+                                                Err(e) => self.sync_message = format!("❌ {}", e),
+                                            }
                                         }
                                     });
                                 }
@@ -1219,16 +1239,27 @@ impl eframe::App for WattcoinApp {
                                         ui.label(egui::RichText::new(display_addr).monospace().color(egui::Color32::DARK_GRAY));
                                         
                                         if ui.button("📋 Copier").clicked() {
-                                            #[cfg(not(target_os = "android"))]
-                                            ui.output_mut(|o| o.copied_text = addr.clone());
-                                            #[cfg(target_os = "android")]
-                                            copy_to_android_clipboard(&addr);
-                                            self.sync_message = "Adresse copiée dans le presse-papier !".to_string();
+                                            // Adresse JETABLE : une sous-adresse neuve "<kyber>.<R_i>" à chaque clic
+                                            match crate::new_receive_address(keys) {
+                                                Ok(fresh) => {
+                                                    #[cfg(not(target_os = "android"))]
+                                                    ui.output_mut(|o| o.copied_text = fresh.clone());
+                                                    #[cfg(target_os = "android")]
+                                                    copy_to_android_clipboard(&fresh);
+                                                    self.sync_message = "Adresse de réception neuve copiée !".to_string();
+                                                }
+                                                Err(e) => self.sync_message = format!("❌ {}", e),
+                                            }
                                         }
                                         if ui.button("📱 QR").clicked() {
-                                            self.payment_qr_data = format!("watt://{}", addr);
-                                            self.payment_qr_amount.clear();
-                                            self.show_payment_qr = true;
+                                            match crate::new_receive_address(keys) {
+                                                Ok(fresh) => {
+                                                    self.payment_qr_data = format!("watt://{}", fresh);
+                                                    self.payment_qr_amount.clear();
+                                                    self.show_payment_qr = true;
+                                                }
+                                                Err(e) => self.sync_message = format!("❌ {}", e),
+                                            }
                                         }
                                     });
                                 }
@@ -1429,9 +1460,10 @@ impl eframe::App for WattcoinApp {
                                         let tx = self.tx.clone();
                                         let keys = keys.clone();
                                         let from_l2 = self.transfer_from_l2;
+                                        let to_l2 = self.transfer_to_l2;
                                         tokio::spawn(async move {
-                                            // On passe bien le tip_val à la fonction d'estimation
-                                            if let Ok((utxos, size, fee)) = crate::estimate_tx_weight(amt_val, tip_val, &keys.kyber_secret_hex, &keys.watt_address, from_l2, false).await {
+                                            // Mêmes cases que l'envoi réel : L2 pur (les 2 cochées) = tarif L2, sinon tarif L1
+                                            if let Ok((utxos, size, fee)) = crate::estimate_tx_weight(amt_val, tip_val, &keys.kyber_secret_hex, &keys.master_seed_hex, from_l2, to_l2).await {
                                                 let _ = tx.send(AppMessage::TxWeightEstimated(utxos, size, fee)).await;
                                             }
                                         });
@@ -1726,7 +1758,12 @@ impl eframe::App for WattcoinApp {
                                         }
 
                                         tokio::spawn(async move {
-                                            match crate::submit_order(o_type, amt_flames, price_sats, keys.btc_address, keys.btc_pubkey_hex, keys.watt_address, hash_to_send).await {
+                                            // L'ordre annonce "<kyber>.<R_0>" : claim/refund paieront une adresse dépensable
+                                            let my_addr = match crate::my_public_address(&keys) {
+                                                Ok(a) => a,
+                                                Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; return; }
+                                            };
+                                            match crate::submit_order(o_type, amt_flames, price_sats, keys.btc_address, keys.btc_pubkey_hex, my_addr, hash_to_send).await {
                                                 Ok(_) => { let _ = tx.send(AppMessage::Info("✅ Ordre placé dans le Dark Pool !".to_string())).await; },
                                                 Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
                                             }
@@ -1753,7 +1790,7 @@ impl eframe::App for WattcoinApp {
 								for swap in &self.active_swaps {
 									egui::Frame::none().fill(item_bg).inner_margin(10.0).rounding(5.0).show(ui, |ui| {
 										let keys = self.wallet_keys.clone().unwrap();
-										let is_buyer = keys.watt_address == swap.buyer_watt_address;
+										let is_buyer = crate::is_my_watt_address(&keys, &swap.buyer_watt_address);
 										
 										let role = if is_buyer { "🔴 ACHETEUR (Vous payez BTC, recevez WATT)" } else { "🔴 VENDEUR (Vous payez WATT, recevez BTC)" };
 										ui.label(egui::RichText::new(role).strong());
@@ -1910,7 +1947,7 @@ impl eframe::App for WattcoinApp {
 										
 										// Bouton Annuler si c'est NOTRE ordre
 										if let Some(keys) = &self.wallet_keys {
-											if keys.watt_address == order.watt_address {
+											if crate::is_my_watt_address(keys, &order.watt_address) {
 												if ui.button("🗑").on_hover_text("Annuler mon ordre").clicked() {
 													self.sync_message = "Annulation de l'ordre...".to_string();
 													let tx = self.tx.clone();
@@ -2242,6 +2279,14 @@ impl eframe::App for WattcoinApp {
 						ui.add_space(20.0);
 
 						// GÉRER SA CAUTION
+						if self.balance_staked.is_empty() {
+							ui.label("🔒 Aucune caution verrouillée.");
+						} else {
+							for (name, flames) in &self.balance_staked {
+								ui.label(egui::RichText::new(format!("🔒 Caution {} : {} WATT", name, crate::format_flames(*flames))).strong().color(egui::Color32::GOLD));
+							}
+						}
+						ui.add_space(10.0);
 						ui.horizontal(|ui| {
 							ui.vertical(|ui| {
 								ui.label("Montant de la caution à verrouiller (WATT) :");
@@ -2542,16 +2587,22 @@ impl eframe::App for WattcoinApp {
                                 ui.label(egui::RichText::new(&self.decrypted_seed).monospace().color(text_color));
                             });
                             
-                            // Adresse courte (minage uniquement) : visible seulement après déverrouillage
+                            // Adresse de minage "<kyber>.<R_0>" : publique et stable (récompenses, DEX, loterie)
                             if let Some(keys) = &self.wallet_keys {
                                 ui.add_space(15.0);
-                                ui.label(egui::RichText::new("⛏ Adresse de Minage (courte — ne pas utiliser pour recevoir) :").color(egui::Color32::from_rgb(255, 165, 0)));
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(&keys.watt_short_address).monospace().color(egui::Color32::DARK_GRAY));
-                                    if ui.button("📋 Copier").clicked() {
-                                        set_clipboard_text(ui.ctx(), &keys.watt_short_address);
+                                ui.label(egui::RichText::new("⛏ Adresse de Minage (publique, stable — pour recevoir, utilisez « Copier » sur l'accueil) :").color(egui::Color32::from_rgb(255, 165, 0)));
+                                match crate::my_public_address(keys) {
+                                    Ok(mining_addr) => {
+                                        let display = if mining_addr.len() > 40 { format!("{}…{}", &mining_addr[0..16], &mining_addr[mining_addr.len() - 16..]) } else { mining_addr.clone() };
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(display).monospace().color(egui::Color32::DARK_GRAY));
+                                            if ui.button("📋 Copier").clicked() {
+                                                set_clipboard_text(ui.ctx(), &mining_addr);
+                                            }
+                                        });
                                     }
-                                });
+                                    Err(e) => { ui.label(egui::RichText::new(format!("❌ {}", e)).color(egui::Color32::RED)); }
+                                }
                             }
                             
                             ui.add_space(15.0);
@@ -2610,8 +2661,8 @@ impl eframe::App for WattcoinApp {
                         ui.horizontal(|ui| {
                             if ui.add_sized([180.0, 40.0], egui::Button::new("🐧 Script Linux (.sh)")).clicked() {
                                 if let Some(keys) = &self.wallet_keys {
-									// On passe la short_address pour alléger les blocs !
-									match crate::save_miner_script("linux".to_string(), keys.watt_short_address.clone()) { 
+									// "<kyber>.<R_0>" : la seule forme que le nœud accepte (récompenses dépensables)
+									match crate::my_public_address(keys).and_then(|a| crate::save_miner_script("linux".to_string(), a)) {
 										Ok(msg) => self.sync_message = format!("✅ {}", msg),
 										Err(e) => self.sync_message = format!("❌ {}", e),
 									}
@@ -2622,7 +2673,7 @@ impl eframe::App for WattcoinApp {
 
                             if ui.add_sized([180.0, 40.0], egui::Button::new("💻 Script Windows (.bat)")).clicked() {
                                 if let Some(keys) = &self.wallet_keys {
-                                    match crate::save_miner_script("windows".to_string(), keys.watt_address.clone()) {
+                                    match crate::my_public_address(keys).and_then(|a| crate::save_miner_script("windows".to_string(), a)) {
                                         Ok(msg) => self.sync_message = format!("✅ {}", msg),
                                         Err(e) => self.sync_message = format!("❌ {}", e),
                                     }

@@ -88,10 +88,10 @@ fn htlc_key(tx: &Transaction) -> Option<String> {
     }
 }
 
-// Clés consommées par une TX : ses UTXO + sa clé WOTS+
+// Clés consommées par une TX : ses UTXO + sa clé à usage unique (feuille hypertree ou clé de caution)
 fn tx_spent_keys(tx: &Transaction) -> Vec<String> {
     let mut keys: Vec<String> = tx.inputs.iter().map(|i| i.utxo_id.clone()).collect();
-    if let Some(sig) = &tx.wots_signature { keys.push(hex::encode(&sig.public_key)); }
+    for k in tx.one_time_keys() { keys.push(k); }
     keys
 }
 
@@ -123,18 +123,18 @@ pub fn check_tx_admission(chain: &Blockchain, pool: &[Transaction], tx: &Transac
     let keys = tx_spent_keys(tx);
     let mut uniq: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !keys.iter().all(|k| uniq.insert(k.clone())) { return Err("❌ Input dupliqué dans la transaction".into()); }
-    if keys.iter().any(|k| chain.spent_key_images.contains(k)) { return Err("❌ UTXO ou clé WOTS+ déjà dépensé on-chain".into()); }
+    if let Some(k) = keys.iter().find(|k| chain.spent_key_images.contains(*k)) {
+        return Err(format!("❌ UTXO ou clé WOTS+ déjà dépensé on-chain ({}…)", k.get(0..16).unwrap_or(k)));
+    }
     for m in pool {
         if tx_spent_keys(m).iter().any(|k| uniq.contains(k)) { return Err("❌ UTXO déjà en cours de dépense dans la mempool".into()); }
     }
-    // 7. Existence et montant réel des inputs L1 (le L2 est géré par le séquenceur)
-    if !is_pure_l2 {
-        for input in &tx.inputs {
-            match chain.find_utxo(&input.utxo_id) {
-                None => return Err(format!("❌ UTXO fantôme ({})", input.utxo_id)),
-                Some(u) if u.amount != input.amount => return Err("❌ Montant d'input falsifié".into()),
-                _ => {}
-            }
+    // 7. Existence et montant réel des inputs (L1 ET L2 : find_utxo couvre les deux couches)
+    for input in &tx.inputs {
+        match chain.find_utxo(&input.utxo_id) {
+            None => return Err(format!("❌ UTXO fantôme ({})", input.utxo_id)),
+            Some(u) if u.amount != input.amount => return Err("❌ Montant d'input falsifié".into()),
+            _ => {}
         }
     }
     // 8. HTLC : règles du consensus + un seul règlement par hash en mempool
@@ -142,6 +142,10 @@ pub fn check_tx_admission(chain: &Blockchain, pool: &[Transaction], tx: &Transac
         chain.check_htlc_tx(tx, chain.current_height + 1, &mut std::collections::HashSet::new())?;
         if pool.iter().any(|m| htlc_key(m).as_ref() == Some(&k)) { return Err("❌ HTLC : règlement déjà en mempool".into()); }
     }
+    // 9. UNSTAKE : même règle que le consensus (seul le détenteur de la clé de retrait)
+    chain.check_unstake_tx(tx)?;
+    // 10. PROPRIÉTÉ : chaque input appartient au signataire (même règle que le consensus)
+    chain.check_ownership(tx)?;
     Ok(())
 }
 

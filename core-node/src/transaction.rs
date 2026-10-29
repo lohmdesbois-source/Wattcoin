@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 use serde::{Serialize, Deserialize};
-use sha2::{Sha512, Digest};
+use sha2::{Sha256, Sha512, Digest};
 use wots::WotsSignature;
+
+/// Nombre maximal de sous-adresses dépensées dans UNE transaction (borne anti-DoS de la vérification)
+pub const MAX_OWNERS: usize = 16;
 
 
 // ==================== WNS (LAYER 2) ====================
@@ -96,6 +99,17 @@ pub struct TransactionInput {
     pub utxo_id: String, // Identifiant strict (kyber_capsule d'origine)
     pub amount: u64, // On ne cache pas le montant, amount direct
     pub source_height: u64,
+    #[serde(default)]
+    pub owner_otp: String, // hex : révélé pour ouvrir l'engagement pq_watt_/L2_WATT_ (vide pour un output public)
+    #[serde(default)]
+    pub owner: u8,         // index de la preuve (dans tx.owners) qui couvre cet input — SIGNÉ
+}
+
+// Une preuve de propriété : une racine R_i + sa signature hypertree sur le hash COMPLET de la TX
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerProof {
+    pub root: String,                               // hex R_i (signé)
+    pub signature: Option<wots::HyperSignature>,    // exclue du hash
 }
 
 // L'Output
@@ -113,8 +127,10 @@ pub struct Transaction {
     pub inputs: Vec<TransactionInput>,
     pub outputs: Vec<TransactionOutput>,
     pub fee: u64, 
-    pub wots_signature: Option<WotsSignature>,
+    pub wots_signature: Option<WotsSignature>, // réservée à l'unstake (clé de caution unique)
     pub public_key: String, 
+    #[serde(default)]
+    pub owners: Vec<OwnerProof>,               // une preuve par sous-adresse dépensée (max MAX_OWNERS)
 }
 
 impl Transaction {
@@ -125,6 +141,7 @@ impl Transaction {
         let mut temp_tx = self.clone();
         temp_tx.wots_signature = None; // On exclut la signature...
         temp_tx.public_key = String::new(); // On exclut la clé publique du hash !
+        for proof in temp_tx.owners.iter_mut() { proof.signature = None; } // les racines restent signées
         
         if let Ok(bytes) = bincode::serialize(&temp_tx) {
             hasher.update(&bytes);
@@ -134,6 +151,17 @@ impl Transaction {
         let mut hash_arr = [0u8; 64];
         hash_arr.copy_from_slice(&result);
         hash_arr
+    }
+	
+	// Clés à usage unique consommées par cette TX (anti-réutilisation) :
+    // une feuille hypertree par preuve, ou la clé de caution d'un unstake.
+    pub fn one_time_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.owners.iter()
+            .filter_map(|o| o.signature.as_ref())
+            .map(|s| s.one_time_key_hex())
+            .collect();
+        if let Some(s) = &self.wots_signature { keys.push(hex::encode(&s.public_key)); }
+        keys
     }
 
     pub fn is_valid(&self) -> bool {
@@ -188,16 +216,39 @@ impl Transaction {
 			return false;
 		}
 
-        // 5. Validation stricte des signatures WOTS+
-        if let Some(sig) = &self.wots_signature {
-            let hash = self.hash_data();
-            if !wots::Wots::verify(sig, &hash) {
-                println!("⛔ Rejet : Signature WOTS+ invalide.");
-                return false;
+        // 5. Signatures
+        //    - Unstake : UNE clé de caution WOTS, aucune preuve hypertree
+        //    - Sans input (mint, feeless) : ni signature ni preuve
+        //    - Toute autre dépense : une preuve par sous-adresse, chacune signant TOUTE la TX
+        let hash = self.hash_data();
+        let reject = |msg: &str| { println!("⛔ Rejet : {}", msg); false };
+        if matches!(self.tx_type, TransactionType::L2Unstake { .. }) {
+            let Some(sig) = &self.wots_signature else { return reject("unstake sans signature de caution."); };
+            if !self.owners.is_empty() || !wots::Wots::verify(sig, &hash) { return reject("signature WOTS+ (unstake) invalide."); }
+        } else if self.inputs.is_empty() {
+            if self.wots_signature.is_some() || !self.owners.is_empty() { return reject("signature sur une transaction sans input."); }
+        } else {
+            if self.wots_signature.is_some() { return reject("signature WOTS simple interdite pour une dépense."); }
+            if self.owners.is_empty() || self.owners.len() > MAX_OWNERS { return reject("nombre de preuves de propriété invalide."); }
+            // a) Chaque input désigne une preuve existante, et chaque preuve couvre au moins un input
+            let mut used = vec![false; self.owners.len()];
+            for input in &self.inputs {
+                match used.get_mut(input.owner as usize) {
+                    Some(u) => *u = true,
+                    None => return reject("input rattaché à une preuve inexistante."),
+                }
             }
-        } else if !is_consensus_mint && !is_feeless {
-            println!("⛔ Rejet : Transaction non signée.");
-            return false;
+            if used.contains(&false) { return reject("preuve de propriété inutilisée."); }
+            // b) Racines distinctes, feuilles distinctes, chaque preuve signe le hash complet
+            let mut roots = std::collections::HashSet::new();
+            let mut leaves = std::collections::HashSet::new();
+            for proof in &self.owners {
+                let Some(root) = decode32(&proof.root) else { return reject("racine de propriété invalide."); };
+                let Some(sig) = &proof.signature else { return reject("preuve de propriété non signée."); };
+                if !roots.insert(root) { return reject("racine de propriété en double."); }
+                if !leaves.insert(sig.one_time_key_hex()) { return reject("feuille hypertree réutilisée dans la transaction."); }
+                if !sig.verify(&hash, &root) { return reject("signature hypertree invalide."); }
+            }
         }
 
         // 6. Validation de la Preuve de Secret (HTLC)
@@ -245,5 +296,138 @@ impl Transaction {
         }
         
         true
+    }
+}
+
+// =====================================================================
+// PROPRIÉTÉ DES OUTPUTS : un output appartient à une racine hypertree R
+// =====================================================================
+
+/// Engagement caché d'un output : H("wattcoin/owner" || R || otp)
+pub fn owner_commit(root: &[u8; 32], otp: &[u8; 32]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"wattcoin/owner");
+    h.update(root);
+    h.update(otp);
+    hex::encode(h.finalize())
+}
+
+pub fn decode32(hex_str: &str) -> Option<[u8; 32]> {
+    hex::decode(hex_str).ok()?.try_into().ok()
+}
+
+/// La racine `root_hex` peut-elle dépenser cet output ?
+/// - pq_watt_<C> / L2_WATT_<C>               : C == owner_commit(R, otp)  (caché)
+/// - COINBASE_… / JACKPOT_… / <kyber>.<R>    : R public en fin d'adresse
+/// - tout le reste (htlc_watt_, LOTTERY_RESERVE, BRIDGE_L2_, L2_STAKE_…) : jamais par cette voie
+pub fn can_spend(out: &TransactionOutput, root_hex: &str, otp_hex: &str) -> bool {
+    let Some(root) = decode32(root_hex) else { return false };
+    let addr = &out.stealth_address;
+
+    // Récompense de séquenceur : L2 mais PUBLIQUE (testé AVANT "L2_WATT_", qui est son préfixe)
+    if let Some(rest) = addr.strip_prefix("L2_WATT_PUB_") {
+        return rest.rsplit('.').next() == Some(hex::encode(root).as_str());
+    }
+
+    for prefix in ["pq_watt_", "L2_WATT_"] {
+        if let Some(commit) = addr.strip_prefix(prefix) {
+            let Some(otp) = decode32(otp_hex) else { return false };
+            return commit == owner_commit(&root, &otp);
+        }
+    }
+
+    let public_owner = if let Some(rest) = addr.strip_prefix("COINBASE_").or_else(|| addr.strip_prefix("JACKPOT_")) {
+        rest.rsplit('.').next().unwrap_or(rest)
+    } else if let Some((_, r)) = addr.rsplit_once('.') {
+        r
+    } else {
+        return false;
+    };
+    public_owner == hex::encode(root)
+}
+
+/// Adresse de propriétaire valide : "<kyber>.<R_hex>" ou "<R_hex>" (R = 32 octets)
+pub fn is_owner_address(addr: &str) -> bool {
+    decode32(addr.rsplit('.').next().unwrap_or(addr)).is_some()
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn out(addr: &str) -> TransactionOutput {
+        TransactionOutput { stealth_address: addr.to_string(), kyber_capsule: String::new(), aes_vault: String::new(), amount: 1 }
+    }
+
+    #[test]
+    fn engagement_cache() {
+        let (r, otp) = ([1u8; 32], [2u8; 32]);
+        let o = out(&format!("pq_watt_{}", owner_commit(&r, &otp)));
+        assert!(can_spend(&o, &hex::encode(r), &hex::encode(otp)));
+        assert!(!can_spend(&o, &hex::encode([9u8; 32]), &hex::encode(otp))); // autre racine
+        assert!(!can_spend(&o, &hex::encode(r), &hex::encode([3u8; 32])));   // autre otp
+    }
+
+    #[test]
+    fn proprietaire_public() {
+        let r = hex::encode([1u8; 32]);
+        assert!(can_spend(&out(&format!("COINBASE_{}", r)), &r, ""));
+        assert!(can_spend(&out(&format!("JACKPOT_kyberB64.{}", r)), &r, ""));
+        assert!(can_spend(&out(&format!("kyberB64.{}", r)), &r, ""));
+        assert!(!can_spend(&out(&format!("COINBASE_{}", r)), &hex::encode([2u8; 32]), ""));
+    }
+
+    #[test]
+    fn jamais_depensables() {
+        let r = hex::encode([1u8; 32]);
+        for a in ["htlc_watt_abc", "LOTTERY_RESERVE", "BRIDGE_L2_WNS", "L2_STAKE_abc"] {
+            assert!(!can_spend(&out(a), &r, &r));
+        }
+    }
+	
+    #[test]
+    fn l2_public() {
+        let r = hex::encode([1u8; 32]);
+        assert!(can_spend(&out(&format!("L2_WATT_PUB_kyberB64.{}", r)), &r, ""));
+        assert!(can_spend(&out(&format!("L2_WATT_PUB_{}", r)), &r, ""));
+        assert!(!can_spend(&out(&format!("L2_WATT_PUB_{}", r)), &hex::encode([2u8; 32]), ""));
+        assert!(is_owner_address(&format!("kyberB64.{}", r)));
+        assert!(!is_owner_address("adresse_bidon"));
+    }
+	
+    // subs[j] = sous-adresse de la preuve j ; owner_of[i] = preuve qui couvre l'input i
+    fn signed_tx(subs: &[u64], owner_of: &[u8]) -> Transaction {
+        let mut tx = Transaction { tx_type: TransactionType::Standard, inputs: vec![], outputs: vec![], fee: 0,
+            wots_signature: None, public_key: String::new(), owners: vec![] };
+        for (i, o) in owner_of.iter().enumerate() {
+            tx.inputs.push(TransactionInput { utxo_id: format!("u{}", i), amount: 1, source_height: 0, owner_otp: String::new(), owner: *o });
+        }
+        tx.outputs.push(TransactionOutput { stealth_address: "pq_watt_x".into(), kyber_capsule: String::new(), aes_vault: String::new(), amount: owner_of.len() as u64 });
+        let mut keys: Vec<wots::HyperKeys> = subs.iter().map(|s| wots::HyperKeys::new(&[7u8; 32], *s)).collect();
+        for k in &keys { tx.owners.push(OwnerProof { root: hex::encode(k.root()), signature: None }); }
+        let msg = tx.hash_data();
+        for (j, k) in keys.iter_mut().enumerate() {
+            tx.owners[j].signature = Some(k.sign(j as u64, &msg, |_| false, |_| true).unwrap());
+        }
+        tx
+    }
+
+    #[test]
+    fn multi_proprietaires() {
+        let tx = signed_tx(&[0, 1], &[0, 1, 1]);
+        assert!(tx.is_valid());
+        assert_eq!(tx.one_time_keys().len(), 2);
+
+        let mut t = tx.clone(); t.inputs[0].owner = 1;          // input réattribué après signature
+        assert!(!t.is_valid());
+        let mut t = tx.clone(); t.owners.swap(0, 1);            // preuves permutées
+        assert!(!t.is_valid());
+        let mut t = tx.clone(); t.owners[1].signature = None;   // preuve non signée
+        assert!(!t.is_valid());
+        let mut t = tx.clone(); t.owners.pop();                 // input sans preuve
+        assert!(!t.is_valid());
+
+        assert!(!signed_tx(&[0, 1], &[0, 0]).is_valid());       // preuve inutile, pourtant bien signée
+        assert!(!signed_tx(&[0, 0], &[0, 1]).is_valid());       // même racine deux fois
     }
 }

@@ -89,7 +89,7 @@ impl Block {
             ],
             fee: 0,
             public_key: "GENESIS".to_string(),
-			wots_signature: None,
+			wots_signature: None, owners: vec![],
         };
         transactions.push(coinbase_tx);
 
