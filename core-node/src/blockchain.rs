@@ -140,6 +140,64 @@ impl Blockchain {
 		settled_in_block.insert(hash); // seulement si tout est OK
 		Ok(())
 	}
+	
+	// Règle ANCRAGE L2 unique : utilisée par validate, prepare et la mempool.
+	// Le séquenceur élu par le VRF signe anchor_message(l2_name, state_root) avec UNE feuille
+	// de son hypertree (racine R stakée). La feuille est brûlée via Transaction::one_time_keys.
+	pub fn check_anchor_tx(&self, tx: &Transaction) -> Result<(), String> {
+		let (l2_name, state_root, sequencer_signature) = match &tx.tx_type {
+			TransactionType::L2Anchor { l2_name, state_root, sequencer_signature, .. } => (l2_name, state_root, sequencer_signature),
+			_ => return Ok(()),
+		};
+
+		let mut active_sequencers: HashSet<String> = HashSet::new();
+		for result in self.db.iter() {
+			if let Ok((_, value)) = result {
+				if let Ok(b) = bincode::deserialize::<Block>(&value) {
+					for past_tx in &b.transactions {
+						if let TransactionType::L2Stake { l2_name: staked_name, sequencer_pubkey } = &past_tx.tx_type {
+							if staked_name == l2_name { active_sequencers.insert(sequencer_pubkey.clone()); }
+						}
+						if let TransactionType::L2Unstake { l2_name: unstaked_name } = &past_tx.tx_type {
+							if unstaked_name == l2_name { active_sequencers.clear(); }
+						}
+					}
+				}
+			}
+		}
+		if active_sequencers.is_empty() {
+			return Err(format!("❌ FRAUDE : La L2 '{}' n'a aucun staker actif !", l2_name));
+		}
+
+		// VRF : score imprévisible par séquenceur, le plus petit gagne
+		let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
+		candidates.sort();
+		let last_block_hash = &self.get_last_block().header.hash;
+		let mut legit_sequencer = String::new();
+		let mut lowest_score = [0xFFu8; 32];
+		for candidate in &candidates {
+			let mut vrf_hasher = sha2::Sha256::new();
+			vrf_hasher.update(last_block_hash.as_bytes());
+			vrf_hasher.update(l2_name.as_bytes());
+			vrf_hasher.update(candidate.as_bytes());
+			let mut vrf_hash = [0u8; 32];
+			vrf_hash.copy_from_slice(&vrf_hasher.finalize());
+			if vrf_hash < lowest_score {
+				lowest_score = vrf_hash;
+				legit_sequencer = candidate.clone();
+			}
+		}
+
+		// La signature hypertree doit remonter à la racine R du séquenceur élu
+		let root = crate::transaction::decode32(&legit_sequencer)
+			.ok_or("❌ FRAUDE VRF : le séquenceur élu n'a pas de racine hypertree valide.")?;
+		let sig: wots::HyperSignature = serde_json::from_str(sequencer_signature)
+			.map_err(|_| format!("❌ Signature hypertree illisible pour la L2 '{}'", l2_name))?;
+		if !sig.verify(&crate::transaction::anchor_message(l2_name, state_root), &root) {
+			return Err("❌ FRAUDE VRF : la state_root n'est pas signée par le séquenceur élu.".into());
+		}
+		Ok(())
+	}
 
 	// Règle UNSTAKE unique : utilisée par validate, prepare et la mempool
 	// La caution désigne elle-même la clé qui peut la retirer : sortie "L2_STAKE_<clé WOTS+ de retrait>"
@@ -542,6 +600,12 @@ impl Blockchain {
 				
 				// Unstake - Même règle que le validateur (fonction unique)
 				if let Err(e) = self.check_unstake_tx(tx) {
+					println!("⛔ Rejet {}", e);
+					continue;
+				}
+
+				// Ancrage L2 - Même règle que le validateur (fonction unique)
+				if let Err(e) = self.check_anchor_tx(tx) {
 					println!("⛔ Rejet {}", e);
 					continue;
 				}
@@ -1397,70 +1461,8 @@ impl Blockchain {
 				println!("🌉 [BRIDGE L2] {} Flames verrouillés publiquement pour le réseau {}", bridge_amount, l2_target_name);
 			}
 			
-            if let TransactionType::L2Anchor { l2_name, state_root, sequencer_signature, .. } = &tx.tx_type {
-                let mut active_sequencers: std::collections::HashSet<String> = std::collections::HashSet::new();
-                
-                for result in self.db.iter() {
-                    if let Ok((_, value)) = result {
-                        if let Ok(b) = bincode::deserialize::<Block>(&value) {
-                            for past_tx in &b.transactions {
-                                if let TransactionType::L2Stake { l2_name: staked_name, sequencer_pubkey } = &past_tx.tx_type {
-                                    if staked_name == l2_name { active_sequencers.insert(sequencer_pubkey.clone()); }
-                                }
-                                if let TransactionType::L2Unstake { l2_name: unstaked_name } = &past_tx.tx_type {
-                                    if unstaked_name == l2_name { active_sequencers.clear(); }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if active_sequencers.is_empty() {
-                    return Err(format!("❌ FRAUDE : La L2 '{}' n'a aucun staker actif !", l2_name));
-                }
-
-                let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
-                candidates.sort(); 
-
-                // VRF V4 : On hash la racine L1 avec l'identité de chaque Séquenceur 
-                // pour créer un score imprévisible (Similaire au consensus Algorand)
-                let last_block_hash = &self.get_last_block().header.hash;
-                let mut legit_sequencer = String::new();
-                let mut lowest_score = [0xFFu8; 32]; // On cherche le plus petit hash
-
-                for candidate in &candidates {
-                    let mut vrf_hasher = sha2::Sha256::new();
-                    vrf_hasher.update(last_block_hash.as_bytes());
-                    vrf_hasher.update(l2_name.as_bytes());
-                    vrf_hasher.update(candidate.as_bytes()); // Le mineur L1 ne peut pas manipuler ça facilement
-                    
-                    let mut vrf_hash = [0u8; 32];
-                    vrf_hash.copy_from_slice(&vrf_hasher.finalize());
-                    
-                    if vrf_hash < lowest_score {
-                        lowest_score = vrf_hash;
-                        legit_sequencer = candidate.clone();
-                    }
-                }
-
-                if let Ok(sig) = serde_json::from_str::<wots::WotsSignature>(sequencer_signature) {
-                    let mut hasher = sha2::Sha512::new();
-                    hasher.update(state_root.as_bytes());
-                    let mut hash_array = [0u8; 64];
-                    hash_array.copy_from_slice(&hasher.finalize());
-                    
-                    
-                    if hex::encode(&sig.public_key) != *legit_sequencer {
-                        return Err(format!("❌ FRAUDE VRF : La clé publique de la signature ne correspond pas au gagnant !"));
-                    }
-
-                    if !wots::Wots::verify(&sig, &hash_array) {
-                        return Err(format!("❌ FRAUDE VRF : Signature WOTS+ invalide ! Le Séquenceur a soumis un faux bloc."));
-                    }
-                } else {
-                    return Err(format!("❌ Signature WOTS+ illisible pour la L2 '{}'", l2_name));
-                }
-                
+            if let TransactionType::L2Anchor { l2_name, state_root, .. } = &tx.tx_type {
+                self.check_anchor_tx(tx)?;
                 println!("🔗 [INTEROPÉRABILITÉ] État '{}' ancré par le Séquenceur VRF légitime ! (Root: {})", l2_name, state_root);
             }
 

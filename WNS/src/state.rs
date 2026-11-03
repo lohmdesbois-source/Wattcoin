@@ -125,6 +125,11 @@ impl L2State {
         
         for tx in txs {
             if tx.fee < 1500 { continue; } 
+            // Retraits L2 → L1 désactivés : le désancrage n'est pas encore conçu (les WATT seraient brûlés sans retour)
+            if tx.action == WnsAction::Withdraw {
+                println!("⛔ [WNS] Retrait refusé : désancrage L2 → L1 pas encore disponible.");
+                continue;
+            }
 
             if matches!(tx.action, WnsAction::Register | WnsAction::Update) {
                 // Seuls les alias payants .watt et .chain sont acceptés sur le registre.
@@ -300,6 +305,9 @@ impl L2State {
         let mut total_fees = 0;
 
         for tx in &block.transactions {
+            if tx.action == WnsAction::Withdraw {
+                return Err("Retrait L2 → L1 non autorisé (désancrage pas encore disponible)".to_string());
+            }
             if matches!(tx.action, WnsAction::Register | WnsAction::Update) {
                 let is_valid_watt = tx.domain_name.ends_with(".watt") && tx.domain_name.len() > 5;
                 let is_valid_chain = tx.domain_name.ends_with(".chain") && tx.domain_name.len() > 6;

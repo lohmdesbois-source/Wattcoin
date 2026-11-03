@@ -161,6 +161,10 @@ impl Transaction {
             .map(|s| s.one_time_key_hex())
             .collect();
         if let Some(s) = &self.wots_signature { keys.push(hex::encode(&s.public_key)); }
+        // Ancrage L2 : la feuille hypertree du séquenceur est brûlée comme toute clé à usage unique
+        if let TransactionType::L2Anchor { sequencer_signature, .. } = &self.tx_type {
+            if let Ok(s) = serde_json::from_str::<wots::HyperSignature>(sequencer_signature) { keys.push(s.one_time_key_hex()); }
+        }
         keys
     }
 
@@ -250,6 +254,14 @@ impl Transaction {
                 if !sig.verify(&hash, &root) { return reject("signature hypertree invalide."); }
             }
         }
+		
+        // 5 bis. L2 : le séquenceur s'identifie par une racine hypertree R ; l'ancrage porte une signature hypertree
+        if let TransactionType::L2Stake { sequencer_pubkey, .. } = &self.tx_type {
+            if decode32(sequencer_pubkey).is_none() { return reject("L2Stake : sequencer_pubkey doit être une racine hypertree (64 hex)."); }
+        }
+        if let TransactionType::L2Anchor { sequencer_signature, .. } = &self.tx_type {
+            if serde_json::from_str::<wots::HyperSignature>(sequencer_signature).is_err() { return reject("L2Anchor : signature hypertree illisible."); }
+        }
 
         // 6. Validation de la Preuve de Secret (HTLC)
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
@@ -302,6 +314,19 @@ impl Transaction {
 // =====================================================================
 // PROPRIÉTÉ DES OUTPUTS : un output appartient à une racine hypertree R
 // =====================================================================
+
+/// Message signé par le séquenceur pour ancrer un état L2.
+/// Lié au nom du L2 : une signature ne peut pas être rejouée d'un L2 à l'autre.
+pub fn anchor_message(l2_name: &str, state_root: &str) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update(b"wattcoin/l2anchor");
+    h.update((l2_name.len() as u64).to_be_bytes());
+    h.update(l2_name.as_bytes());
+    h.update(state_root.as_bytes());
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&h.finalize());
+    out
+}
 
 /// Engagement caché d'un output : H("wattcoin/owner" || R || otp)
 pub fn owner_commit(root: &[u8; 32], otp: &[u8; 32]) -> String {
@@ -429,5 +454,24 @@ mod owner_tests {
 
         assert!(!signed_tx(&[0, 1], &[0, 0]).is_valid());       // preuve inutile, pourtant bien signée
         assert!(!signed_tx(&[0, 0], &[0, 1]).is_valid());       // même racine deux fois
+    }
+	
+	    #[test]
+    fn ancrage_l2_feuille_brulee() {
+        let mut seq = wots::HyperKeys::new(&[9u8; 32], 0);
+        let root = seq.root();
+        let msg = anchor_message("WNS", "racine_etat");
+        let sig = seq.sign(0, &msg, |_| false, |_| true).unwrap();
+        assert!(sig.verify(&msg, &root));
+        assert!(!sig.verify(&anchor_message("WNS", "autre_racine"), &root));   // état falsifié
+        assert!(!sig.verify(&anchor_message("AUTRE", "racine_etat"), &root));  // rejeu sur un autre L2
+
+        let leaf = sig.one_time_key_hex();
+        let tx = Transaction {
+            tx_type: TransactionType::L2Anchor { l2_name: "WNS".into(), state_root: "racine_etat".into(),
+                sequencer_signature: serde_json::to_string(&sig).unwrap(), withdrawals: vec![] },
+            inputs: vec![], outputs: vec![], fee: 0, wots_signature: None, public_key: String::new(), owners: vec![],
+        };
+        assert_eq!(tx.one_time_keys(), vec![leaf]); // la feuille de l'ancrage part dans spent_key_images
     }
 }

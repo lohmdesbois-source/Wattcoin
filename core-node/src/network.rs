@@ -144,6 +144,8 @@ pub fn check_tx_admission(chain: &Blockchain, pool: &[Transaction], tx: &Transac
     }
     // 9. UNSTAKE : même règle que le consensus (seul le détenteur de la clé de retrait)
     chain.check_unstake_tx(tx)?;
+    // 9 bis. ANCRAGE L2 : même règle que le consensus (seul le séquenceur élu, feuille hypertree)
+    chain.check_anchor_tx(tx)?;
     // 10. PROPRIÉTÉ : chaque input appartient au signataire (même règle que le consensus)
     chain.check_ownership(tx)?;
     Ok(())

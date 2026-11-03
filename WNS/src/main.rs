@@ -1,7 +1,7 @@
 use dotenv::dotenv;
 use reqwest::Client;
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::Digest;
 use std::env;
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -15,21 +15,28 @@ use wattcoin_name_service::state::L2State;
 use wattcoin_name_service::network::{start_wns_p2p_server, ActiveWnsPeers, WnsP2PMessage};
 use wattcoin_name_service::transaction::WnsBlock;
 
+// Le coffre ne garde que la GRAINE : R et toutes les feuilles s'en déduisent
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SequencerKeys {
-    public_key: String,
-    secret_key_hex: String, 
+    seed_hex: String,
 }
 
-fn decode_wots_sk(hex_str: &str) -> Vec<[u8; 32]> {
-    let bytes = hex::decode(hex_str).unwrap();
-    let mut sk = Vec::new();
-    for chunk in bytes.chunks_exact(32) {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(chunk);
-        sk.push(arr);
-    }
-    sk
+// Payload d'un carburant caché "montant|otp|R" (chiffré Kyber + AES pour le WNS) → otp hex.
+// On ne croit pas le payload : can_spend recalcule ensuite l'engagement on-chain.
+fn open_gas_payload(out: &TransactionOutput, kyber_sk: &[u8]) -> Option<String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    let capsule = hex::decode(&out.kyber_capsule).ok()?;
+    let shared = pqc_kyber::decapsulate(&capsule, kyber_sk).ok()?;
+    let vault = hex::decode(&out.aes_vault).ok()?;
+    if vault.len() <= 12 { return None; }
+    let cipher = Aes256Gcm::new(&shared.into());
+    #[allow(deprecated)]
+    let nonce = aes_gcm::Nonce::from_slice(&vault[0..12]);
+    let text = String::from_utf8(cipher.decrypt(nonce, &vault[12..]).ok()?).ok()?;
+    let mut parts = text.split('|');
+    let amount: u64 = parts.next()?.parse().ok()?;
+    let otp = parts.next()?.to_string();
+    (amount == out.amount).then_some(otp)
 }
 
 #[tokio::main]
@@ -81,9 +88,9 @@ async fn main() {
     
     let node_kyber_pub = std::fs::read_to_string(&kyber_pub_path).unwrap().trim().to_string();
     println!("============================================================");
-    println!("🧅 IDENTITÉ MIXNET ET RÉSERVOIR D'ESSENCE WNS !");
-    println!("Envoyez des WATT (Virement normal) sur cette adresse Kyber pour financer les ancrages :");
+    println!("🧅 IDENTITÉ MIXNET DU NŒUD WNS (clé Kyber) :");
     println!("{}", node_kyber_pub);
+    println!("(L'adresse de CARBURANT complète <clé>.<racine> est affichée plus bas.)");
     println!("============================================================\n");
 
     let state = Arc::new(Mutex::new(
@@ -151,15 +158,10 @@ async fn main() {
         let json_string = String::from_utf8(plaintext).expect("Erreur UTF-8");
         serde_json::from_str::<SequencerKeys>(&json_string).expect("JSON invalide")
     } else {
-        println!("🔧 Première exécution : Génération du Hot Wallet Séquenceur (WOTS+)...");
+        println!("🔧 Première exécution : Génération de l'identité hypertree du Séquenceur...");
         let mut seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut seed);
-        
-        let keys_wots = wots::Wots::generate_keypair(&seed, 0);
-        let mut sk_hex = String::new();
-        for chunk in keys_wots.0 { sk_hex.push_str(&hex::encode(chunk)); }
-        
-        let keys = SequencerKeys { public_key: hex::encode(&keys_wots.1), secret_key_hex: sk_hex };
+        let keys = SequencerKeys { seed_hex: hex::encode(seed) };
         let keys_json = serde_json::to_string(&keys).unwrap();
 
         println!("🔒 Chiffrement AES-256-GCM de l'identité WOTS+...");
@@ -193,10 +195,17 @@ async fn main() {
         keys
     };
 
-    let pubkey = hot_wallet.public_key.clone(); 
+    // Identité hypertree : R = clé à staker ; une feuille neuve par signature (journal dans la base du WNS)
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&hex::decode(&hot_wallet.seed_hex).expect("❌ Graine du séquenceur illisible"));
+    let leaves_journal = state.lock().unwrap().db.clone().expect("La DB Sled n'est pas initialisée")
+        .open_tree("sequencer_leaves").expect("Impossible d'ouvrir le journal des feuilles");
+    let mut signer = wattcoin_name_service::sequencer::SequencerSigner::new(&seed, leaves_journal);
+    let pubkey = signer.root_hex(); 
     
     println!("=====================================================");
-    println!("🔑 CLÉ PUBLIQUE D'AUTORITÉ WOTS+ : \n{}", pubkey);
+    println!("🔑 RACINE HYPERTREE DU SÉQUENCEUR (à staker) : \n{}", pubkey);
+    println!("⛽ ADRESSE DE CARBURANT (payez-la avec « Envoyer » depuis un wallet) : \n{}.{}", node_kyber_pub, pubkey);
     println!("👉 ACTION REQUISE : Copiez cette clé et allez 'Staker' 100 WATT sur le L1 avec le nom '{}' !", l2_name);
     println!("=====================================================\n");
 
@@ -314,7 +323,7 @@ async fn main() {
             continue; 
         }
 
-        let (state_root, block_idx, valid_txs, fees, mut withdrawals_l2) = {
+        let (state_root, block_idx, valid_txs, fees, _withdrawals_l2) = {
             let mut state_guard = state.lock().unwrap();
             
             if state_guard.mempool.is_empty() {
@@ -340,167 +349,113 @@ async fn main() {
         println!("🌳 Racine du Registre (Root)    : {}", &state_root[..32]); 
         println!("=====================================================\n");
 
-        let estimated_weight_kb = 100;
-        let l1_fee_sats = std::cmp::max(1000, estimated_weight_kb * 20); 
-
-        // AUTO-SIPHON : Le Séquenceur rapatrie ses gains du L2 vers le L1
-        let mut my_l2_balance = 0;
-        {
-            let state_guard = state.lock().unwrap();
-            if let Some(acc) = state_guard.accounts.get(&pubkey) {
-                my_l2_balance = acc.balance;
-            }
-        }
-        
-        let reserve_l2 = 1_000_000_000; // Il laisse toujours 1 WATT sur le L2
-        if my_l2_balance > reserve_l2 + l1_fee_sats {
-            let amount_to_withdraw = my_l2_balance - reserve_l2;
-            withdrawals_l2.push((pubkey.clone(), amount_to_withdraw));
-            
-            let mut state_guard = state.lock().unwrap();
-            if let Some(acc) = state_guard.accounts.get_mut(&pubkey) {
-                acc.balance -= amount_to_withdraw;
-            }
-            println!("🔄 [AUTO-SIPHON] Le séquenceur rapatrie {} Flames du L2 vers le L1.", amount_to_withdraw);
-        }
-
-        // PAIEMENT L1 (RÉSERVOIR D'ESSENCE)
-        let utxos_url = format!("{}/all_transactions", l1_node_url);
-        let mut selected_inputs = Vec::new();
+        // ==============================================================
+        // CARBURANT L1 : UTXO payés à "<kyber_wns>.<R>" (cachés pq_watt_ ou publics),
+        // dépensés avec une preuve de propriété hypertree, comme n'importe quel wallet.
+        // (Retraits L2 → L1 et auto-siphon : désactivés tant que le désancrage n'est pas conçu.)
+        // ==============================================================
+        const GAS_TARGET: u64 = 10_000; // largement assez pour un ancrage (le reste revient en monnaie)
+        let gas_address = format!("{}.{}", node_kyber_pub, pubkey);
+        let wns_kyber_sk = hex::decode(&node_kyber_secret).unwrap_or_default();
+        let mut gas: Vec<(wattcoin_core::transaction::TransactionInput, String)> = Vec::new(); // (input, utxo_id)
         let mut total_l1_collected = 0u64;
-        let mut newly_spent_utxos = Vec::new(); // 💡 Déclaré ici au bon niveau de scope !
 
-        if let Ok(res) = client.get(&utxos_url).send().await {
+        if let Ok(res) = client.get(&format!("{}/all_transactions", l1_node_url)).send().await {
             if let Ok(all_txs) = res.json::<Vec<serde_json::Value>>().await {
-                
-                let wns_kyber_sk = hex::decode(&node_kyber_secret).unwrap_or_default();
-
                 for item in all_txs {
+                    if item["is_l2"].as_bool().unwrap_or(false) { continue; }
                     let height = item["height"].as_u64().unwrap_or(0);
-                    let is_l2 = item["is_l2"].as_bool().unwrap_or(false);
-                    if is_l2 { continue; } 
-
-                    let tx_json = item["transaction"].clone();
-                    if let Ok(tx) = serde_json::from_value::<Transaction>(tx_json) {
-                        for out in tx.outputs {
-                            
-                            // 💡 ON INTERROGE SLED : Est-ce que ce billet L1 a déjà été consommé ?
-                            let utxo_id = out.kyber_capsule.clone();
-                            if spent_utxos_tree.contains_key(&utxo_id).unwrap_or(false) {
-                                continue; 
-                            }
-
-                            let mut is_my_gas = false;
-                            let mut amt_collected = 0u64;
-
-                            if out.stealth_address == pubkey {
-                                if let Ok(amt) = out.aes_vault.parse::<u64>() {
-                                    amt_collected = amt;
-                                    is_my_gas = true;
-                                }
-                            } else if out.stealth_address.starts_with("pq_watt_") {
-                                if let Ok(capsule) = hex::decode(&out.kyber_capsule) {
-                                    if let Ok(shared_secret) = pqc_kyber::decapsulate(&capsule, &wns_kyber_sk) {
-                                        if let Ok(vault_bytes) = hex::decode(&out.aes_vault) {
-                                            if vault_bytes.len() > 12 {
-                                                use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
-                                                let cipher = Aes256Gcm::new(&shared_secret.into());
-                                                let mut n_arr = [0u8; 12];
-                                                n_arr.copy_from_slice(&vault_bytes[0..12]);
-                                                
-                                                #[allow(deprecated)]
-                                                let nonce = aes_gcm::Nonce::from_slice(&n_arr);
-                                                
-                                                if let Ok(plaintext) = cipher.decrypt(nonce, &vault_bytes[12..]) {
-                                                    if let Ok(payload_str) = String::from_utf8(plaintext) {
-                                                        let parts: Vec<&str> = payload_str.split('|').collect();
-                                                        if parts.len() >= 2 {
-                                                            if let Ok(amt) = parts[0].parse::<u64>() {
-                                                                amt_collected = amt;
-                                                                is_my_gas = true;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if is_my_gas && amt_collected > 0 {
-                                selected_inputs.push(wattcoin_core::transaction::TransactionInput {
-                                    utxo_id: out.kyber_capsule.clone(), 
-                                    amount: amt_collected, // On utilise l'amount en clair !
-                                    source_height: height,
-                                });
-                                total_l1_collected += amt_collected;
-                                newly_spent_utxos.push(utxo_id); // 💡 On l'enregistre pour Sled
-                                break; 
-                            }
-                        }
+                    let Ok(tx) = serde_json::from_value::<Transaction>(item["transaction"].clone()) else { continue };
+                    for out in tx.outputs {
+                        if out.amount == 0 || spent_utxos_tree.contains_key(&out.kyber_capsule).unwrap_or(false) { continue; }
+                        // Caché : on ouvre le payload "montant|otp|R" ; public : R en fin d'adresse
+                        let otp_hex = if out.stealth_address.starts_with("pq_watt_") {
+                            match open_gas_payload(&out, &wns_kyber_sk) { Some(otp) => otp, None => continue }
+                        } else { String::new() };
+                        // Dernier mot à la règle du consensus, à l'identique
+                        if !wattcoin_core::transaction::can_spend(&out, &pubkey, &otp_hex) { continue; }
+                        total_l1_collected += out.amount;
+                        gas.push((wattcoin_core::transaction::TransactionInput {
+                            utxo_id: out.kyber_capsule.clone(),
+                            amount: out.amount,
+                            source_height: height,
+                            owner_otp: otp_hex,
+                            owner: 0,
+                        }, out.kyber_capsule.clone()));
+                        if total_l1_collected >= GAS_TARGET { break; }
                     }
-                    if total_l1_collected >= l1_fee_sats { break; }
+                    if total_l1_collected >= GAS_TARGET { break; }
                 }
             }
         }
 
-        if total_l1_collected < l1_fee_sats {
-            println!("🛑 [ÉCHEC ANCRAGE] Le Réservoir L1 est vide ! (Requis: {} Flames).", l1_fee_sats);
+        if gas.is_empty() {
+            println!("🛑 [ÉCHEC ANCRAGE] Aucun carburant L1. Envoyez des WATT (bouton Envoyer) à :\n{}", gas_address);
             let mut state_guard = state.lock().unwrap();
             state_guard.block_index -= 1; // Rollback simple
             continue;
         }
 
-        let change_l1 = total_l1_collected - l1_fee_sats;
+        // Signature hypertree de l'état : UNE feuille neuve, liée au nom du L2 (vérifiée par le L1 et les pairs)
+        let anchor_msg = wattcoin_core::transaction::anchor_message(&l2_name, &state_root);
+        let anchor_sig = match signer.sign(&anchor_msg) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("{}", e);
+                let mut state_guard = state.lock().unwrap();
+                state_guard.block_index -= 1;
+                continue;
+            }
+        };
+        let signature_hex = serde_json::to_string(&anchor_sig).unwrap();
 
-        let mut hasher = Sha512::new();
-        hasher.update(state_root.as_bytes());
-        let mut hash_array = [0u8; 64];
-        hash_array.copy_from_slice(&hasher.finalize());
-        
-        let secret_matrix = decode_wots_sk(&hot_wallet.secret_key_hex);
-        let public_key_bytes = hex::decode(&pubkey).unwrap_or_default();
-        
-        let wots_sig = wots::Wots::sign(&secret_matrix, block_idx, &hash_array, &public_key_bytes);
-        let signature_hex = serde_json::to_string(&wots_sig).unwrap();
-        
-        let mut final_outputs = Vec::new();
-        
-        for (l1_addr, amt) in withdrawals_l2 {
-            final_outputs.push(TransactionOutput {
-                stealth_address: l1_addr,
-                kyber_capsule: format!("UNPEG_WNS_{}", block_idx),
-                aes_vault: amt.to_string(),
-                amount: amt, // LE MONTANT EN CLAIR
-            });
-        }
-
-        if change_l1 > 0 {
-            final_outputs.push(TransactionOutput {
-                stealth_address: pubkey.clone(),
-                kyber_capsule: format!("CHANGE_WNS_{}", block_idx),
-                aes_vault: change_l1.to_string(),
-                amount: change_l1, // LE MONTANT EN CLAIR
-            });
-        }
-
+        // Transaction d'ancrage : carburant → frais + monnaie rendue sur "<kyber_wns>.<R>"
+        let (inputs, newly_spent_utxos): (Vec<_>, Vec<String>) = gas.into_iter().unzip();
         let mut anchor_tx = Transaction {
             tx_type: TransactionType::L2Anchor {
                 l2_name: l2_name.clone(),
                 state_root: state_root.clone(),
-                sequencer_signature: signature_hex.clone(), 
-                withdrawals: Vec::new(), 
+                sequencer_signature: signature_hex.clone(),
+                withdrawals: Vec::new(),
             },
-            inputs: selected_inputs,
-            outputs: final_outputs,
-            fee: l1_fee_sats,
+            inputs,
+            outputs: vec![TransactionOutput {
+                stealth_address: gas_address.clone(),
+                kyber_capsule: format!("CHANGE_WNS_{}_{}", block_idx, hex::encode(rand::random::<[u8; 8]>())), // identifiant unique
+                aes_vault: String::new(),
+                amount: 0,
+            }],
+            fee: 0,
             wots_signature: None,
-            public_key: pubkey.clone(),
+            public_key: String::new(),
+            owners: vec![wattcoin_core::transaction::OwnerProof { root: pubkey.clone(), signature: None }],
         };
 
-        let tx_hash_64 = anchor_tx.hash_data();
-        anchor_tx.wots_signature = Some(wots::Wots::sign(&secret_matrix, block_idx, &tx_hash_64, &public_key_bytes)); // 64 OCTETS
+        // Frais au poids RÉEL (+ marge pour la preuve de propriété, pas encore signée)
+        let weight_kb = (bincode::serialized_size(&anchor_tx).unwrap_or(0) + 8_000 + 1023) / 1024;
+        let l1_fee_sats = std::cmp::max(1000, weight_kb * 20);
+        if total_l1_collected <= l1_fee_sats {
+            println!("🛑 [ÉCHEC ANCRAGE] Carburant insuffisant ({} ≤ {} Flames). Envoyez des WATT à :\n{}", total_l1_collected, l1_fee_sats, gas_address);
+            let mut state_guard = state.lock().unwrap();
+            state_guard.block_index -= 1;
+            continue;
+        }
+        let change_l1 = total_l1_collected - l1_fee_sats;
+        anchor_tx.fee = l1_fee_sats;
+        anchor_tx.outputs[0].amount = change_l1;
+        anchor_tx.outputs[0].aes_vault = change_l1.to_string();
+
+        // Preuve de propriété du carburant : une AUTRE feuille neuve, sur le hash COMPLET (ancrage inclus)
+        let tx_msg = anchor_tx.hash_data();
+        match signer.sign(&tx_msg) {
+            Ok(sig) => anchor_tx.owners[0].signature = Some(sig),
+            Err(e) => {
+                println!("{}", e);
+                let mut state_guard = state.lock().unwrap();
+                state_guard.block_index -= 1;
+                continue;
+            }
+        }
 
         println!("⚓ Envoi de l'ancrage au L1 en cours (Frais payés : {} Flames)...", l1_fee_sats);
 
@@ -520,6 +475,7 @@ async fn main() {
 
                         let new_block = WnsBlock {
                             index: block_idx,
+                            l2_name: l2_name.clone(),
                             l1_parent_hash: "L1_HASH_ICI".to_string(),
                             state_root: state_root.clone(),
                             sequencer_pubkey: pubkey.clone(),

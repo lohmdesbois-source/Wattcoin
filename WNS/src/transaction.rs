@@ -51,6 +51,7 @@ impl L2Transaction {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WnsBlock {
     pub index: u64,
+    pub l2_name: String,        // signé (anchor_message) : la signature ne vaut que pour CE L2
     pub l1_parent_hash: String, 
     pub state_root: String,
     pub sequencer_pubkey: String,
