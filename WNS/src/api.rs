@@ -2,7 +2,7 @@
 
 use warp::Filter;
 use crate::state::SharedL2State;
-use crate::transaction::L2Transaction;
+use crate::transaction::{L2Transaction, WnsAction};
 use wots::{Wots, WotsSignature};
 use crate::network::{ActiveWnsPeers, WnsP2PMessage, broadcast_message};
 
@@ -19,12 +19,12 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
         .and(state_filter.clone())
         .map(|state: SharedL2State| {
             let state_guard = state.lock().unwrap();
-            let total_l2_supply: u64 = state_guard.accounts.values().map(|a| a.balance).sum();
             
             warp::reply::json(&serde_json::json!({
                 "l2_network": "WNS",
-                "total_supply_flames": total_l2_supply,
-                "message": "Pour vérifier le Peg, comparez cette valeur avec le solde L1 de l'adresse BRIDGE_L2_WNS"
+                "total_supply_flames": state_guard.l2_total(),
+                "l2_height": state_guard.block_index,
+                "message": "Compteur 1:1 : doit égaler reserve_at_anchor_flames de /l2/peg/WNS sur le L1"
             }))
         });
 
@@ -72,12 +72,15 @@ pub async fn start_api_server(port: u16, state: SharedL2State, active_peers: Act
                 );
             }
             
-            let is_valid_watt = tx.domain_name.ends_with(".watt") && tx.domain_name.len() > 5;
-            let is_valid_chain = tx.domain_name.ends_with(".chain") && tx.domain_name.len() > 6;
+            // Un retrait vise une adresse L1 <kyber>.<R> ; toute autre action vise un domaine du registre
+            let form_ok = match tx.action {
+                WnsAction::Withdraw => tx.amount > 0 && crate::state::is_l1_owner_address(&tx.record_data),
+                _ => crate::state::valid_domain(&tx.domain_name),
+            };
 
-            if !is_valid_watt && !is_valid_chain {
+            if !form_ok {
                 return warp::reply::with_status(
-                    warp::reply::json(&serde_json::json!({"error": "Nom de domaine invalide (doit finir par .watt ou .chain et contenir au moins 1 caractère)." })),
+                    warp::reply::json(&serde_json::json!({"error": "Domaine invalide (.watt / .chain) ou retrait invalide (montant > 0, adresse L1 <kyber>.<R>)." })),
                     warp::http::StatusCode::BAD_REQUEST,
                 );
             }

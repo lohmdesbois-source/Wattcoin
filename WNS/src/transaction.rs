@@ -47,13 +47,17 @@ impl L2Transaction {
         result
     }
 }
-
+// Un bloc WNS = UN ancrage L1 : il porte exactement les champs signés par anchor_message
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WnsBlock {
-    pub index: u64,
-    pub l2_name: String,        // signé (anchor_message) : la signature ne vaut que pour CE L2
+    pub index: u64,             // = l2_height de l'ancrage
+    pub l2_name: String,        // signé : la signature ne vaut que pour CE L2
     pub l1_parent_hash: String, 
+    pub prev_root: String,      // racine du bloc précédent (L2_GENESIS au premier)
     pub state_root: String,
+    pub l1_height: u64,         // dépôts L1 couverts jusqu'à ce bloc
+    pub l2_total: u64,          // tout l'argent du L2 après ce bloc (compteur 1:1)
+    pub withdrawals: Vec<wattcoin_core::transaction::TransactionOutput>, // = les `unpeg` premières sorties de l'ancrage
     pub sequencer_pubkey: String,
     pub transactions: Vec<L2Transaction>,
     pub signature: String, 

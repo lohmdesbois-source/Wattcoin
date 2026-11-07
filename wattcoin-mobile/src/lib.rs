@@ -42,6 +42,8 @@ const HLTC_LOCK_TIME : u64 = 5; // 720 pour la prod (24H : 720 blocs de 2 min)
 const HLTC_LOCK_BTC_TIME : i64 = 1; // 288 pour la prod (~48H). DOIT rester > délai WATT (HLTC_LOCK_TIME)
 // Taille d'une dépense du HTLC (claim ≈ 138 vB, refund ≈ 130 vB) + marge
 const HTLC_SPEND_VBYTES: u64 = 150;
+/// Frais minimum demandés par le séquenceur WNS (route /send)
+pub const WNS_MIN_FEE: u64 = 2000;
 
 // ===================================================================
 // SWITCH LOCAL / PROD WALLET (identique au node !)
@@ -808,6 +810,15 @@ pub struct Scan {
     pub used_keys: std::collections::HashSet<String>, // déjà brûlé on-chain ou en attente (RAM)
 }
 
+/// UTXO pas encore dépensable selon le consensus : récompense système < MATURITY_BLOCKS,
+/// retrait L2 → L1 (UNPEG_) < UNPEG_DELAY_BLOCKS (fenêtre de contestation)
+fn is_immature(out: &TransactionOutput, height: u64, current_height: u64) -> bool {
+    let age = current_height.saturating_sub(height);
+    let is_system_reward = out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") || out.kyber_capsule.starts_with("MICRO_COINBASE_");
+    (is_system_reward && height > 0 && age < MATURITY_BLOCKS)
+        || (out.kyber_capsule.starts_with("UNPEG_") && age < wattcoin_core::blockchain::UNPEG_DELAY_BLOCKS)
+}
+
 pub async fn scan_my_utxos(kyber_secret_hex: &str, master_seed_hex: &str) -> Result<Scan, String> {
     let res_str = get_all_transactions_cached().await?;
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
@@ -838,7 +849,7 @@ pub async fn scan_my_utxos(kyber_secret_hex: &str, master_seed_hex: &str) -> Res
         for out in &tx.outputs {
             if out.amount == 0 || used_keys.contains(&out.kyber_capsule) || seen.contains(&out.kyber_capsule) { continue; }
             let is_system_reward = out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") || out.kyber_capsule.starts_with("MICRO_COINBASE_");
-            if is_system_reward && height > 0 && current_height.saturating_sub(height) < MATURITY_BLOCKS { continue; }
+            if is_immature(out, height, current_height) { continue; }
             let source_height = if is_system_reward { height } else { 0 };
 
             if let Some(owned) = book.owns_public(out) {
@@ -901,6 +912,7 @@ fn history_label(
     if out.amount == 0 { return None; } // messages / preuves d'existence : pas des fonds
     if book.owns_public(out).is_some() {
         let label = if out.stealth_address.starts_with("JACKPOT_") { "Jackpot gagné ! 🎰" }
+            else if out.kyber_capsule.starts_with("UNPEG_") { "Retrait (Bridge L2 ➡ L1) 🌉" }
             else if out.kyber_capsule.starts_with("HTLC_CLAIM") { "Swap Atomique Réclamé ⚡" }
             else if out.kyber_capsule.starts_with("HTLC_REFUND") { "Remboursement HTLC 🔙" }
             else if out.kyber_capsule.starts_with("SHARE_") { "Part de minage (P2Pool) ⛏" }
@@ -963,13 +975,8 @@ pub async fn get_history(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
             let is_spent = spent_keys_snapshot.contains(&expected_key_image) || pending_snapshot.contains(&expected_key_image);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
-            let mut is_mature = true;
-            let is_system_reward = out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") || out.kyber_capsule.starts_with("MICRO_COINBASE_");
-            
-            if is_system_reward && height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) { 
-                is_mature = false; 
-            }
-            if !is_mature { continue; }
+            // Pas encore mûr (récompense système, ou retrait L2 → L1 en fenêtre de contestation)
+            if is_immature(out, height, current_height) { continue; }
 
             let date_str = if timestamp > 0 {
                 let dt: DateTime<Utc> = DateTime::from_timestamp(timestamp, 0).unwrap_or_default();
@@ -2218,6 +2225,7 @@ pub async fn stake_l2(
     master_seed_hex: String,
 ) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let l2_name = l2_name.trim().to_uppercase(); // nom canonique : le consensus refuse "wns"
     let my_kyber = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).map_err(|_| "❌ Clé Kyber du wallet illisible.".to_string())?;
 
     let schedule = get_fee_schedule().await?;
@@ -2300,6 +2308,7 @@ pub async fn unstake_l2(
     sender_kyber_public_hex: String,
     master_seed_hex: String,
 ) -> Result<String, String> {
+    let l2_name = l2_name.trim().to_uppercase(); // nom canonique
     let schedule = get_fee_schedule().await?;
     let fee = calculate_dynamic_fee(1, 1, false, &schedule);
 
@@ -2440,7 +2449,7 @@ pub async fn get_staked_flames(master_seed_hex: String) -> Result<Vec<(String, u
 
 // 3. Ajoute cette nouvelle fonction pour lire l'API du nœud :
 pub async fn get_l2_status(l2_name: &str) -> Result<serde_json::Value, String> {
-    let res_str = node_call("GET", &format!("/l2/status/{}", l2_name), None).await?;
+    let res_str = node_call("GET", &format!("/l2/status/{}", l2_name.trim().to_uppercase()), None).await?;
     serde_json::from_str(&res_str).map_err(|e| e.to_string())
 }
 
@@ -2659,9 +2668,10 @@ pub fn try_decrypt_output(
     None
 }
 
+/// Pont L1 → L2 : TOUJOURS vers MON compte L2 ("<ma clé kyber>|<ma clé WOTS L2 libre>").
+/// Un compte L2 sans clé WOTS ne peut jamais être dépensé : un pont vers une autre adresse enterrerait les fonds.
 pub async fn bridge_to_l2(
     l2_target_name: String,
-    receiver_pubkey: String,
     amount_flames: u64,
     sender_kyber_secret_hex: String,
     sender_kyber_public_hex: String,
@@ -2669,10 +2679,7 @@ pub async fn bridge_to_l2(
 ) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
-    let clean_recipient = receiver_pubkey.trim().replace("wattcoin:", "").replace("L2_WATT_", "").replace("pq_watt_", "");
-    if clean_recipient.starts_with("Wq") {
-        return Err("❌ Erreur : Le Bridge nécessite l'adresse Kyber complète du destinataire L2, pas l'adresse courte de minage.".to_string());
-    }
+    let l2_target_name = l2_target_name.trim().to_uppercase(); // nom canonique : un seul pont par L2
     let my_kyber = URL_SAFE_NO_PAD.decode(&sender_kyber_public_hex).map_err(|_| "❌ Clé Kyber du wallet illisible.".to_string())?;
 
     let schedule = get_fee_schedule().await?;
@@ -2693,6 +2700,7 @@ pub async fn bridge_to_l2(
     if collected < required_total { return Err("❌ Fonds insuffisants.".to_string()); }
 
     let used_keys = scan.used_keys;
+    let name_for_tx = l2_target_name.clone();
     let tx_pq = tokio::task::spawn_blocking(move || -> Result<Transaction, String> {
         let book = owner::OwnerBook::open(&master_seed_hex)?;
 
@@ -2700,7 +2708,7 @@ pub async fn bridge_to_l2(
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
         let mut outputs = vec![TransactionOutput {
-            stealth_address: format!("BRIDGE_L2_{}", l2_target_name.to_uppercase()),
+            stealth_address: format!("BRIDGE_L2_{}", name_for_tx),
             kyber_capsule: format!("L2_BRIDGE_LOCK_{}", hex::encode(nonce)),
             aes_vault: amount_flames.to_string(),
             amount: amount_flames,
@@ -2712,23 +2720,19 @@ pub async fn bridge_to_l2(
             outputs.push(sealed_output("pq_watt_", &my_kyber, Some(&book.root(0)?), change_amount)?);
         }
 
-        // 3. Destinataire L2 : si c'est MOI ("<kyber>" ou "<kyber>.<R>"), on y joint ma clé WOTS L2 libre
-        //    (clé PUBLIQUE seulement : la clé secrète ne sort jamais du crate wots)
-        let mut final_l2_receiver = clean_recipient.clone();
-        if clean_recipient.split('.').next() == Some(sender_kyber_public_hex.as_str()) {
-            let mut seed_bytes = [0u8; 32];
-            seed_bytes.copy_from_slice(&hex::decode(&master_seed_hex).unwrap_or_default()[0..32]);
-            let mut l2_index = 0u64;
-            let l2_pk_hex = loop {
-                let pk_hex = hex::encode(wots::Wots::public_key(&seed_bytes, l2_index));
-                if !used_keys.contains(&pk_hex) { break pk_hex; }
-                l2_index += 1;
-            };
-            final_l2_receiver = format!("{}|{}", sender_kyber_public_hex, l2_pk_hex);
-        }
+        // 3. Destinataire L2 : MOI, avec ma prochaine clé WOTS L2 libre (clé PUBLIQUE seulement)
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes.copy_from_slice(&hex::decode(&master_seed_hex).unwrap_or_default()[0..32]);
+        let mut l2_index = 0u64;
+        let l2_pk_hex = loop {
+            let pk_hex = hex::encode(wots::Wots::public_key(&seed_bytes, l2_index));
+            if !used_keys.contains(&pk_hex) { break pk_hex; }
+            l2_index += 1;
+        };
+        let my_l2_account = format!("{}|{}", sender_kyber_public_hex, l2_pk_hex);
 
         let mut tx = Transaction {
-            tx_type: TransactionType::L2BridgeLock { l2_target_name: l2_target_name.clone(), l2_receiver_pubkey: final_l2_receiver },
+            tx_type: TransactionType::L2BridgeLock { l2_target_name: name_for_tx.clone(), l2_receiver_pubkey: my_l2_account },
             inputs: selected.iter().map(|u| u.input()).collect(),
             outputs,
             fee,
@@ -2743,7 +2747,8 @@ pub async fn bridge_to_l2(
     }).await.map_err(|e| format!("Erreur du thread CPU : {}", e))??;
 
     crate::submit_signed_tx(&tx_pq).await?; // MÉMOIRE IMMÉDIATE et envoi
-    Ok("✅ Succès".to_string())
+    Ok(format!("✅ {} WATT verrouillés : ils seront crédités sur VOTRE compte {} dès que le bloc L1 sera miné.",
+        format_flames(amount_flames), l2_target_name))
 }
 
 pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, String> {
@@ -2807,13 +2812,8 @@ pub async fn get_history_offline(keys: WalletKeys) -> Result<Vec<HistoryItem>, S
             let is_spent = spent_keys_snapshot.contains(&expected_key_image) || pending_snapshot.contains(&expected_key_image);
             let status_text = if is_spent { "Dépensé" } else { "Disponible" };
 
-            let mut is_mature = true;
-            let is_system_reward = out.stealth_address.starts_with("COINBASE_") || out.stealth_address.starts_with("JACKPOT_") || out.kyber_capsule.starts_with("MICRO_COINBASE_");
-            
-            if is_system_reward && height > 0 && (current_height.saturating_sub(height) < MATURITY_BLOCKS) { 
-                is_mature = false; 
-            }
-            if !is_mature { continue; }
+            // Pas encore mûr (récompense système, ou retrait L2 → L1 en fenêtre de contestation)
+            if is_immature(out, height, current_height) { continue; }
 
             let date_str = if timestamp > 0 {
                 let dt: DateTime<Utc> = DateTime::from_timestamp(timestamp, 0).unwrap_or_default();
@@ -2871,14 +2871,23 @@ pub async fn register_wns_alias(
     }
 
     // On force l'action "Register" en dur !
-    submit_wns_transaction(domain, target, fee, keys, WnsAction::Register).await
+    submit_wns_transaction(domain, target, fee, 0, keys, WnsAction::Register).await
 }
 
-// La vraie mécanique interne (nom de domaine)
+/// Retrait L2 (WNS) → L1 : `amount` quitte le L2 ; le séquenceur DOIT le payer dans son prochain ancrage,
+/// sur une adresse NEUVE à moi "<kyber>.<R_i>" (le L1 refuse tout ancrage qui l'oublie ou le détourne).
+pub async fn withdraw_from_wns(amount: u64, fee: u64, keys: WalletKeys) -> Result<String, String> {
+    if amount == 0 { return Err("❌ Montant de retrait nul.".to_string()); }
+    let destination = new_receive_address(&keys)?;
+    submit_wns_transaction(String::new(), destination, fee, amount, keys, WnsAction::Withdraw).await
+}
+
+// La vraie mécanique interne (nom de domaine, retrait)
 async fn submit_wns_transaction(
     domain: String,
     record_data: String,
     fee: u64,
+    amount: u64,
     keys: WalletKeys,
     action: WnsAction
 ) -> Result<String, String> {
@@ -2893,8 +2902,9 @@ async fn submit_wns_transaction(
     let auth_key = json["authorized_lattice_key"].as_str().unwrap_or("").to_string();
     let nonce = json["nonce"].as_u64().unwrap_or(0);
 
-    if balance < fee {
-        return Err(format!("Fonds insuffisants sur le WNS (Solde: {}). Utilisez l'onglet Bridge.", balance));
+    if balance < fee.saturating_add(amount) {
+        return Err(format!("Fonds insuffisants sur le WNS (Solde : {} WATT, requis : {} WATT). Utilisez le Bridge.",
+            format_flames(balance), format_flames(fee.saturating_add(amount))));
     }
     if auth_key.is_empty() {
         return Err("Votre compte WNS n'est pas initialisé. Faites un premier Bridge.".to_string());
@@ -2928,10 +2938,10 @@ async fn submit_wns_transaction(
             sender_pubkey: pubkey_hex.clone(),
             next_pubkey: next_pubkey_hex, // KEY ROLLING APPLIQUÉ !
             nonce: nonce + 1,
-            action,
+            action: action.clone(),
             domain_name: domain.clone(),
             record_data,
-            amount: 0,
+            amount,
             fee,
             signature: String::new(),
         };
@@ -2947,8 +2957,9 @@ async fn submit_wns_transaction(
             Err(cas) => serde_json::from_slice(&cas.current.ok_or("Journal WNS incohérent.")?).map_err(|e| e.to_string())?,
         }
     };
-    let note = if l2_tx.domain_name != domain {
-        format!(" (⚠️ demande précédente pour '{}' renvoyée à l'identique : une clé WOTS ne signe qu'une fois)", l2_tx.domain_name)
+    let same_request = l2_tx.action == action && l2_tx.domain_name == domain && l2_tx.amount == amount;
+    let note = if !same_request {
+        format!(" (⚠️ demande précédente ({:?} '{}') renvoyée à l'identique : une clé WOTS ne signe qu'une fois. Recommencez ensuite.)", l2_tx.action, l2_tx.domain_name)
     } else { String::new() };
 
     let url = format!("{}/send", resolver);
@@ -2961,7 +2972,13 @@ async fn submit_wns_transaction(
         let mut instant_cache = load_cache();
         instant_cache.known_spent_key_images.insert(pubkey_hex);
         save_cache(&instant_cache);
-        Ok(format!("✅ Réservation/Mise à jour réussie pour '{}' !{}", l2_tx.domain_name, note))
+        let what = if l2_tx.action == WnsAction::Withdraw {
+            format!("Retrait de {} WATT vers le L1 accepté : il arrive après l'ancrage, puis {} blocs de maturation",
+                format_flames(l2_tx.amount), wattcoin_core::blockchain::UNPEG_DELAY_BLOCKS)
+        } else {
+            format!("Réservation/Mise à jour réussie pour '{}'", l2_tx.domain_name)
+        };
+        Ok(format!("✅ {} !{}", what, note))
     } else {
         let err_text = res.text().await.unwrap_or_default();
         Err(format!("❌ Rejeté par le WNS : {}{}", err_text, note))

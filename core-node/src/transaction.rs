@@ -84,8 +84,11 @@ pub enum TransactionType {
     L2Stake { l2_name: String, sequencer_pubkey: String },
     // Le Séquenceur ferme sa chaîne et récupère ses fonds (après un délai de sécurité)
     L2Unstake { l2_name: String },
-    // Le Séquenceur grave l'état de sa chaîne (La racine de son arbre de Merkle) sur le L1
-    L2Anchor { l2_name: String, state_root: String, sequencer_signature: String, withdrawals: Vec<TransactionOutput> },
+    // Le Séquenceur grave l'état de sa chaîne sur le L1. Les ancrages sont CHAÎNÉS (l2_height, prev_root)
+    // et l2_total (somme de TOUS les soldes du L2, portée par la racine) doit égaler la réserve du pont
+    // pour les dépôts L1 jusqu'au bloc l1_height (compteur 1:1).
+    // Les `unpeg` PREMIÈRES sorties de la TX sont les retraits L2 → L1, payés par la réserve du pont.
+    L2Anchor { l2_name: String, l2_height: u64, prev_root: String, state_root: String, l1_height: u64, l2_total: u64, sequencer_signature: String, unpeg: u16 },
 	// L'utilisateur verrouille ses WATT pour lui-même sur le L2 !
     L2BridgeLock { 
         l2_target_name: String,       // ex: "WNS"
@@ -262,6 +265,24 @@ impl Transaction {
         if let TransactionType::L2Anchor { sequencer_signature, .. } = &self.tx_type {
             if serde_json::from_str::<wots::HyperSignature>(sequencer_signature).is_err() { return reject("L2Anchor : signature hypertree illisible."); }
         }
+        // Nom de L2 canonique (A-Z, 0-9, _) : "wns" et "WNS" ne peuvent pas être deux L2 sur le même pont
+        let l2_name = match &self.tx_type {
+            TransactionType::L2Stake { l2_name, .. } | TransactionType::L2Unstake { l2_name } | TransactionType::L2Anchor { l2_name, .. } => Some(l2_name),
+            TransactionType::L2BridgeLock { l2_target_name, .. } => Some(l2_target_name),
+            _ => None,
+        };
+        if let Some(n) = l2_name {
+            if n.is_empty() || n.len() > 32 || !n.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_') {
+                return reject("nom de L2 invalide (A-Z, 0-9, _ ; 32 caractères max).");
+            }
+        }
+        // Retraits L2 → L1 : les `unpeg` premières sorties d'un ancrage. L'identifiant UNPEG_… leur est RÉSERVÉ
+        // (personne ne peut fabriquer un faux UTXO du même identifiant pour bloquer un retrait).
+        let unpeg_count = if let TransactionType::L2Anchor { unpeg, .. } = &self.tx_type { *unpeg as usize } else { 0 };
+        if unpeg_count > self.outputs.len() { return reject("L2Anchor : plus de retraits que de sorties."); }
+        if self.outputs.iter().skip(unpeg_count).any(|o| o.kyber_capsule.starts_with("UNPEG_")) {
+            return reject("identifiant UNPEG_ réservé aux retraits L2 → L1.");
+        }
 
         // 6. Validation de la Preuve de Secret (HTLC)
         if let TransactionType::HTLCClaim { secret } = &self.tx_type {
@@ -301,6 +322,10 @@ impl Transaction {
                 None => return false,
             };
 
+            // Ancrage L2 : les retraits sont payés par la réserve du pont (vérifiée par check_anchor_tx), pas par les inputs
+            let Some(unpegged) = self.outputs.iter().take(unpeg_count).try_fold(0u64, |acc, o| acc.checked_add(o.amount)) else { return false };
+            let Some(sum_in) = sum_in.checked_add(unpegged) else { return false };
+
             if sum_in != expected_in {
                 println!("⛔ Rejet : Les montants ne s'équilibrent pas (Entrée: {}, Sortie+Frais: {}).", sum_in, expected_in);
                 return false;
@@ -314,18 +339,38 @@ impl Transaction {
 // =====================================================================
 // PROPRIÉTÉ DES OUTPUTS : un output appartient à une racine hypertree R
 // =====================================================================
+/// Racine "précédente" du tout premier ancrage d'un L2
+pub const L2_GENESIS_ROOT: &str = "L2_GENESIS";
 
 /// Message signé par le séquenceur pour ancrer un état L2.
-/// Lié au nom du L2 : une signature ne peut pas être rejouée d'un L2 à l'autre.
-pub fn anchor_message(l2_name: &str, state_root: &str) -> [u8; 64] {
+/// Couvre le nom du L2 (pas de rejeu entre L2), le maillon (l2_height, prev_root),
+/// l'état, la hauteur L1 des dépôts couverts, le total 1:1 et CHAQUE retrait (adresse, identifiant, montant).
+pub fn anchor_message(l2_name: &str, l2_height: u64, prev_root: &str, state_root: &str, l1_height: u64, l2_total: u64, withdrawals: &[TransactionOutput]) -> [u8; 64] {
     let mut h = Sha512::new();
-    h.update(b"wattcoin/l2anchor");
-    h.update((l2_name.len() as u64).to_be_bytes());
-    h.update(l2_name.as_bytes());
-    h.update(state_root.as_bytes());
+    h.update(b"wattcoin/l2anchor/v3");
+    for s in [l2_name, prev_root, state_root] {
+        h.update((s.len() as u64).to_be_bytes());
+        h.update(s.as_bytes());
+    }
+    h.update(l2_height.to_be_bytes());
+    h.update(l1_height.to_be_bytes());
+    h.update(l2_total.to_be_bytes());
+    h.update((withdrawals.len() as u64).to_be_bytes());
+    for w in withdrawals {
+        for s in [&w.stealth_address, &w.kyber_capsule] {
+            h.update((s.len() as u64).to_be_bytes());
+            h.update(s.as_bytes());
+        }
+        h.update(w.amount.to_be_bytes());
+    }
     let mut out = [0u8; 64];
     out.copy_from_slice(&h.finalize());
     out
+}
+
+/// Identifiant (UTXO) du i-ème retrait de l'ancrage #l2_height : unique, car un maillon n'existe qu'une fois
+pub fn unpeg_capsule(l2_name: &str, l2_height: u64, i: usize) -> String {
+    format!("UNPEG_{}_{}_{}", l2_name, l2_height, i)
 }
 
 /// Engagement caché d'un output : H("wattcoin/owner" || R || otp)
@@ -456,21 +501,30 @@ mod owner_tests {
         assert!(!signed_tx(&[0, 0], &[0, 1]).is_valid());       // même racine deux fois
     }
 	
-	    #[test]
+	#[test]
     fn ancrage_l2_feuille_brulee() {
         let mut seq = wots::HyperKeys::new(&[9u8; 32], 0);
         let root = seq.root();
-        let msg = anchor_message("WNS", "racine_etat");
+        let retrait = TransactionOutput { stealth_address: format!("kyberB64.{}", hex::encode([4u8; 32])),
+            kyber_capsule: unpeg_capsule("WNS", 1, 0), aes_vault: "200".into(), amount: 200 };
+        let w = vec![retrait.clone()];
+        let msg = anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &w);
         let sig = seq.sign(0, &msg, |_| false, |_| true).unwrap();
         assert!(sig.verify(&msg, &root));
-        assert!(!sig.verify(&anchor_message("WNS", "autre_racine"), &root));   // état falsifié
-        assert!(!sig.verify(&anchor_message("AUTRE", "racine_etat"), &root));  // rejeu sur un autre L2
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "autre_racine", 5, 1_000, &w), &root)); // état falsifié
+        assert!(!sig.verify(&anchor_message("AUTRE", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &w), &root)); // rejeu sur un autre L2
+        assert!(!sig.verify(&anchor_message("WNS", 2, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &w), &root));  // autre maillon
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 9_999, &w), &root));  // total 1:1 falsifié
+        let mut detourne = retrait.clone(); detourne.stealth_address = format!("kyberB64.{}", hex::encode([5u8; 32]));
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &[detourne]), &root)); // retrait détourné
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &[]), &root));         // retrait supprimé
 
         let leaf = sig.one_time_key_hex();
         let tx = Transaction {
-            tx_type: TransactionType::L2Anchor { l2_name: "WNS".into(), state_root: "racine_etat".into(),
-                sequencer_signature: serde_json::to_string(&sig).unwrap(), withdrawals: vec![] },
-            inputs: vec![], outputs: vec![], fee: 0, wots_signature: None, public_key: String::new(), owners: vec![],
+            tx_type: TransactionType::L2Anchor { l2_name: "WNS".into(), l2_height: 1, prev_root: L2_GENESIS_ROOT.into(),
+                state_root: "racine_etat".into(), l1_height: 5, l2_total: 1_000,
+                sequencer_signature: serde_json::to_string(&sig).unwrap(), unpeg: 1 },
+            inputs: vec![], outputs: w, fee: 0, wots_signature: None, public_key: String::new(), owners: vec![],
         };
         assert_eq!(tx.one_time_keys(), vec![leaf]); // la feuille de l'ancrage part dans spent_key_images
     }

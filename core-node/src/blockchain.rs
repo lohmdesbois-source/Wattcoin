@@ -12,6 +12,7 @@ const FLAME: u64 = 1_000_000_000;
 const MAX_BLOCK_SIZE_BYTES: usize = 32 * 1024 * 1024; // 32 Mo maximum par bloc !
 const MAX_BLOCK_L2_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2 Mo maximum par microbloc !
 const MATURITY_BLOCKS: u64 = 1; // 12 Prod
+pub const UNPEG_DELAY_BLOCKS: u64 = 10; // 720 Prod (1 jour) : fenêtre de contestation des retraits L2 → L1
 const EXPECTED_BLOCK_TIME: u64 = 120;    // 2 mins (120 s)
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
@@ -141,61 +142,141 @@ impl Blockchain {
 		Ok(())
 	}
 	
-	// Règle ANCRAGE L2 unique : utilisée par validate, prepare et la mempool.
-	// Le séquenceur élu par le VRF signe anchor_message(l2_name, state_root) avec UNE feuille
-	// de son hypertree (racine R stakée). La feuille est brûlée via Transaction::one_time_keys.
-	pub fn check_anchor_tx(&self, tx: &Transaction) -> Result<(), String> {
-		let (l2_name, state_root, sequencer_signature) = match &tx.tx_type {
-			TransactionType::L2Anchor { l2_name, state_root, sequencer_signature, .. } => (l2_name, state_root, sequencer_signature),
-			_ => return Ok(()),
-		};
-
-		let mut active_sequencers: HashSet<String> = HashSet::new();
-		for result in self.db.iter() {
-			if let Ok((_, value)) = result {
-				if let Ok(b) = bincode::deserialize::<Block>(&value) {
-					for past_tx in &b.transactions {
-						if let TransactionType::L2Stake { l2_name: staked_name, sequencer_pubkey } = &past_tx.tx_type {
-							if staked_name == l2_name { active_sequencers.insert(sequencer_pubkey.clone()); }
-						}
-						if let TransactionType::L2Unstake { l2_name: unstaked_name } = &past_tx.tx_type {
-							if unstaked_name == l2_name { active_sequencers.clear(); }
+	// Séquenceurs actifs d'un L2 : une caution (son UTXO L2_STAKE_) = une racine R.
+	// Un unstake ne retire QUE la caution qu'il dépense : les autres séquenceurs restent actifs.
+	pub fn active_sequencers(&self, l2_name: &str) -> Vec<String> {
+		let mut stakes: std::collections::HashMap<String, String> = std::collections::HashMap::new(); // UTXO de caution -> R
+		for i in 0..=self.current_height {
+			let Some(b) = self.get_block_by_height(i) else { continue };
+			for past_tx in &b.transactions {
+				match &past_tx.tx_type {
+					TransactionType::L2Stake { l2_name: name, sequencer_pubkey } if name == l2_name => {
+						if let Some(o) = past_tx.outputs.iter().find(|o| o.stealth_address.starts_with("L2_STAKE_")) {
+							stakes.insert(o.kyber_capsule.clone(), sequencer_pubkey.clone());
 						}
 					}
+					TransactionType::L2Unstake { l2_name: name } if name == l2_name => {
+						for input in &past_tx.inputs { stakes.remove(&input.utxo_id); }
+					}
+					_ => {}
 				}
 			}
 		}
-		if active_sequencers.is_empty() {
-			return Err(format!("❌ FRAUDE : La L2 '{}' n'a aucun staker actif !", l2_name));
-		}
+		let mut roots: Vec<String> = stakes.into_values().collect();
+		roots.sort();
+		roots.dedup();
+		roots
+	}
 
-		// VRF : score imprévisible par séquenceur, le plus petit gagne
-		let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
-		candidates.sort();
-		let last_block_hash = &self.get_last_block().header.hash;
-		let mut legit_sequencer = String::new();
-		let mut lowest_score = [0xFFu8; 32];
-		for candidate in &candidates {
+	// VRF : score imprévisible par séquenceur actif, le plus petit gagne (même règle pour le consensus et l'API)
+	pub fn elected_sequencer(&self, l2_name: &str) -> Option<String> {
+		let last_block_hash = self.get_last_block().header.hash;
+		self.active_sequencers(l2_name).into_iter().min_by_key(|candidate| {
 			let mut vrf_hasher = sha2::Sha256::new();
 			vrf_hasher.update(last_block_hash.as_bytes());
 			vrf_hasher.update(l2_name.as_bytes());
 			vrf_hasher.update(candidate.as_bytes());
-			let mut vrf_hash = [0u8; 32];
-			vrf_hash.copy_from_slice(&vrf_hasher.finalize());
-			if vrf_hash < lowest_score {
-				lowest_score = vrf_hash;
-				legit_sequencer = candidate.clone();
+			let vrf_hash: [u8; 32] = vrf_hasher.finalize().into();
+			vrf_hash
+		})
+	}
+
+	// Dernier ancrage gravé d'un L2 : (l2_height, state_root, l1_height, l2_total).
+	// Aucun ancrage : (0, L2_GENESIS_ROOT, 0, 0)
+	pub fn last_anchor(&self, l2_name: &str) -> (u64, String, u64, u64) {
+		for i in (0..=self.current_height).rev() {
+			let Some(b) = self.get_block_by_height(i) else { continue };
+			for tx in b.transactions.iter().rev() {
+				if let TransactionType::L2Anchor { l2_name: name, l2_height, state_root, l1_height, l2_total, .. } = &tx.tx_type {
+					if name == l2_name { return (*l2_height, state_root.clone(), *l1_height, *l2_total); }
+				}
 			}
 		}
+		(0, crate::transaction::L2_GENESIS_ROOT.to_string(), 0, 0)
+	}
 
-		// La signature hypertree doit remonter à la racine R du séquenceur élu
+	// Réserve du pont d'un L2 = dépôts L2BridgeLock jusqu'au bloc L1 `up_to` inclus − TOUS les retraits déjà payés
+	pub fn bridge_reserve(&self, l2_name: &str, up_to: u64) -> u64 {
+		let official_bridge_address = format!("BRIDGE_L2_{}", l2_name);
+		let (mut deposits, mut withdrawn) = (0u64, 0u64);
+		for i in 0..=self.current_height {
+			let Some(b) = self.get_block_by_height(i) else { continue };
+			for tx in &b.transactions {
+				match &tx.tx_type {
+					TransactionType::L2BridgeLock { l2_target_name, .. } if l2_target_name == l2_name && i <= up_to => {
+						if let Some(o) = tx.outputs.first() {
+							if o.stealth_address == official_bridge_address { deposits = deposits.saturating_add(o.amount); }
+						}
+					}
+					TransactionType::L2Anchor { l2_name: name, unpeg, .. } if name == l2_name => {
+						for o in tx.outputs.iter().take(*unpeg as usize) { withdrawn = withdrawn.saturating_add(o.amount); }
+					}
+					_ => {}
+				}
+			}
+		}
+		deposits.saturating_sub(withdrawn)
+	}
+
+	// Règle ANCRAGE L2 unique : utilisée par validate, prepare, la mempool et la purge.
+	// 1 ancrage par L2 et par bloc, chaîné au précédent, retraits ≤ réserve, total 1:1 avec la réserve restante,
+	// signé par UNE feuille hypertree du séquenceur élu (brûlée via Transaction::one_time_keys).
+	pub fn check_anchor_tx(&self, tx: &Transaction, anchored_in_block: &mut HashSet<String>) -> Result<(), String> {
+		let TransactionType::L2Anchor { l2_name, l2_height, prev_root, state_root, l1_height, l2_total, sequencer_signature, unpeg } = &tx.tx_type else {
+			return Ok(());
+		};
+
+		// 1. Un seul ancrage par L2 et par bloc
+		if anchored_in_block.contains(l2_name) {
+			return Err(format!("❌ ANCRAGE : un seul ancrage de '{}' par bloc.", l2_name));
+		}
+
+		// 2. Ancrages chaînés : il prolonge EXACTEMENT le dernier ancrage gravé (ni fourche, ni rejeu)
+		let (last_height, last_root, last_l1, _) = self.last_anchor(l2_name);
+		if *l2_height != last_height + 1 || prev_root != &last_root {
+			return Err(format!("❌ ANCRAGE : '{}' doit prolonger l'ancrage #{} (reçu #{} sur une autre racine).", l2_name, last_height, l2_height));
+		}
+
+		// 3. Les dépôts couverts ne reculent jamais et existent déjà sur le L1
+		if *l1_height < last_l1 || *l1_height > self.current_height {
+			return Err(format!("❌ ANCRAGE : hauteur L1 couverte invalide ({}, attendu {}..={}).", l1_height, last_l1, self.current_height));
+		}
+
+		// 4. Retraits L2 → L1 : vers une adresse propriétaire <kyber>.<R>, montant > 0, identifiant fixé par le consensus
+		let withdrawals = &tx.outputs[..(*unpeg as usize).min(tx.outputs.len())];
+		let mut withdrawn = 0u64;
+		for (i, o) in withdrawals.iter().enumerate() {
+			let owner_ok = o.stealth_address.rsplit_once('.').map_or(false, |(_, r)| crate::transaction::decode32(r).is_some());
+			if !owner_ok || o.amount == 0 || o.aes_vault != o.amount.to_string()
+				|| o.kyber_capsule != crate::transaction::unpeg_capsule(l2_name, *l2_height, i) {
+				return Err(format!("❌ RETRAIT : sortie #{} invalide (adresse <kyber>.<R>, montant > 0, identifiant UNPEG_…).", i));
+			}
+			withdrawn = withdrawn.checked_add(o.amount).ok_or("❌ RETRAIT : débordement.")?;
+		}
+
+		// 5. Compteur 1:1 : jamais plus que la réserve, et le L2 garde EXACTEMENT le reste
+		let reserve = self.bridge_reserve(l2_name, *l1_height);
+		if withdrawn > reserve {
+			return Err(format!("❌ FRAUDE : '{}' veut retirer {} Flames, la réserve du pont n'en a que {}.", l2_name, withdrawn, reserve));
+		}
+		if *l2_total != reserve - withdrawn {
+			return Err(format!("❌ FRAUDE 1:1 : '{}' déclare {} Flames sur le L2, il doit en rester {} (réserve {} − retraits {}).",
+				l2_name, l2_total, reserve - withdrawn, reserve, withdrawn));
+		}
+
+		// 6. Signé par le séquenceur élu par le VRF (une feuille de son hypertree), retraits compris
+		let legit_sequencer = self.elected_sequencer(l2_name)
+			.ok_or_else(|| format!("❌ FRAUDE : La L2 '{}' n'a aucun staker actif !", l2_name))?;
 		let root = crate::transaction::decode32(&legit_sequencer)
 			.ok_or("❌ FRAUDE VRF : le séquenceur élu n'a pas de racine hypertree valide.")?;
 		let sig: wots::HyperSignature = serde_json::from_str(sequencer_signature)
 			.map_err(|_| format!("❌ Signature hypertree illisible pour la L2 '{}'", l2_name))?;
-		if !sig.verify(&crate::transaction::anchor_message(l2_name, state_root), &root) {
-			return Err("❌ FRAUDE VRF : la state_root n'est pas signée par le séquenceur élu.".into());
+		let msg = crate::transaction::anchor_message(l2_name, *l2_height, prev_root, state_root, *l1_height, *l2_total, withdrawals);
+		if !sig.verify(&msg, &root) {
+			return Err("❌ FRAUDE VRF : l'ancrage n'est pas signé par le séquenceur élu.".into());
 		}
+
+		anchored_in_block.insert(l2_name.clone()); // seulement si tout est OK
 		Ok(())
 	}
 
@@ -244,17 +325,24 @@ impl Blockchain {
 		Ok(())
 	}
 
-	// Récompenses système (coinbase, jackpot) encore immatures, identifiées par leur UTXO
+	// UTXO encore immatures, identifiés par leur UTXO :
+	// - récompenses système (coinbase, jackpot) : MATURITY_BLOCKS
+	// - retraits L2 → L1 (les `unpeg` premières sorties d'un ancrage) : UNPEG_DELAY_BLOCKS (fenêtre de contestation)
 	fn immature_utxos(&self, height: u64) -> HashSet<String> {
 		let mut set = HashSet::new();
-		let scan_limit = height.saturating_sub(MATURITY_BLOCKS);
+		let window = MATURITY_BLOCKS.max(UNPEG_DELAY_BLOCKS);
 		for i in (0..=self.current_height).rev() {
-			if i <= scan_limit { break; }
-			if let Some(b) = self.get_block_by_height(i) {
-				for past_tx in &b.transactions {
-					if matches!(past_tx.tx_type, TransactionType::Coinbase | TransactionType::LotteryPayout { .. }) {
+			if i + window <= height { break; }
+			let Some(b) = self.get_block_by_height(i) else { continue };
+			for past_tx in &b.transactions {
+				match &past_tx.tx_type {
+					TransactionType::Coinbase | TransactionType::LotteryPayout { .. } if i + MATURITY_BLOCKS > height => {
 						for out in &past_tx.outputs { set.insert(out.kyber_capsule.clone()); }
 					}
+					TransactionType::L2Anchor { unpeg, .. } if i + UNPEG_DELAY_BLOCKS > height => {
+						for out in past_tx.outputs.iter().take(*unpeg as usize) { set.insert(out.kyber_capsule.clone()); }
+					}
+					_ => {}
 				}
 			}
 		}
@@ -514,6 +602,7 @@ impl Blockchain {
         let immature_utxos = self.immature_utxos(current_height);
 		
 		let mut block_htlc_settled = HashSet::new();
+		let mut block_anchored = HashSet::new();
 
         for tx in &transactions {
 			// On ignore les parts ici, on les traitera proprement après
@@ -605,7 +694,7 @@ impl Blockchain {
 				}
 
 				// Ancrage L2 - Même règle que le validateur (fonction unique)
-				if let Err(e) = self.check_anchor_tx(tx) {
+				if let Err(e) = self.check_anchor_tx(tx, &mut block_anchored) {
 					println!("⛔ Rejet {}", e);
 					continue;
 				}
@@ -1242,6 +1331,11 @@ impl Blockchain {
 		if block.header.hash != hex::encode(&hash_bytes) { 
 			return Err("Hash frauduleux.".to_string()); 
 		}
+		// La difficulté est une règle de CONSENSUS : le hash doit atteindre la cible de CE bloc
+		// (cible déterministe, recalculée à l'identique par tous les nœuds)
+		if num_bigint::BigUint::from_bytes_be(&hash_bytes) > self.target {
+			return Err("❌ FRAUDE : Preuve de travail sous la difficulté requise.".to_string());
+		}
 
 		// On parse le hash du BLOC, pas une variable "hash" inexistante
 		let hash_bigint = num_bigint::BigUint::parse_bytes(block.header.hash.as_bytes(), 16).unwrap_or_default();
@@ -1286,6 +1380,7 @@ impl Blockchain {
         };
 		
 		let mut block_htlc_settled = HashSet::new();
+		let mut block_anchored = HashSet::new();
 
         for tx in &block.transactions {
 			if tx.tx_type == TransactionType::Coinbase {
@@ -1461,9 +1556,9 @@ impl Blockchain {
 				println!("🌉 [BRIDGE L2] {} Flames verrouillés publiquement pour le réseau {}", bridge_amount, l2_target_name);
 			}
 			
-            if let TransactionType::L2Anchor { l2_name, state_root, .. } = &tx.tx_type {
-                self.check_anchor_tx(tx)?;
-                println!("🔗 [INTEROPÉRABILITÉ] État '{}' ancré par le Séquenceur VRF légitime ! (Root: {})", l2_name, state_root);
+            if let TransactionType::L2Anchor { l2_name, l2_height, state_root, l2_total, .. } = &tx.tx_type {
+                self.check_anchor_tx(tx, &mut block_anchored)?;
+                println!("🔗 [INTEROPÉRABILITÉ] État '{}' #{} ancré par le Séquenceur VRF légitime ! (Root: {}, 1:1 = {} Flames)", l2_name, l2_height, state_root, l2_total);
             }
 
 			total_block_fees += tx.fee;
@@ -1738,7 +1833,8 @@ impl Blockchain {
     pub fn recalculate_target_from_scratch(&mut self) {
         let max_target = num_bigint::BigUint::from_bytes_be(&[0xFF; 32]);
         let mut current_target = &max_target >> INITIAL_DIFFICULTY_SHIFT; 
-        let window_size = 17;
+        // MÊME fenêtre que update_target : un nœud redémarré calcule EXACTEMENT la cible d'un nœud resté allumé
+        let window_size = FENETRE_DIFFICULTY as u64;
         
         for i in 2..=(self.current_height + 1) { 
             let start_idx = if i > window_size { i - window_size } else { 0 };
@@ -1842,5 +1938,150 @@ impl Blockchain {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod l2_tests {
+    use super::*;
+    use crate::transaction::TransactionInput;
+
+    fn tx(tx_type: TransactionType, inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput>) -> Transaction {
+        Transaction { tx_type, inputs, outputs, fee: 0, wots_signature: None, public_key: String::new(), owners: vec![] }
+    }
+
+    fn stake(r: &str, capsule: &str) -> Transaction {
+        tx(TransactionType::L2Stake { l2_name: "WNS".into(), sequencer_pubkey: r.into() }, vec![],
+           vec![TransactionOutput { stealth_address: "L2_STAKE_cle".into(), kyber_capsule: capsule.into(), aes_vault: String::new(), amount: 1 }])
+    }
+
+    fn block(index: u64, transactions: Vec<Transaction>) -> Block {
+        Block { header: BlockHeader { index, timestamp: 0, previous_hash: String::new(), hash: format!("h{}", index),
+            nonce: 0, target_hex: String::new(), l2_root: String::new(), tx_root: String::new() }, transactions }
+    }
+
+    #[test]
+    fn unstake_ne_retire_que_sa_caution() {
+        let path = std::env::temp_dir().join(format!("wattcoin_l2_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut chain = Blockchain::new(path.to_str().unwrap()).unwrap();
+
+        let (r1, r2) = (hex::encode([1u8; 32]), hex::encode([2u8; 32]));
+        chain.push_block(&block(1, vec![stake(&r1, "caution_1"), stake(&r2, "caution_2")])).unwrap();
+        assert_eq!(chain.active_sequencers("WNS"), vec![r1.clone(), r2.clone()]);
+        assert!(chain.active_sequencers("AUTRE").is_empty());
+
+        let unstake = tx(TransactionType::L2Unstake { l2_name: "WNS".into() },
+            vec![TransactionInput { utxo_id: "caution_1".into(), amount: 1, source_height: 1, owner_otp: String::new(), owner: 0 }], vec![]);
+        chain.push_block(&block(2, vec![unstake])).unwrap();
+        assert_eq!(chain.active_sequencers("WNS"), vec![r2.clone()]); // R2 reste actif
+        assert_eq!(chain.elected_sequencer("WNS"), Some(r2));
+
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    fn anchor(keys: &mut wots::HyperKeys, leaf: u64, l2_height: u64, prev_root: &str, state_root: &str, l1_height: u64, l2_total: u64,
+              withdrawals: Vec<TransactionOutput>) -> Transaction {
+        let msg = crate::transaction::anchor_message("WNS", l2_height, prev_root, state_root, l1_height, l2_total, &withdrawals);
+        let sig = keys.sign(leaf, &msg, |_| false, |_| true).unwrap();
+        let unpeg = withdrawals.len() as u16;
+        tx(TransactionType::L2Anchor { l2_name: "WNS".into(), l2_height, prev_root: prev_root.into(), state_root: state_root.into(),
+            l1_height, l2_total, sequencer_signature: serde_json::to_string(&sig).unwrap(), unpeg }, vec![], withdrawals)
+    }
+
+    #[test]
+    fn ancrages_chaines_et_compteur_1_1() {
+        let path = std::env::temp_dir().join(format!("wattcoin_anchor_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut chain = Blockchain::new(path.to_str().unwrap()).unwrap();
+
+        // Un séquenceur staké + un dépôt de 5 Flames sur le pont du WNS
+        let mut seq = wots::HyperKeys::new(&[9u8; 32], 0);
+        let r = hex::encode(seq.root());
+        let lock = tx(TransactionType::L2BridgeLock { l2_target_name: "WNS".into(), l2_receiver_pubkey: "compte|cle".into() }, vec![],
+            vec![TransactionOutput { stealth_address: "BRIDGE_L2_WNS".into(), kyber_capsule: "depot_1".into(), aes_vault: "5".into(), amount: 5 }]);
+        chain.push_block(&block(1, vec![stake(&r, "caution_1"), lock])).unwrap();
+        assert_eq!(chain.bridge_reserve("WNS", 1), 5);
+
+        let genesis = crate::transaction::L2_GENESIS_ROOT;
+        let a1 = anchor(&mut seq, 0, 1, genesis, "etat_1", 1, 5, vec![]);
+        assert!(chain.check_anchor_tx(&a1, &mut HashSet::new()).is_ok());
+
+        let mut faux = a1.clone(); // le séquenceur gonfle son L2 : 6 ≠ réserve 5
+        if let TransactionType::L2Anchor { l2_total, .. } = &mut faux.tx_type { *l2_total = 6; }
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut faux = a1.clone(); // état modifié après signature
+        if let TransactionType::L2Anchor { state_root, .. } = &mut faux.tx_type { *state_root = "etat_pirate".into(); }
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut faux = a1.clone(); // dépôts "couverts" d'un bloc qui n'existe pas encore
+        if let TransactionType::L2Anchor { l1_height, .. } = &mut faux.tx_type { *l1_height = 99; }
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut deja = HashSet::new(); // deux ancrages du même L2 dans un bloc
+        assert!(chain.check_anchor_tx(&a1, &mut deja).is_ok());
+        assert!(chain.check_anchor_tx(&a1, &mut deja).is_err());
+
+        chain.push_block(&block(2, vec![a1.clone()])).unwrap();
+        assert_eq!(chain.last_anchor("WNS"), (1, "etat_1".to_string(), 1, 5));
+        assert!(chain.check_anchor_tx(&a1, &mut HashSet::new()).is_err()); // rejeu du même maillon
+
+        // Maillon 2 : retrait de 2 Flames vers une adresse propriétaire → il reste 3 sur le L2
+        let dest = format!("kyberB64.{}", hex::encode([4u8; 32]));
+        let retrait = TransactionOutput { stealth_address: dest.clone(), kyber_capsule: crate::transaction::unpeg_capsule("WNS", 2, 0),
+            aes_vault: "2".into(), amount: 2 };
+        let a2 = anchor(&mut seq, 1, 2, "etat_1", "etat_2", 2, 3, vec![retrait]);
+        assert!(chain.check_anchor_tx(&a2, &mut HashSet::new()).is_ok());
+
+        let mut fourche = a2.clone(); // maillon 2 accroché à la mauvaise racine
+        if let TransactionType::L2Anchor { prev_root, .. } = &mut fourche.tx_type { *prev_root = genesis.into(); }
+        assert!(chain.check_anchor_tx(&fourche, &mut HashSet::new()).is_err());
+        let mut faux = a2.clone(); // retrait non débité du L2 : 5 + 2 sortiraient d'une réserve de 5
+        if let TransactionType::L2Anchor { l2_total, .. } = &mut faux.tx_type { *l2_total = 5; }
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut faux = a2.clone(); // plus que la réserve
+        faux.outputs[0].amount = 6; faux.outputs[0].aes_vault = "6".into();
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut faux = a2.clone(); // R nu : output indépensable
+        faux.outputs[0].stealth_address = hex::encode([4u8; 32]);
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut faux = a2.clone(); // identifiant d'un autre maillon
+        faux.outputs[0].kyber_capsule = crate::transaction::unpeg_capsule("WNS", 1, 0);
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut faux = a2.clone(); // retrait détourné après signature
+        faux.outputs[0].stealth_address = format!("kyberB64.{}", hex::encode([5u8; 32]));
+        assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+
+        // Gravé : la réserve tombe à 3, le retrait reste immature pendant UNPEG_DELAY_BLOCKS
+        chain.push_block(&block(3, vec![a2.clone()])).unwrap();
+        assert_eq!(chain.bridge_reserve("WNS", 3), 3);
+        let id = crate::transaction::unpeg_capsule("WNS", 2, 0);
+        assert!(chain.immature_utxos(4).contains(&id));
+        assert!(!chain.immature_utxos(3 + UNPEG_DELAY_BLOCKS).contains(&id));
+
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+	
+    #[test]
+    fn difficulte_identique_apres_redemarrage() {
+        let path = std::env::temp_dir().join(format!("wattcoin_target_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut chain = Blockchain::new(path.to_str().unwrap()).unwrap();
+
+        // Temps de bloc irréguliers, sur plus de 17 blocs
+        let mut ts = 1_791_472_320i64;
+        for (i, dt) in [30i64, 400, 90, 5, 250, 120, 60, 700, 15, 180].iter().cycle().take(40).enumerate() {
+            ts += dt;
+            let mut b = block(i as u64 + 1, vec![]);
+            b.header.timestamp = ts;
+            chain.push_block(&b).unwrap();
+            chain.update_target(); // un nœud qui tourne sans s'arrêter
+        }
+        let running = chain.target.clone();
+        chain.recalculate_target_from_scratch(); // le même nœud après un redémarrage
+        assert_eq!(chain.target, running);
+
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

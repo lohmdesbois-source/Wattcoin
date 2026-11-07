@@ -8,6 +8,13 @@ use sha2::{Digest, Sha256};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use wattcoin_core::transaction::{can_spend, decode32, owner_commit, OwnerProof, Transaction, TransactionOutput, MAX_OWNERS};
 
+
+/// Restauration : nombre d'index consécutifs sans paiement avant d'arrêter la recherche.
+/// Large : chaque « Copier » / « QR » / retrait WNS consomme un index, payé ou non.
+/// (Coût unique : chaque R_i calculée est mémorisée dans le carnet.)
+pub const ADDRESS_GAP: u64 = 200;
+
+
 fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
     for p in parts { h.update(p); }
@@ -41,9 +48,6 @@ pub fn stealth_address(prefix: &str, root: &[u8; 32], otp: &[u8; 32]) -> String 
 pub fn payload(amount: u64, otp: &[u8; 32], root: &[u8; 32]) -> String {
     format!("{}|{}|{}", amount, hex::encode(otp), hex::encode(root))
 }
-
-/// Restauration : nombre d'index consécutifs sans paiement avant d'arrêter la recherche
-pub const ADDRESS_GAP: u64 = 20;
 
 /// R annoncée par un payload "montant|otp|R", SEULEMENT si elle ouvre l'engagement on-chain.
 /// (Ne dit pas si R est à moi : c'est le rôle de OwnerBook::sub_of.)
@@ -156,6 +160,8 @@ impl OwnerBook {
     /// Restauration (48 mots) : le carnet est vide. On redérive les R_i à partir du prochain
     /// index libre jusqu'à retrouver celles de `wanted`, ou `gap` index consécutifs sans paiement.
     pub fn discover(&self, wanted: &std::collections::HashSet<[u8; 32]>, gap: u64) -> Result<(), String> {
+        // R_0 (minage, monnaie rendue, alias WNS) n'est jamais dans la plage next_sub (≥ 1) : on la mémorise d'abord
+        self.root(0)?;
         let mut left = wanted.iter().filter(|r| self.sub_of(r).is_none()).count();
         let mut sub = self.get_u64("next_sub").unwrap_or(1);
         let mut misses = 0;
@@ -289,6 +295,10 @@ mod tests {
         fresh.discover(&[r5].into_iter().collect(), ADDRESS_GAP).unwrap();
         assert_eq!(fresh.sub_of(&r5), Some(5));
         assert_eq!(fresh.get_u64("next_sub"), Some(6));                      // « Recevoir » repart après
+        let r0 = old.root(0).unwrap();                                       // monnaie / alias : la R_0
+        let fresh0 = book();
+        fresh0.discover(&[r0].into_iter().collect(), ADDRESS_GAP).unwrap();
+        assert_eq!(fresh0.sub_of(&r0), Some(0));                             // retrouvée malgré next_sub ≥ 1
         let junk = [9u8; 32];                                                // R inconnue : s'arrête au gap
         fresh.discover(&[junk].into_iter().collect(), 3).unwrap();
         assert_eq!(fresh.sub_of(&junk), None);

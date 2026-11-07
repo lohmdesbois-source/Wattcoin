@@ -75,8 +75,9 @@ mod tests {
         let mut s = SequencerSigner::new(&[5u8; 32], tree.clone());
         let root = s.keys.root();
 
-        let m1 = wattcoin_core::transaction::anchor_message("WNS", "etat_1");
-        let m2 = wattcoin_core::transaction::anchor_message("WNS", "etat_2");
+        let genesis = wattcoin_core::transaction::L2_GENESIS_ROOT;
+        let m1 = wattcoin_core::transaction::anchor_message("WNS", 1, genesis, "etat_1", 0, 0, &[]);
+        let m2 = wattcoin_core::transaction::anchor_message("WNS", 2, "etat_1", "etat_2", 0, 0, &[]);
         let a = s.sign(&m1).unwrap();
         let b = s.sign(&m2).unwrap();
         assert!(a.verify(&m1, &root) && b.verify(&m2, &root));

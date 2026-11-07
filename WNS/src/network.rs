@@ -145,8 +145,9 @@ pub fn start_peer_connection(
                     if block.index == state_guard.block_index + 1 {
                         println!("📦 [WNS P2P] Nouveau bloc L2 reçu (Index {}) !", block.index);
                         
-                        // Signature hypertree du séquenceur sur anchor_message(l2_name, state_root) : même règle que le L1
-                        let msg = wattcoin_core::transaction::anchor_message(&block.l2_name, &block.state_root);
+                        // EXACTEMENT le message vérifié par le L1 : maillon, état, dépôts couverts, total 1:1, retraits
+                        let msg = wattcoin_core::transaction::anchor_message(&block.l2_name, block.index, &block.prev_root,
+                            &block.state_root, block.l1_height, block.l2_total, &block.withdrawals);
                         let is_valid = match (wattcoin_core::transaction::decode32(&block.sequencer_pubkey),
                                               serde_json::from_str::<wots::HyperSignature>(&block.signature)) {
                             (Some(root), Ok(sig)) => sig.verify(&msg, &root),
@@ -158,12 +159,13 @@ pub fn start_peer_connection(
                             continue; 
                         }
                         
-                        if let Ok(_) = state_guard.apply_incoming_wns_block(&block) {
-                            println!("✅ [WNS P2P] Bloc L2 validé ! Registre mis à jour.");
-                            let env = WnsP2PMessage::BroadcastBlock { block };
-                            broadcast_message(&env, &active_peers_clone, &peer_id);
-                        } else {
-                            println!("❌ [WNS P2P] Fraude détectée. Bloc rejeté.");
+                        match state_guard.apply_incoming_wns_block(&block) {
+                            Ok(()) => {
+                                println!("✅ [WNS P2P] Bloc L2 validé ! Registre mis à jour.");
+                                let env = WnsP2PMessage::BroadcastBlock { block };
+                                broadcast_message(&env, &active_peers_clone, &peer_id);
+                            }
+                            Err(e) => println!("❌ [WNS P2P] Bloc rejeté : {}", e),
                         }
                     }
                 },

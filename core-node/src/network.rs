@@ -144,8 +144,14 @@ pub fn check_tx_admission(chain: &Blockchain, pool: &[Transaction], tx: &Transac
     }
     // 9. UNSTAKE : même règle que le consensus (seul le détenteur de la clé de retrait)
     chain.check_unstake_tx(tx)?;
-    // 9 bis. ANCRAGE L2 : même règle que le consensus (seul le séquenceur élu, feuille hypertree)
-    chain.check_anchor_tx(tx)?;
+    // 9 bis. ANCRAGE L2 : même règle que le consensus (séquenceur élu, maillon suivant, total 1:1)
+    //        + un seul ancrage par L2 en mempool
+    if let TransactionType::L2Anchor { l2_name, .. } = &tx.tx_type {
+        if pool.iter().any(|m| matches!(&m.tx_type, TransactionType::L2Anchor { l2_name: n, .. } if n == l2_name)) {
+            return Err("❌ ANCRAGE : un ancrage de ce L2 est déjà en mempool".into());
+        }
+    }
+    chain.check_anchor_tx(tx, &mut std::collections::HashSet::new())?;
     // 10. PROPRIÉTÉ : chaque input appartient au signataire (même règle que le consensus)
     chain.check_ownership(tx)?;
     Ok(())
@@ -158,6 +164,7 @@ pub fn purge_mempool(chain: &Blockchain, pool: &mut Vec<Transaction>) {
     let mut seen = std::collections::HashSet::new();
     let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut htlc_reserved = std::collections::HashSet::new();
+    let mut anchored = std::collections::HashSet::new();
     let mut rounds = SHARE_ROUNDS.lock().unwrap();
     // Parts : on ne garde que le tour du bloc en cours (tip, incluses dans tip+1) et le suivant (tip+1)
     rounds.retain(|_, h| *h >= tip);
@@ -175,6 +182,10 @@ pub fn purge_mempool(chain: &Blockchain, pool: &mut Vec<Transaction>) {
             TransactionType::HTLCClaim { .. } | TransactionType::HTLCRefund { .. } => {
                 if chain.check_htlc_tx(tx, tip + 1, &mut std::collections::HashSet::new()).is_err() { return false; }
                 if let Some(k) = htlc_key(tx) { if !htlc_reserved.insert(k) { return false; } }
+            }
+            // 4 bis. Ancrage L2 : maillon dépassé, séquenceur plus élu, ou doublon pour ce L2 → dehors
+            TransactionType::L2Anchor { .. } => {
+                if chain.check_anchor_tx(tx, &mut anchored).is_err() { return false; }
             }
             _ => {}
         }
@@ -684,12 +695,13 @@ pub fn start_peer_connection(
                     // On libère IMMÉDIATEMENT le port TCP (le réseau respire)
                     tokio::spawn(async move {
                         // BOUCLIER ANTI-DOS : VÉRIFICATION PoW *AVANT* LE RESTE ET *HORS MUTEX*
-                        let (seed, target) = {
+                        let (seed, target, next_index) = {
                             let chain = bc_clone.lock().unwrap();
-                            (chain.get_epoch_seed(block_clone.header.index), chain.target.clone())
+                            (chain.get_epoch_seed(block_clone.header.index), chain.target.clone(), chain.current_height + 1)
                         };
 
-                        let is_pow_valid = tokio::task::spawn_blocking({
+                        // (hash vraiment calculé ?, cible atteinte ?)
+                        let (hash_ok, meets_target) = tokio::task::spawn_blocking({
                             let b_clone = block_clone.clone();
                             let s = seed.clone();
                             move || {
@@ -708,20 +720,27 @@ pub fn start_peer_connection(
                                         );
 
                                         if let Ok(hash_bytes) = vm.calculate_hash(header_data.as_bytes()) {
-                                            let hash_hex = hex::encode(&hash_bytes);
-                                            let hash_bigint = num_bigint::BigUint::parse_bytes(hash_hex.as_bytes(), 16).unwrap_or_default();
-                                            return hash_hex == b_clone.header.hash && hash_bigint <= target;
+                                            let hash_ok = hex::encode(&hash_bytes) == b_clone.header.hash;
+                                            let meets_target = num_bigint::BigUint::from_bytes_be(&hash_bytes) <= target;
+                                            return (hash_ok, meets_target);
                                         }
                                     }
                                 }
-                                false
+                                (false, false)
                             }
                         }).await.unwrap();
 
-                        if !is_pow_valid {
-                            println!("❌ [SÉCURITÉ] Bloc rejeté : Preuve de Travail (PoW) invalide ! Spam détecté.");
+                        // Hash FALSIFIÉ = fraude : bannissement
+                        if !hash_ok {
+                            println!("❌ [SÉCURITÉ] Bloc rejeté : Preuve de Travail (PoW) falsifiée ! Spam détecté.");
                             crate::network::ban_peer(&peer_ip_task, "Faux PoW (Spam CPU)");
                             return; 
+                        }
+                        // Vrai hash sous NOTRE cible : désaccord de difficulté possible, on ignore sans bannir.
+                        // (Un bloc en retard ou de fourche n'est pas jugé sur la cible actuelle : la synchro s'en charge.)
+                        if block_clone.header.index == next_index && !meets_target {
+                            println!("⚠️ [P2P] Bloc {} sous la difficulté attendue : ignoré (pas de bannissement).", block_clone.header.index);
+                            return;
                         }
 
                         // BOUCLIER ZKP : VÉRIFICATION DES TX SEULEMENT SI LE POW EST BON !

@@ -150,8 +150,8 @@ struct WattcoinApp {
     l2_status_result: String,
 	
 	bridge_l2_name: String,
-    bridge_receiver_pubkey: String,
     bridge_amount: String,
+    wns_withdraw_amount: String,
 	
 	wns_tab: String, // "wallet"
     wns_domain_input: String,
@@ -278,9 +278,9 @@ impl WattcoinApp {
 			l2_sequencer_pubkey: String::new(),
 			l2_status_result: String::new(),
 			
-			bridge_l2_name: String::new(),
-            bridge_receiver_pubkey: String::new(),
+			bridge_l2_name: "WNS".to_string(),
             bridge_amount: String::new(),
+            wns_withdraw_amount: String::new(),
 			
 			wns_tab: "wallet".to_string(),
 			wns_domain_input: String::new(),
@@ -2376,66 +2376,71 @@ impl eframe::App for WattcoinApp {
 				}
 				
 				AppView::Bridge => {
-					overlay_ui.add_space(rect.height() * 0.15);
+					overlay_ui.add_space(rect.height() * 0.10);
 					egui::Frame::none().fill(panel_bg).inner_margin(25.0).rounding(12.0).show(&mut overlay_ui, |ui| {
-						ui.heading("🌉 Bridge : Transférer vers un L2");
+						ui.heading("🌉 Bridge L1 ↔ L2");
 						ui.add_space(10.0);
-						ui.label(egui::RichText::new("Verrouillez vos WATT sur le réseau principal (L1) de manière transparente. Ils seront crédités sur la blockchain secondaire (L2) de votre choix.").color(egui::Color32::GRAY));
+						ui.label(egui::RichText::new("Le pont crédite TOUJOURS votre propre compte L2 (le wallet y joint votre clé WOTS). Le L1 garantit le 1:1 : un L2 ne peut jamais rendre plus que ce qu'il a reçu.").color(egui::Color32::GRAY));
 						ui.add_space(20.0);
 
-						ui.label("Nom du réseau L2 de destination (ex: WNS) :");
-						ui.add(egui::TextEdit::singleline(&mut self.bridge_l2_name));
+						// ---------- L1 → L2 ----------
+						ui.label(egui::RichText::new("➡ L1 → L2").strong());
+						ui.label("Réseau L2 de destination :");
+						ui.add(egui::TextEdit::singleline(&mut self.bridge_l2_name).hint_text("WNS"));
+						ui.add_space(6.0);
+						ui.label("Montant à transférer (WATT) :");
+						ui.add(egui::TextEdit::singleline(&mut self.bridge_amount).hint_text("ex: 50.0"));
+						if let Ok(amt) = self.bridge_amount.parse::<f64>() {
+							if self.watt_price_usd > 0.0 {
+								ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", amt * self.watt_price_usd)).color(egui::Color32::GRAY));
+							}
+						}
 						ui.add_space(10.0);
 
-						ui.label("Clé publique du destinataire sur le L2 :");
-						let response = ui.add(egui::TextEdit::singleline(&mut self.bridge_receiver_pubkey).hint_text("Adresse Kyber"));
-
-						response.context_menu(|ui| {
-							if ui.button("📋 Coller").clicked() {
-								if let Some(pasted_text) = get_clipboard_text() {
-									self.bridge_receiver_pubkey = pasted_text;
-								}
-								ui.close_menu();
-							}
-							if ui.button("📋 Copier").clicked() {
-								set_clipboard_text(ui.ctx(), &self.bridge_receiver_pubkey);
-								ui.close_menu();
-							}
-						});
-						ui.add_space(10.0);
-
-						ui.horizontal(|ui| {
-							ui.vertical(|ui| {
-								ui.label("Montant à transférer (WATT) :");
-								ui.add(egui::TextEdit::singleline(&mut self.bridge_amount).hint_text("ex: 50.0"));
-								
-								if let Ok(amt) = self.bridge_amount.parse::<f64>() {
-									if self.watt_price_usd > 0.0 {
-										ui.label(egui::RichText::new(format!("≈ $ {:.2} USD", amt * self.watt_price_usd)).color(egui::Color32::GRAY));
-									}
-								}
-							});
-						});
-						ui.add_space(20.0);
-
-						if ui.add_sized([250.0, 40.0], egui::Button::new("🔒 Verrouiller et Transférer")).clicked() {
+						if ui.add_sized([250.0, 40.0], egui::Button::new("🔒 Verrouiller vers mon compte L2")).clicked() {
 							if let (Some(keys), Some(amt)) = (&self.wallet_keys, crate::parse_watt_to_flames(&self.bridge_amount).filter(|a| *a > 0)) {
-								if self.bridge_l2_name.is_empty() || self.bridge_receiver_pubkey.is_empty() {
-									self.sync_message = "❌ Tous les champs sont requis.".to_string();
+								if self.bridge_l2_name.trim().is_empty() {
+									self.sync_message = "❌ Le nom du réseau L2 est requis.".to_string();
 								} else {
 									self.sync_message = "Verrouillage des fonds pour le L2...".to_string();
 									let tx = self.tx.clone();
 									let keys = keys.clone();
 									let l2_name = self.bridge_l2_name.clone();
-									let receiver = self.bridge_receiver_pubkey.clone();
-
 									tokio::spawn(async move {
-										match crate::bridge_to_l2(l2_name, receiver, amt, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex).await {
+										match crate::bridge_to_l2(l2_name, amt, keys.kyber_secret_hex, keys.watt_address, keys.master_seed_hex).await {
 											Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
 											Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
 										}
 									});
 								}
+							} else {
+								self.sync_message = "❌ Montant invalide ou portefeuille verrouillé.".to_string();
+							}
+						}
+
+						ui.add_space(20.0);
+						ui.separator();
+						ui.add_space(10.0);
+
+						// ---------- L2 (WNS) → L1 ----------
+						ui.label(egui::RichText::new("⬅ L2 (WNS) → L1").strong());
+						ui.label(egui::RichText::new(format!("Solde WNS : {} WATT · frais L2 : {} WATT",
+							crate::format_flames(self.balance_wns), crate::format_flames(crate::WNS_MIN_FEE))).color(egui::Color32::GRAY));
+						ui.label("Montant à retirer (WATT) :");
+						ui.add(egui::TextEdit::singleline(&mut self.wns_withdraw_amount).hint_text("ex: 0.5"));
+						ui.add_space(10.0);
+
+						if ui.add_sized([250.0, 40.0], egui::Button::new("⬅ Retirer vers mon wallet L1")).clicked() {
+							if let (Some(keys), Some(amt)) = (&self.wallet_keys, crate::parse_watt_to_flames(&self.wns_withdraw_amount).filter(|a| *a > 0)) {
+								self.sync_message = "Signature du retrait L2 → L1...".to_string();
+								let tx = self.tx.clone();
+								let keys = keys.clone();
+								tokio::spawn(async move {
+									match crate::withdraw_from_wns(amt, crate::WNS_MIN_FEE, keys).await {
+										Ok(msg) => { let _ = tx.send(AppMessage::Info(msg)).await; }
+										Err(e) => { let _ = tx.send(AppMessage::Error(e)).await; }
+									}
+								});
 							} else {
 								self.sync_message = "❌ Montant invalide ou portefeuille verrouillé.".to_string();
 							}

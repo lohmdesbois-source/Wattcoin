@@ -1080,107 +1080,59 @@ pub async fn start_api_server(
         .and(chain_filter.clone())
         .map(|l2_name: String, chain_arc: Arc<Mutex<Blockchain>>| {
             let chain_guard = chain_arc.lock().unwrap();
-            
-            let mut active_sequencers: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            // Historique des ancrages (seuls des ancrages validés par le consensus sont dans la chaîne)
             let mut last_state_root = String::from("AUCUN_ANCRAGE");
             let mut total_anchors = 0u64;
-
             for i in 0..=chain_guard.current_height {
                 if let Some(block) = chain_guard.get_block_by_height(i) {
                     for tx in &block.transactions {
-                        match &tx.tx_type {
-                            TransactionType::L2Stake { l2_name: name, sequencer_pubkey: pubkey } => {
-                                if name == &l2_name { active_sequencers.insert(pubkey.clone()); }
-                            },
-                            TransactionType::L2Unstake { l2_name: name } => {
-                                if name == &l2_name { active_sequencers.clear(); }
-                            },
-                            TransactionType::L2Anchor { l2_name: name, state_root, .. } => {
-                                if name == &l2_name && !active_sequencers.is_empty() {
-                                    last_state_root = state_root.clone();
-                                    total_anchors += 1;
-                                }
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            let mut elected_pubkey = String::new();
-
-            if !active_sequencers.is_empty() {
-                let mut candidates: Vec<String> = active_sequencers.into_iter().collect();
-                candidates.sort(); 
-
-                let last_block_hash = &chain_guard.get_last_block().header.hash;
-                
-                use sha2::Digest;
-                let mut lowest_score = [0xFFu8; 32];
-                
-                for candidate in &candidates {
-                    let mut vrf_hasher = sha2::Sha256::new();
-                    vrf_hasher.update(last_block_hash.as_bytes());
-                    vrf_hasher.update(l2_name.as_bytes());
-                    vrf_hasher.update(candidate.as_bytes()); 
-                    
-                    let mut vrf_hash = [0u8; 32];
-                    vrf_hash.copy_from_slice(&vrf_hasher.finalize());
-                    
-                    if vrf_hash < lowest_score {
-                        lowest_score = vrf_hash;
-                        elected_pubkey = candidate.clone();
-                    }
-                }
-            }
-
-            if elected_pubkey.is_empty() {
-                warp::reply::json(&serde_json::json!({
-                    "error": "L2 introuvable ou aucun séquenceur actif",
-                    "l2_name": l2_name
-                }))
-            } else {
-                warp::reply::json(&serde_json::json!({
-                    "l2_name": l2_name,
-                    "is_active": true,
-                    "sequencer_pubkey": elected_pubkey, 
-                    "last_state_root": last_state_root,
-                    "total_anchors_on_l1": total_anchors
-                }))
-            }
-        });
-		
-    let get_l2_peg = warp::path!("l2" / "peg" / String)
-        .and(warp::get())
-        .and(chain_filter.clone())
-        .map(|l2_name: String, chain_arc: Arc<Mutex<Blockchain>>| {
-            let chain_guard = chain_arc.lock().unwrap();
-            let mut total_peg_flames = 0u64;
-
-            let official_bridge_address = format!("BRIDGE_L2_{}", l2_name.to_uppercase());
-
-            for i in 0..=chain_guard.current_height {
-                if let Some(block) = chain_guard.get_block_by_height(i) {
-                    for tx in &block.transactions {
-                        if let TransactionType::L2BridgeLock { l2_target_name, .. } = &tx.tx_type {
-                            if l2_target_name.to_uppercase() == l2_name.to_uppercase() {
-                                for out in &tx.outputs {
-                                    if out.stealth_address == official_bridge_address {
-                                        let amount: u64 = out.aes_vault.parse().unwrap_or(0);
-                                        total_peg_flames += amount;
-                                    }
-                                }
+                        if let TransactionType::L2Anchor { l2_name: name, state_root, .. } = &tx.tx_type {
+                            if name == &l2_name {
+                                last_state_root = state_root.clone();
+                                total_anchors += 1;
                             }
                         }
                     }
                 }
             }
 
+            // Même élection VRF que le consensus (check_anchor_tx)
+            match chain_guard.elected_sequencer(&l2_name) {
+                None => warp::reply::json(&serde_json::json!({
+                    "error": "L2 introuvable ou aucun séquenceur actif",
+                    "l2_name": l2_name
+                })),
+                Some(elected_pubkey) => warp::reply::json(&serde_json::json!({
+                    "l2_name": l2_name,
+                    "is_active": true,
+                    "sequencer_pubkey": elected_pubkey,
+                    "last_state_root": last_state_root,
+                    "total_anchors_on_l1": total_anchors
+                })),
+            }
+        });
+		
+    // COMPTEUR 1:1 : réserve du pont (L1) face à l'argent total du L2 (dernier ancrage)
+    let get_l2_peg = warp::path!("l2" / "peg" / String)
+        .and(warp::get())
+        .and(chain_filter.clone())
+        .map(|l2_name: String, chain_arc: Arc<Mutex<Blockchain>>| {
+            let chain_guard = chain_arc.lock().unwrap();
+            let reserve = chain_guard.bridge_reserve(&l2_name, chain_guard.current_height);
+            let (l2_height, _, l1_height, l2_total) = chain_guard.last_anchor(&l2_name);
+            let reserve_at_anchor = chain_guard.bridge_reserve(&l2_name, l1_height);
+
             warp::reply::json(&serde_json::json!({
                 "l2_name": l2_name,
-                "bridge_address": official_bridge_address,
-                "peg_flames": total_peg_flames,
-                "peg_watt": total_peg_flames as f64 / 1_000_000_000.0
+                "bridge_address": format!("BRIDGE_L2_{}", l2_name),
+                "peg_flames": reserve,
+                "peg_watt": reserve as f64 / 1_000_000_000.0,
+                "l2_total_flames": l2_total,
+                "reserve_at_anchor_flames": reserve_at_anchor,
+                "pending_deposits_flames": reserve.saturating_sub(reserve_at_anchor),
+                "l2_height": l2_height,
+                "is_one_to_one": l2_total == reserve_at_anchor
             }))
         });
 		
