@@ -819,6 +819,16 @@ fn is_immature(out: &TransactionOutput, height: u64, current_height: u64) -> boo
         || (out.kyber_capsule.starts_with("UNPEG_") && age < wattcoin_core::blockchain::UNPEG_DELAY_BLOCKS)
 }
 
+/// Ma clé Kyber publique (base64), redérivée de la graine EXACTEMENT comme à la création du wallet
+fn my_kyber_b64(master_seed_hex: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let seed = hex::decode(master_seed_hex).ok()?;
+    let seed_array: [u8; 32] = seed.get(0..32)?.try_into().ok()?;
+    let mut rng = rand::rngs::StdRng::from_seed(seed_array);
+    let kp = keypair(&mut rng).ok()?;
+    Some(URL_SAFE_NO_PAD.encode(&kp.public))
+}
+
 pub async fn scan_my_utxos(kyber_secret_hex: &str, master_seed_hex: &str) -> Result<Scan, String> {
     let res_str = get_all_transactions_cached().await?;
     let enriched: Vec<serde_json::Value> = serde_json::from_str(&res_str).map_err(|_| "Erreur JSON".to_string())?;
@@ -837,6 +847,8 @@ pub async fn scan_my_utxos(kyber_secret_hex: &str, master_seed_hex: &str) -> Res
     let mut utxos = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut orphans = Vec::new(); // payload valide vers une R absente du carnet (wallet restauré)
+    let mut public_orphans = Vec::new(); // output public vers MA clé Kyber, R absente du carnet
+    let my_kyber = my_kyber_b64(master_seed_hex);
 
     for item in &enriched {
         let height = item["height"].as_u64().unwrap_or(0);
@@ -864,16 +876,26 @@ pub async fn scan_my_utxos(kyber_secret_hex: &str, master_seed_hex: &str) -> Res
                         orphans.push((out.clone(), payload, root, source_height));
                     }
                 }
+            } else if let Some(root) = my_kyber.as_deref().and_then(|k| owner::public_root_for(out, k)) {
+                public_orphans.push((out.clone(), root, source_height));
             }
         }
     }
 
-    // Restauration : des paiements valides visent des R_i pas encore redérivées
-    if !orphans.is_empty() {
-        let wanted: std::collections::HashSet<[u8; 32]> = orphans.iter().map(|o| o.2).collect();
+    // Restauration : des paiements valides (cachés OU publics vers ma clé Kyber) visent des R_i pas encore redérivées
+    if !orphans.is_empty() || !public_orphans.is_empty() {
+        let wanted: std::collections::HashSet<[u8; 32]> = orphans.iter().map(|o| o.2)
+            .chain(public_orphans.iter().map(|o| o.1)).collect();
         book.discover(&wanted, owner::ADDRESS_GAP)?;
         for (out, payload, _, source_height) in orphans {
             if let Some(owned) = book.owns_hidden(&out, &payload) {
+                if seen.insert(out.kyber_capsule.clone()) {
+                    utxos.push(MyUtxo::new(&out, source_height, owned));
+                }
+            }
+        }
+        for (out, _, source_height) in public_orphans {
+            if let Some(owned) = book.owns_public(&out) {
                 if seen.insert(out.kyber_capsule.clone()) {
                     utxos.push(MyUtxo::new(&out, source_height, owned));
                 }
@@ -2493,10 +2515,13 @@ pub async fn get_all_transactions_cached() -> Result<String, String> {
     
     let current_height = info["blocks"].as_u64().unwrap_or(0);
     let current_l2_blocks = info["l2_blocks"].as_u64().unwrap_or(0);
+    let tip_hash = info["last_hash"].as_str().unwrap_or_default().to_string();
+    // Clé RAM = wallet + tête de chaîne : même hauteur mais autre bloc (fourche) → pas de raccourci
+    let ram_key = format!("{}#{}", current_wallet_name, tip_hash);
     
     let mut cache_ram = CACHED_CHAIN.lock().await;
     // Si la RAM est déjà à jour, on la renvoie instantanément
-    if cache_ram.0 == current_wallet_name && cache_ram.1 == current_height && cache_ram.2 == current_l2_blocks && !cache_ram.3.is_empty() {
+    if cache_ram.0 == ram_key && cache_ram.1 == current_height && cache_ram.2 == current_l2_blocks && !cache_ram.3.is_empty() {
         return Ok(cache_ram.3.clone()); 
     }
     
@@ -2545,6 +2570,31 @@ pub async fn get_all_transactions_cached() -> Result<String, String> {
         }
     }
 
+    // 1 bis. RÉORGANISATION : le bloc sous mon curseur est-il toujours celui du nœud ?
+    //        Sinon mon cache contient une branche abandonnée (blocs et dépenses fantômes) → on repart de zéro.
+    if last_l1 > 0 {
+        let node_hash = node_call("GET", &format!("/block_hash/{}", last_l1), None).await
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|j| j["hash"].as_str().map(|h| h.to_string()));
+        // None = nœud sans la route (ancienne version) : on ne peut pas juger, on ne touche à rien
+        if let Some(node_hash) = node_hash {
+            let stored = meta_tree.get(b"last_hash").ok().flatten().map(|v| String::from_utf8_lossy(&v).to_string());
+            if stored.as_deref() != Some(node_hash.as_str()) {
+                crate::set_status("🔀 Réorganisation de la chaîne détectée : resynchronisation complète...");
+                let _ = tx_tree.clear();
+                let _ = meta_tree.remove(b"last_hash");
+                last_l1 = 0;
+                last_l2 = 0;
+                let mut cache = load_cache();
+                cache.last_scanned_height = 0;
+                cache.last_scanned_micro_index = 0;
+                cache.known_spent_key_images.clear(); // les dépenses d'une branche orpheline ne comptent plus
+                save_cache(&cache);
+            }
+        }
+    }
+
     // 2. Si on est en retard, on demande le delta au nœud
     if last_l1 < current_height || last_l2 < current_l2_blocks {
         crate::set_status(&format!("🔄 Tél. différentiel (L1: {}->{}, L2: {}->{})...", last_l1, current_height, last_l2, current_l2_blocks));
@@ -2555,11 +2605,15 @@ pub async fn get_all_transactions_cached() -> Result<String, String> {
         if let Ok(new_txs) = serde_json::from_str::<Vec<serde_json::Value>>(&new_txs_str) {
             if !new_txs.is_empty() {
                 for tx in new_txs {
+                    // Un bloc miné entre /info et /sync_blocks : pris au prochain tour (curseur et hash restent appariés)
+                    let is_l2 = tx["is_l2"].as_bool().unwrap_or(false);
+                    if !is_l2 && tx["height"].as_u64().unwrap_or(0) > current_height { continue; }
                     let key = db.generate_id().unwrap().to_be_bytes();
                     let _ = tx_tree.insert(key, serde_json::to_vec(&tx).unwrap());
                 }
                 let _ = meta_tree.insert(b"last_l1", &current_height.to_be_bytes());
                 let _ = meta_tree.insert(b"last_l2", &current_l2_blocks.to_be_bytes());
+                let _ = meta_tree.insert(b"last_hash", tip_hash.as_bytes()); // le bloc sous le curseur
             }
         }
     }
@@ -2575,7 +2629,7 @@ pub async fn get_all_transactions_cached() -> Result<String, String> {
     }
 
     let final_json = serde_json::to_string(&local_txs).unwrap_or_default();
-    *cache_ram = (current_wallet_name, current_height, current_l2_blocks, final_json.clone());
+    *cache_ram = (ram_key, current_height, current_l2_blocks, final_json.clone());
     Ok(final_json)
 }
 

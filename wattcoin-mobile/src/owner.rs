@@ -62,6 +62,17 @@ pub fn hidden_root(out: &TransactionOutput, payload: &str) -> Option<([u8; 32], 
     can_spend(out, &hex::encode(root), otp_hex).then(|| (root, otp_hex.to_string()))
 }
 
+/// Output PUBLIC adressé à MA clé Kyber : "<kyber>.<R>", "COINBASE_<kyber>.<R>", "JACKPOT_<kyber>.<R>" → R.
+/// Restauration : la clé Kyber est commune à toutes mes sous-adresses, R dit laquelle (à retrouver).
+pub fn public_root_for(out: &TransactionOutput, my_kyber_b64: &str) -> Option<[u8; 32]> {
+    let addr = &out.stealth_address;
+    let addr = addr.strip_prefix("COINBASE_").or_else(|| addr.strip_prefix("JACKPOT_")).unwrap_or(addr);
+    let (kyber, r) = addr.rsplit_once('.')?;
+    if kyber != my_kyber_b64 { return None; } // la clé d'un autre : jamais de recherche pour lui
+    let root = decode32(r)?;
+    can_spend(out, &hex::encode(root), "").then_some(root) // même règle que le consensus
+}
+
 /// Un output qui m'appartient : ce qu'il faut pour le dépenser
 #[derive(Clone, Debug)]
 pub struct Owned {
@@ -302,6 +313,24 @@ mod tests {
         let junk = [9u8; 32];                                                // R inconnue : s'arrête au gap
         fresh.discover(&[junk].into_iter().collect(), 3).unwrap();
         assert_eq!(fresh.sub_of(&junk), None);
+    }
+
+    #[test]
+    fn restauration_sorties_publiques() {
+        let old = book();
+        let r9 = old.root(9).unwrap();                                       // ancienne adresse de minage / retrait
+        let coinbase = out(format!("COINBASE_{}.{}", KYBER, hex::encode(r9)), 3);
+        let unpeg = out(format!("{}.{}", KYBER, hex::encode(r9)), 2);
+        let foreign = out(format!("AUTRE.{}", hex::encode(r9)), 2);
+        assert_eq!(public_root_for(&coinbase, KYBER), Some(r9));
+        assert_eq!(public_root_for(&unpeg, KYBER), Some(r9));
+        assert_eq!(public_root_for(&foreign, KYBER), None);                  // autre clé Kyber : pas à moi
+
+        let fresh = book();                                                  // mêmes 48 mots, carnet vide
+        assert!(fresh.owns_public(&unpeg).is_none());
+        fresh.discover(&[r9].into_iter().collect(), ADDRESS_GAP).unwrap();
+        assert_eq!(fresh.owns_public(&unpeg).map(|w| w.sub), Some(9));
+        assert_eq!(fresh.owns_public(&coinbase).map(|w| w.sub), Some(9));
     }
 
     #[test]

@@ -415,6 +415,21 @@ pub async fn start_api_server(
             warp::reply::json(&enriched_txs)
         });
 		
+    // Hash du bloc à une hauteur : le wallet vérifie que le bloc sous son curseur n'a pas été remplacé (fourche)
+    let get_block_hash = warp::path("block_hash")
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(chain_filter.clone())
+        .map(|height: u64, chain_arc: Arc<Mutex<Blockchain>>| {
+            let chain_lock = chain_arc.lock().unwrap();
+            // Au-delà de la tête : "" (un bloc d'une branche abandonnée peut traîner sur le disque)
+            let hash = if height <= chain_lock.current_height {
+                chain_lock.get_block_by_height(height).map(|b| b.header.hash.clone()).unwrap_or_default()
+            } else { String::new() };
+            warp::reply::json(&serde_json::json!({ "height": height, "hash": hash }))
+        });
+
     let sync_blocks = warp::get()
         .and(warp::path("sync_blocks"))
         .and(warp::query::<std::collections::HashMap<String, String>>())
@@ -592,6 +607,7 @@ pub async fn start_api_server(
 
 			warp::reply::json(&serde_json::json!({
 				"blocks": last_block.header.index,
+				"last_hash": last_block.header.hash,
 				"l2_blocks": l2_blocks_count,
 				"connected_peers": peers_count,
 				"last_price_sats": LAST_PRICE_SATS.load(Ordering::Relaxed),
@@ -1257,6 +1273,7 @@ pub async fn start_api_server(
     let routes = send_tx
 		.or(relay_onion)
         .or(get_all_txs)
+		.or(get_block_hash)
 		.or(sync_blocks)
         .or(get_pool)
         .or(submit_order)
