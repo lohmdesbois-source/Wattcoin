@@ -88,7 +88,9 @@ pub enum TransactionType {
     // et l2_total (somme de TOUS les soldes du L2, portée par la racine) doit égaler la réserve du pont
     // pour les dépôts L1 jusqu'au bloc l1_height (compteur 1:1).
     // Les `unpeg` PREMIÈRES sorties de la TX sont les retraits L2 → L1, payés par la réserve du pont.
-    L2Anchor { l2_name: String, l2_height: u64, prev_root: String, state_root: String, l1_height: u64, l2_total: u64, sequencer_signature: String, unpeg: u16 },
+    // v4 : utxo_root = arbre de l'ARGENT du L2 (sa somme EST l2_total), trace_root = les étapes qui l'ont fait bouger (contestables)
+    L2Anchor { l2_name: String, l2_height: u64, prev_root: String, state_root: String, l1_height: u64, l2_total: u64,
+               utxo_root: crate::l2tree::TreeRoot, trace_root: crate::l2trace::TraceRoot, sequencer_signature: String, unpeg: u16 },
 	// L'utilisateur verrouille ses WATT pour lui-même sur le L2 !
     L2BridgeLock { 
         l2_target_name: String,       // ex: "WNS"
@@ -345,16 +347,20 @@ pub const L2_GENESIS_ROOT: &str = "L2_GENESIS";
 /// Message signé par le séquenceur pour ancrer un état L2.
 /// Couvre le nom du L2 (pas de rejeu entre L2), le maillon (l2_height, prev_root),
 /// l'état, la hauteur L1 des dépôts couverts, le total 1:1 et CHAQUE retrait (adresse, identifiant, montant).
-pub fn anchor_message(l2_name: &str, l2_height: u64, prev_root: &str, state_root: &str, l1_height: u64, l2_total: u64, withdrawals: &[TransactionOutput]) -> [u8; 64] {
+pub fn anchor_message(l2_name: &str, l2_height: u64, prev_root: &str, state_root: &str, l1_height: u64, l2_total: u64,
+                      utxo_root: &crate::l2tree::TreeRoot, trace_root: &crate::l2trace::TraceRoot, withdrawals: &[TransactionOutput]) -> [u8; 64] {
     let mut h = Sha512::new();
-    h.update(b"wattcoin/l2anchor/v3");
-    for s in [l2_name, prev_root, state_root] {
+    h.update(b"wattcoin/l2anchor/v4");
+    for s in [l2_name, prev_root, state_root, utxo_root.hash.as_str(), trace_root.hash.as_str()] {
         h.update((s.len() as u64).to_be_bytes());
         h.update(s.as_bytes());
     }
     h.update(l2_height.to_be_bytes());
     h.update(l1_height.to_be_bytes());
     h.update(l2_total.to_be_bytes());
+    h.update(utxo_root.sum.to_be_bytes());
+    h.update(utxo_root.next_index.to_be_bytes());
+    h.update(trace_root.len.to_be_bytes());
     h.update((withdrawals.len() as u64).to_be_bytes());
     for w in withdrawals {
         for s in [&w.stealth_address, &w.kyber_capsule] {
@@ -505,24 +511,29 @@ mod owner_tests {
     fn ancrage_l2_feuille_brulee() {
         let mut seq = wots::HyperKeys::new(&[9u8; 32], 0);
         let root = seq.root();
+        let (u, t) = (crate::l2tree::L2Tree::new().root(), crate::l2trace::trace_root(&[]));
         let retrait = TransactionOutput { stealth_address: format!("kyberB64.{}", hex::encode([4u8; 32])),
             kyber_capsule: unpeg_capsule("WNS", 1, 0), aes_vault: "200".into(), amount: 200 };
         let w = vec![retrait.clone()];
-        let msg = anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &w);
+        let msg = anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u, &t, &w);
         let sig = seq.sign(0, &msg, |_| false, |_| true).unwrap();
         assert!(sig.verify(&msg, &root));
-        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "autre_racine", 5, 1_000, &w), &root)); // état falsifié
-        assert!(!sig.verify(&anchor_message("AUTRE", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &w), &root)); // rejeu sur un autre L2
-        assert!(!sig.verify(&anchor_message("WNS", 2, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &w), &root));  // autre maillon
-        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 9_999, &w), &root));  // total 1:1 falsifié
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "autre_racine", 5, 1_000, &u, &t, &w), &root)); // état falsifié
+        assert!(!sig.verify(&anchor_message("AUTRE", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u, &t, &w), &root)); // rejeu sur un autre L2
+        assert!(!sig.verify(&anchor_message("WNS", 2, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u, &t, &w), &root));  // autre maillon
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 9_999, &u, &t, &w), &root));  // total 1:1 falsifié
+        let mut u_faux = u.clone(); u_faux.sum = 1;
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u_faux, &t, &w), &root)); // arbre de l'argent falsifié
+        let mut t_faux = t.clone(); t_faux.len = 7;
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u, &t_faux, &w), &root)); // trace falsifiée
         let mut detourne = retrait.clone(); detourne.stealth_address = format!("kyberB64.{}", hex::encode([5u8; 32]));
-        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &[detourne]), &root)); // retrait détourné
-        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &[]), &root));         // retrait supprimé
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u, &t, &[detourne]), &root)); // retrait détourné
+        assert!(!sig.verify(&anchor_message("WNS", 1, L2_GENESIS_ROOT, "racine_etat", 5, 1_000, &u, &t, &[]), &root));         // retrait supprimé
 
         let leaf = sig.one_time_key_hex();
         let tx = Transaction {
             tx_type: TransactionType::L2Anchor { l2_name: "WNS".into(), l2_height: 1, prev_root: L2_GENESIS_ROOT.into(),
-                state_root: "racine_etat".into(), l1_height: 5, l2_total: 1_000,
+                state_root: "racine_etat".into(), l1_height: 5, l2_total: 1_000, utxo_root: u.clone(), trace_root: t.clone(),
                 sequencer_signature: serde_json::to_string(&sig).unwrap(), unpeg: 1 },
             inputs: vec![], outputs: w, fee: 0, wots_signature: None, public_key: String::new(), owners: vec![],
         };

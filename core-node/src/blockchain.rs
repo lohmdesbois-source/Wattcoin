@@ -13,6 +13,7 @@ const MAX_BLOCK_SIZE_BYTES: usize = 32 * 1024 * 1024; // 32 Mo maximum par bloc 
 const MAX_BLOCK_L2_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2 Mo maximum par microbloc !
 const MATURITY_BLOCKS: u64 = 1; // 12 Prod
 pub const UNPEG_DELAY_BLOCKS: u64 = 10; // 720 Prod (1 jour) : fenêtre de contestation des retraits L2 → L1
+pub const MAX_TRACE_STEPS: u64 = 1 << 20; // étapes max dans un ancrage (borne la longueur des chemins de contestation)
 const EXPECTED_BLOCK_TIME: u64 = 120;    // 2 mins (120 s)
 const INITIAL_REWARD: u64 = 15 * FLAME; // 15 Watts
 const TAIL_EMISSION: u64 = 600_000_000; // 0.6 Watts
@@ -195,6 +196,19 @@ impl Blockchain {
 		(0, crate::transaction::L2_GENESIS_ROOT.to_string(), 0, 0)
 	}
 
+	// Racine de l'ARGENT du dernier ancrage d'un L2 (arbre vide avant le premier ancrage)
+	pub fn last_utxo_root(&self, l2_name: &str) -> crate::l2tree::TreeRoot {
+		for i in (0..=self.current_height).rev() {
+			let Some(b) = self.get_block_by_height(i) else { continue };
+			for tx in b.transactions.iter().rev() {
+				if let TransactionType::L2Anchor { l2_name: name, utxo_root, .. } = &tx.tx_type {
+					if name == l2_name { return utxo_root.clone(); }
+				}
+			}
+		}
+		crate::l2tree::L2Tree::new().root()
+	}
+
 	// Réserve du pont d'un L2 = dépôts L2BridgeLock jusqu'au bloc L1 `up_to` inclus − TOUS les retraits déjà payés
 	pub fn bridge_reserve(&self, l2_name: &str, up_to: u64) -> u64 {
 		let official_bridge_address = format!("BRIDGE_L2_{}", l2_name);
@@ -222,7 +236,7 @@ impl Blockchain {
 	// 1 ancrage par L2 et par bloc, chaîné au précédent, retraits ≤ réserve, total 1:1 avec la réserve restante,
 	// signé par UNE feuille hypertree du séquenceur élu (brûlée via Transaction::one_time_keys).
 	pub fn check_anchor_tx(&self, tx: &Transaction, anchored_in_block: &mut HashSet<String>) -> Result<(), String> {
-		let TransactionType::L2Anchor { l2_name, l2_height, prev_root, state_root, l1_height, l2_total, sequencer_signature, unpeg } = &tx.tx_type else {
+		let TransactionType::L2Anchor { l2_name, l2_height, prev_root, state_root, l1_height, l2_total, utxo_root, trace_root, sequencer_signature, unpeg } = &tx.tx_type else {
 			return Ok(());
 		};
 
@@ -264,6 +278,19 @@ impl Blockchain {
 				l2_name, l2_total, reserve - withdrawn, reserve, withdrawn));
 		}
 
+		// 5 bis. L'argent du L2 est un arbre : sa somme EST le total 1:1, et la trace qui l'a construit est bornée.
+		//        Une trace VIDE n'a aucune étape à contester : elle doit laisser l'arbre strictement inchangé, sans retrait.
+		if utxo_root.sum != *l2_total {
+			return Err(format!("❌ ANCRAGE : l'arbre de '{}' contient {} Flames, l'ancrage en déclare {}.", l2_name, utxo_root.sum, l2_total));
+		}
+		if trace_root.len > MAX_TRACE_STEPS {
+			return Err(format!("❌ ANCRAGE : trace trop longue ({} étapes, {} max).", trace_root.len, MAX_TRACE_STEPS));
+		}
+		if trace_root.len == 0
+			&& (*trace_root != crate::l2trace::trace_root(&[]) || *utxo_root != self.last_utxo_root(l2_name) || *unpeg != 0) {
+			return Err("❌ ANCRAGE : une trace vide doit laisser l'arbre de l'argent inchangé, sans retrait.".into());
+		}
+
 		// 6. Signé par le séquenceur élu par le VRF (une feuille de son hypertree), retraits compris
 		let legit_sequencer = self.elected_sequencer(l2_name)
 			.ok_or_else(|| format!("❌ FRAUDE : La L2 '{}' n'a aucun staker actif !", l2_name))?;
@@ -271,7 +298,7 @@ impl Blockchain {
 			.ok_or("❌ FRAUDE VRF : le séquenceur élu n'a pas de racine hypertree valide.")?;
 		let sig: wots::HyperSignature = serde_json::from_str(sequencer_signature)
 			.map_err(|_| format!("❌ Signature hypertree illisible pour la L2 '{}'", l2_name))?;
-		let msg = crate::transaction::anchor_message(l2_name, *l2_height, prev_root, state_root, *l1_height, *l2_total, withdrawals);
+		let msg = crate::transaction::anchor_message(l2_name, *l2_height, prev_root, state_root, *l1_height, *l2_total, utxo_root, trace_root, withdrawals);
 		if !sig.verify(&msg, &root) {
 			return Err("❌ FRAUDE VRF : l'ancrage n'est pas signé par le séquenceur élu.".into());
 		}
@@ -1945,6 +1972,8 @@ impl Blockchain {
 mod l2_tests {
     use super::*;
     use crate::transaction::TransactionInput;
+    use crate::l2tree::{L2Tree, TreeRoot};
+    use crate::l2trace::{deposit_id, trace_root, TraceBuilder, TraceRoot, EXIT_PREFIX};
 
     fn tx(tx_type: TransactionType, inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput>) -> Transaction {
         Transaction { tx_type, inputs, outputs, fee: 0, wots_signature: None, public_key: String::new(), owners: vec![] }
@@ -1982,12 +2011,13 @@ mod l2_tests {
     }
 
     fn anchor(keys: &mut wots::HyperKeys, leaf: u64, l2_height: u64, prev_root: &str, state_root: &str, l1_height: u64, l2_total: u64,
-              withdrawals: Vec<TransactionOutput>) -> Transaction {
-        let msg = crate::transaction::anchor_message("WNS", l2_height, prev_root, state_root, l1_height, l2_total, &withdrawals);
+              utxo_root: &TreeRoot, trace_root: &TraceRoot, withdrawals: Vec<TransactionOutput>) -> Transaction {
+        let msg = crate::transaction::anchor_message("WNS", l2_height, prev_root, state_root, l1_height, l2_total, utxo_root, trace_root, &withdrawals);
         let sig = keys.sign(leaf, &msg, |_| false, |_| true).unwrap();
         let unpeg = withdrawals.len() as u16;
         tx(TransactionType::L2Anchor { l2_name: "WNS".into(), l2_height, prev_root: prev_root.into(), state_root: state_root.into(),
-            l1_height, l2_total, sequencer_signature: serde_json::to_string(&sig).unwrap(), unpeg }, vec![], withdrawals)
+            l1_height, l2_total, utxo_root: utxo_root.clone(), trace_root: trace_root.clone(),
+            sequencer_signature: serde_json::to_string(&sig).unwrap(), unpeg }, vec![], withdrawals)
     }
 
     #[test]
@@ -1996,16 +2026,25 @@ mod l2_tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut chain = Blockchain::new(path.to_str().unwrap()).unwrap();
 
-        // Un séquenceur staké + un dépôt de 5 Flames sur le pont du WNS
+        // Un séquenceur staké + un dépôt de 5 Flames sur le pont du WNS, pour un utilisateur du L2
         let mut seq = wots::HyperKeys::new(&[9u8; 32], 0);
         let r = hex::encode(seq.root());
-        let lock = tx(TransactionType::L2BridgeLock { l2_target_name: "WNS".into(), l2_receiver_pubkey: "compte|cle".into() }, vec![],
+        let mut user = wots::HyperKeys::new(&[3u8; 32], 0);
+        let user_addr = format!("kyberB64.{}", hex::encode(user.root()));
+        let lock = tx(TransactionType::L2BridgeLock { l2_target_name: "WNS".into(), l2_receiver_pubkey: user_addr.clone() }, vec![],
             vec![TransactionOutput { stealth_address: "BRIDGE_L2_WNS".into(), kyber_capsule: "depot_1".into(), aes_vault: "5".into(), amount: 5 }]);
         chain.push_block(&block(1, vec![stake(&r, "caution_1"), lock])).unwrap();
         assert_eq!(chain.bridge_reserve("WNS", 1), 5);
 
+        // Maillon 1 : le dépôt entre dans l'arbre de l'argent
+        let mut tree = L2Tree::new();
+        let mut b = TraceBuilder::new(&mut tree, 0);
+        b.deposit(TransactionOutput { stealth_address: user_addr.clone(), kyber_capsule: deposit_id("WNS", 0), aes_vault: String::new(), amount: 5 }).unwrap();
+        let (u1, t1) = (b.steps.last().unwrap().root_after.clone(), trace_root(&b.steps));
+        drop(b);
+
         let genesis = crate::transaction::L2_GENESIS_ROOT;
-        let a1 = anchor(&mut seq, 0, 1, genesis, "etat_1", 1, 5, vec![]);
+        let a1 = anchor(&mut seq, 0, 1, genesis, "etat_1", 1, 5, &u1, &t1, vec![]);
         assert!(chain.check_anchor_tx(&a1, &mut HashSet::new()).is_ok());
 
         let mut faux = a1.clone(); // le séquenceur gonfle son L2 : 6 ≠ réserve 5
@@ -2017,19 +2056,38 @@ mod l2_tests {
         let mut faux = a1.clone(); // dépôts "couverts" d'un bloc qui n'existe pas encore
         if let TransactionType::L2Anchor { l1_height, .. } = &mut faux.tx_type { *l1_height = 99; }
         assert!(chain.check_anchor_tx(&faux, &mut HashSet::new()).is_err());
+        let mut gonfle = u1.clone(); gonfle.sum = 6; // arbre qui ne contient pas le total déclaré (même bien signé)
+        let menteur = anchor(&mut seq, 2, 1, genesis, "etat_1", 1, 5, &gonfle, &t1, vec![]);
+        assert!(chain.check_anchor_tx(&menteur, &mut HashSet::new()).is_err());
         let mut deja = HashSet::new(); // deux ancrages du même L2 dans un bloc
         assert!(chain.check_anchor_tx(&a1, &mut deja).is_ok());
         assert!(chain.check_anchor_tx(&a1, &mut deja).is_err());
 
         chain.push_block(&block(2, vec![a1.clone()])).unwrap();
         assert_eq!(chain.last_anchor("WNS"), (1, "etat_1".to_string(), 1, 5));
+        assert_eq!(chain.last_utxo_root("WNS"), u1);
         assert!(chain.check_anchor_tx(&a1, &mut HashSet::new()).is_err()); // rejeu du même maillon
 
-        // Maillon 2 : retrait de 2 Flames vers une adresse propriétaire → il reste 3 sur le L2
+        // Maillon 2 : l'utilisateur retire 2 Flames vers le L1 (sortie EXIT_), garde 3 sur le L2
         let dest = format!("kyberB64.{}", hex::encode([4u8; 32]));
+        let mut t = Transaction { tx_type: TransactionType::Standard,
+            inputs: vec![TransactionInput { utxo_id: deposit_id("WNS", 0), amount: 5, source_height: 0, owner_otp: String::new(), owner: 0 }],
+            outputs: vec![
+                TransactionOutput { stealth_address: format!("{}{}", EXIT_PREFIX, dest), kyber_capsule: "sortie_l1".into(), aes_vault: String::new(), amount: 2 },
+                TransactionOutput { stealth_address: user_addr.clone(), kyber_capsule: "monnaie".into(), aes_vault: String::new(), amount: 3 }],
+            fee: 0, wots_signature: None, public_key: String::new(),
+            owners: vec![crate::transaction::OwnerProof { root: hex::encode(user.root()), signature: None }] };
+        let m = t.hash_data();
+        t.owners[0].signature = Some(user.sign(0, &m, |_| false, |_| true).unwrap());
+        let mut b = TraceBuilder::new(&mut tree, 1);
+        b.tx(t).unwrap();
+        let (u2, t2) = (b.steps.last().unwrap().root_after.clone(), trace_root(&b.steps));
+        drop(b);
+        assert_eq!(u2.sum, 3);
+
         let retrait = TransactionOutput { stealth_address: dest.clone(), kyber_capsule: crate::transaction::unpeg_capsule("WNS", 2, 0),
             aes_vault: "2".into(), amount: 2 };
-        let a2 = anchor(&mut seq, 1, 2, "etat_1", "etat_2", 2, 3, vec![retrait]);
+        let a2 = anchor(&mut seq, 1, 2, "etat_1", "etat_2", 2, 3, &u2, &t2, vec![retrait]);
         assert!(chain.check_anchor_tx(&a2, &mut HashSet::new()).is_ok());
 
         let mut fourche = a2.clone(); // maillon 2 accroché à la mauvaise racine
@@ -2057,6 +2115,15 @@ mod l2_tests {
         let id = crate::transaction::unpeg_capsule("WNS", 2, 0);
         assert!(chain.immature_utxos(4).contains(&id));
         assert!(!chain.immature_utxos(3 + UNPEG_DELAY_BLOCKS).contains(&id));
+
+        // Maillon 3 : rien n'a bougé → trace vide et arbre inchangé : accepté
+        let vide = trace_root(&[]);
+        let a3 = anchor(&mut seq, 3, 3, "etat_2", "etat_3", 3, 3, &u2, &vide, vec![]);
+        assert!(chain.check_anchor_tx(&a3, &mut HashSet::new()).is_ok());
+        // Trace vide mais arbre modifié : rien à contester, donc refusé d'office
+        let mut autre = u2.clone(); autre.next_index += 1;
+        let a3_faux = anchor(&mut seq, 4, 3, "etat_2", "etat_3", 3, 3, &autre, &vide, vec![]);
+        assert!(chain.check_anchor_tx(&a3_faux, &mut HashSet::new()).is_err());
 
         drop(chain);
         let _ = std::fs::remove_dir_all(&path);
