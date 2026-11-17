@@ -13,6 +13,8 @@ pub mod transaction;
 pub mod network;
 pub mod api;
 pub mod mixnet;
+pub mod l2tree;
+pub mod l2trace;
 
 
 pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
